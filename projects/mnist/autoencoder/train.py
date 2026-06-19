@@ -14,10 +14,10 @@ Single, self-contained script:
 Examples
 --------
     # fresh run
-    uv run python projects/mnist_autoencoder/train.py --epochs 20
+    uv run python projects/mnist/autoencoder/train.py --epochs 20
 
     # resume run <id> for more epochs (same wandb run, continues from its checkpoint)
-    uv run python projects/mnist_autoencoder/train.py --resume <run_id> --epochs 40
+    uv run python projects/mnist/autoencoder/train.py --resume <run_id> --epochs 40
 """
 
 from __future__ import annotations
@@ -27,17 +27,21 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-import wandb
-from lightning import LightningModule, Trainer, seed_everything
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning import LightningModule, seed_everything
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.utilities.seed import isolate_rng
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 from torchvision.transforms import v2
-from torchvision.utils import make_grid
 
 from chimera.data import MNISTDataModule
 from chimera.models import ConvAutoEncoder
+from chimera.utils.experiment import (
+    add_common_args,
+    find_ckpt,
+    grid,
+    init_wandb_logger,
+    run_training,
+)
 
 PROJECT_DEFAULT = "mnist-autoencoder"
 IMAGE_SIZE = 32
@@ -121,9 +125,9 @@ class LitAutoEncoder(LightningModule):
             return
         x, recon = self._val_sample
         panel = torch.cat([x, recon, (x - recon).abs()], dim=0)
-        grid = _grid(panel, nrow=x.shape[0])  # nrow = samples -> each category on its own row
+        image = grid(panel, nrow=x.shape[0])  # nrow = samples -> each category on its own row
         self.logger.log_image(
-            "val/reconstructions", [grid], caption=["rows: original / reconstruction / |diff|"]
+            "val/reconstructions", [image], caption=["rows: original / reconstruction / |diff|"]
         )
         self._val_sample = None
 
@@ -135,44 +139,9 @@ class LitAutoEncoder(LightningModule):
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
 
-def _grid(images: torch.Tensor, nrow: int | None = None):
-    """Tile a batch of [0,1] images into one grid, returned as an HxW (grayscale) numpy array."""
-    grid = make_grid(images, nrow=nrow or images.shape[0], padding=2)
-    grid = grid[0] if grid.shape[0] == 1 else grid.permute(1, 2, 0)
-    return grid.numpy()
-
-
-def _find_resume_ckpt(run_id: str, project: str) -> str:
-    """Locate the checkpoint for a run: prefer the local copy, else the wandb artifact."""
-    local = OUTPUTS / run_id / "last.ckpt"
-    if local.exists():
-        print(f"[resume] using local checkpoint {local}")
-        return str(local)
-    print(f"[resume] no local checkpoint; downloading model artifact for run {run_id}")
-    api = wandb.Api()
-    run = api.run(f"{api.default_entity}/{project}/{run_id}")
-    for artifact in reversed(list(run.logged_artifacts())):
-        if artifact.type != "model":
-            continue
-        directory = Path(artifact.download())
-        ckpts = sorted(directory.glob("*.ckpt"))
-        if ckpts:
-            print(f"[resume] downloaded {ckpts[0]}")
-            return str(ckpts[0])
-    raise FileNotFoundError(f"No checkpoint found locally or as an artifact for run {run_id}")
-
-
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--epochs", type=int, default=25)
-    p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--num-workers", type=int, default=7)
-    p.add_argument("--grad-clip", type=float, default=1.0, help="max grad norm (0 disables)")
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--data-dir", default="/mnt/ai/data", help="where MNIST is downloaded/cached")
-    p.add_argument("--project", default=PROJECT_DEFAULT)
-    p.add_argument("--resume", metavar="RUN_ID", default=None, help="wandb run id to resume")
+    add_common_args(p, project=PROJECT_DEFAULT, epochs=25)
     args = p.parse_args()
 
     seed_everything(args.seed, workers=True)  # seed python/numpy/torch + dataloader workers
@@ -192,16 +161,7 @@ def main() -> None:
         "data": {"dataset": "MNIST", "data_dir": args.data_dir, "num_workers": args.num_workers},
     }
 
-    logger_kwargs = dict(project=args.project, config=config)
-    if args.resume:
-        logger_kwargs.update(id=args.resume, resume="must")
-    logger = WandbLogger(**logger_kwargs)
-    run_id = logger.experiment.id  # initializes the run; learn its id for the ckpt dir
-    print(f"wandb run id: {run_id}{' (resumed)' if args.resume else ''}")
-
-    ckpt_dir = OUTPUTS / run_id
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_cb = ModelCheckpoint(dirpath=str(ckpt_dir), save_last=True, save_top_k=0, every_n_epochs=1)
+    logger, run_id = init_wandb_logger(args.project, config, resume=args.resume)
 
     datamodule = MNISTDataModule(
         data_dir=args.data_dir,
@@ -210,7 +170,7 @@ def main() -> None:
         image_size=IMAGE_SIZE,  # materialize at 32x32 once; no per-batch resize
     )
 
-    resume_ckpt = _find_resume_ckpt(args.resume, args.project) if args.resume else None
+    resume_ckpt = find_ckpt(args.resume, args.project, OUTPUTS) if args.resume else None
     if resume_ckpt:
         # Rebuild from the checkpoint's saved hyperparameters (model_config), not
         # the current module-level MODEL_CONFIG, so a resume always reconstructs
@@ -219,29 +179,16 @@ def main() -> None:
     else:
         module = LitAutoEncoder(MODEL_CONFIG, lr=args.lr)
 
-    trainer = Trainer(
-        max_epochs=args.epochs,
-        precision="bf16-mixed",
-        accelerator="auto",
+    run_training(
+        module=module,
+        datamodule=datamodule,
+        args=args,
         logger=logger,
-        callbacks=[ckpt_cb],
-        gradient_clip_val=args.grad_clip or None,
-        gradient_clip_algorithm="norm",
-        deterministic=True,
+        run_id=run_id,
+        outputs=OUTPUTS,
+        resume_ckpt=resume_ckpt,
+        artifact_metadata=config,
     )
-    try:
-        trainer.fit(module, datamodule=datamodule, ckpt_path=resume_ckpt)
-    except KeyboardInterrupt:
-        print("interrupted — uploading the latest checkpoint before exiting")
-
-    last_ckpt = ckpt_dir / "last.ckpt"
-    if last_ckpt.exists():
-        artifact = wandb.Artifact(name=run_id, type="model", metadata={"model": MODEL_CONFIG})
-        artifact.add_file(str(last_ckpt))
-        logger.experiment.log_artifact(artifact, aliases=["latest"])
-        print(f"logged checkpoint artifact for run {run_id}")
-
-    wandb.finish()
 
 
 if __name__ == "__main__":

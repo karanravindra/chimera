@@ -2,7 +2,7 @@
 
 Two-stage generative model:
 
-  * a *frozen* pretrained ``ConvAutoEncoder`` (from the ``mnist_autoencoder`` project)
+  * a *frozen* pretrained ``ConvAutoEncoder`` (from the ``mnist/autoencoder`` project)
     maps 32x32 MNIST images to a small spatial latent ``(C, H, W)``, flattened to a
     ``D = C*H*W`` vector; latents are standardized (per-dim mean/std) before the flow;
   * a ``VelocityDiT`` learns the rectified-flow velocity ``v(z_t, t, y) ~= z1 - z0`` where
@@ -17,30 +17,35 @@ Two-stage generative model:
 
 Examples
 --------
-    # fresh run against a trained autoencoder run (see mnist_autoencoder/outputs/<id>)
-    uv run python projects/mnist_rectified_flow/train.py --ae-run <ae_run_id> --epochs 40
+    # fresh run against a trained autoencoder run (see mnist/autoencoder/outputs/<id>)
+    uv run python projects/mnist/rectified_flow/train.py --ae-run <ae_run_id> --epochs 40
 
     # resume flow run <id> for more epochs (the AE must still be supplied)
-    uv run python projects/mnist_rectified_flow/train.py --ae-run <ae_run_id> \
+    uv run python projects/mnist/rectified_flow/train.py --ae-run <ae_run_id> \
         --resume <flow_run_id> --epochs 80
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-import wandb
-from lightning import LightningModule, Trainer, seed_everything
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning import LightningModule, seed_everything
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.utilities.seed import isolate_rng
-from torchvision.utils import make_grid
 
 from chimera.data import MNISTDataModule
 from chimera.models import ConvAutoEncoder, VelocityDiT
+from chimera.utils.experiment import (
+    add_common_args,
+    find_ckpt,
+    grid,
+    init_wandb_logger,
+    run_training,
+)
 
 PROJECT_DEFAULT = "mnist-rectified-flow"
 AE_PROJECT_DEFAULT = "mnist-autoencoder"
@@ -48,7 +53,7 @@ IMAGE_SIZE = 32
 NUM_CLASSES = 10  # MNIST digits 0-9; the null CFG class is index NUM_CLASSES.
 
 OUTPUTS = Path(__file__).parent / "outputs"
-AE_OUTPUTS = Path(__file__).parent.parent / "mnist_autoencoder" / "outputs"
+AE_OUTPUTS = Path(__file__).parent.parent / "autoencoder" / "outputs"
 
 
 class LitRectifiedFlow(LightningModule):
@@ -57,6 +62,7 @@ class LitRectifiedFlow(LightningModule):
     def __init__(
         self,
         autoencoder: ConvAutoEncoder,
+        ae_config: dict,
         latent_shape: tuple[int, int, int],
         flow_config: dict,
         lr: float = 1e-3,
@@ -68,12 +74,14 @@ class LitRectifiedFlow(LightningModule):
     ):
         super().__init__()
         # The AE is a frozen, non-trainable dependency: don't checkpoint it as a hparam
-        # object, but do persist its config so the run is reproducible.
+        # object, but persist its *config* (and its weights live in the state_dict, since
+        # it's a registered submodule) so a run is fully rebuildable from the checkpoint
+        # alone -- no wandb round-trip needed (see notebook.ipynb).
         self.save_hyperparameters(ignore=["autoencoder"])
 
         self.ae = autoencoder.eval().requires_grad_(False)
         self.latent_shape = tuple(latent_shape)  # (C, H, W)
-        self.latent_dim = int(torch.tensor(self.latent_shape).prod())
+        self.latent_dim = math.prod(self.latent_shape)
         self.model = VelocityDiT(
             latent_dim=self.latent_dim, num_classes=NUM_CLASSES + 1, **flow_config
         )
@@ -99,18 +107,14 @@ class LitRectifiedFlow(LightningModule):
 
     # -- latent helpers --------------------------------------------------------------
 
-    def _resize(self, images: torch.Tensor) -> torch.Tensor:
-        """Match the AE's input pipeline: float in [0, 1] resized to 32x32."""
-        x = images.float()
-        return F.interpolate(
-            x, size=(IMAGE_SIZE, IMAGE_SIZE), mode="bilinear", align_corners=False
-        )
-
     @torch.no_grad()
     def encode(self, images: torch.Tensor) -> torch.Tensor:
-        """Images -> flat latent (B, D), in float32 with autocast disabled for stability."""
+        """Images -> flat latent (B, D), in float32 with autocast disabled for stability.
+
+        The DataModule materializes MNIST at IMAGE_SIZE (same pipeline the AE trained
+        on), so the batch is already the right resolution -- just cast to float."""
         with torch.autocast(self.device.type, enabled=False):
-            z = self.ae.encode(self._resize(images))
+            z = self.ae.encode(images.float())
         return z.flatten(1)
 
     def normalize(self, z: torch.Tensor) -> torch.Tensor:
@@ -175,16 +179,27 @@ class LitRectifiedFlow(LightningModule):
     # -- sampling --------------------------------------------------------------------
 
     @torch.inference_mode()
-    def sample(self, y: torch.Tensor, z0: torch.Tensor | None = None) -> torch.Tensor:
-        """Integrate the rectified-flow ODE from noise to latent, return decoded images."""
+    def sample(
+        self,
+        y: torch.Tensor,
+        z0: torch.Tensor | None = None,
+        *,
+        guidance_scale: float | None = None,
+        steps: int | None = None,
+    ) -> torch.Tensor:
+        """Integrate the rectified-flow ODE from noise to latent, return decoded images.
+
+        ``guidance_scale`` and ``steps`` default to the values the module was built with;
+        callers (e.g. the analysis notebook) override them to sweep without rebuilding."""
+        scale = self.guidance_scale if guidance_scale is None else guidance_scale
+        steps = self.sample_steps if steps is None else steps
         if z0 is None:
             z0 = torch.randn(y.shape[0], self.latent_dim, device=self.device)
         z = z0
         null = torch.full_like(y, self.null_class)
-        dt = 1.0 / self.sample_steps
-        scale = self.guidance_scale
+        dt = 1.0 / steps
         with torch.autocast(self.device.type, enabled=False):
-            for step in range(self.sample_steps):
+            for step in range(steps):
                 t = torch.full((y.shape[0],), step * dt, device=self.device)
                 if scale == 1.0:
                     v = self.model(z, t, y)
@@ -205,9 +220,9 @@ class LitRectifiedFlow(LightningModule):
             torch.manual_seed(self.sample_seed)
             z0 = torch.randn(y.shape[0], self.latent_dim, device=self.device)
         imgs = self.sample(y, z0).float().cpu()
-        grid = _grid(imgs, nrow=n)
+        image = grid(imgs, nrow=n)
         self.logger.log_image(
-            "samples/grid", [grid], caption=[f"rows = digits 0-9, cfg={self.guidance_scale}"]
+            "samples/grid", [image], caption=[f"rows = digits 0-9, cfg={self.guidance_scale}"]
         )
 
     def configure_optimizers(self):
@@ -216,33 +231,6 @@ class LitRectifiedFlow(LightningModule):
             optimizer, T_max=self.trainer.max_epochs or 1
         )
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
-
-
-def _grid(images: torch.Tensor, nrow: int | None = None):
-    """Tile a batch of [0,1] images into one grid, returned as an HxW (grayscale) numpy array."""
-    grid = make_grid(images, nrow=nrow or images.shape[0], padding=2)
-    grid = grid[0] if grid.shape[0] == 1 else grid.permute(1, 2, 0)
-    return grid.numpy()
-
-
-def _find_ckpt(run_id: str, project: str, outputs: Path) -> str:
-    """Locate a run's checkpoint: prefer the local copy, else the wandb model artifact."""
-    local = outputs / run_id / "last.ckpt"
-    if local.exists():
-        print(f"[ckpt] using local checkpoint {local}")
-        return str(local)
-    print(f"[ckpt] no local checkpoint; downloading model artifact for run {run_id}")
-    api = wandb.Api()
-    run = api.run(f"{api.default_entity}/{project}/{run_id}")
-    for artifact in reversed(list(run.logged_artifacts())):
-        if artifact.type != "model":
-            continue
-        directory = Path(artifact.download())
-        ckpts = sorted(directory.glob("*.ckpt"))
-        if ckpts:
-            print(f"[ckpt] downloaded {ckpts[0]}")
-            return str(ckpts[0])
-    raise FileNotFoundError(f"No checkpoint found locally or as an artifact for run {run_id}")
 
 
 def load_autoencoder(ckpt_path: str) -> tuple[ConvAutoEncoder, dict]:
@@ -257,27 +245,18 @@ def load_autoencoder(ckpt_path: str) -> tuple[ConvAutoEncoder, dict]:
 
 
 def _probe_latent_shape(ae: ConvAutoEncoder, datamodule: MNISTDataModule) -> tuple[int, int, int]:
-    """Encode one batch to learn the latent (C, H, W)."""
+    """Encode one (already IMAGE_SIZE) batch to learn the latent (C, H, W)."""
     datamodule.prepare_data()
     datamodule.setup("fit")
     images, _ = next(iter(datamodule.train_dataloader()))
-    x = F.interpolate(images.float(), size=(IMAGE_SIZE, IMAGE_SIZE), mode="bilinear", align_corners=False)
     with torch.no_grad():
-        z = ae.encode(x)
+        z = ae.encode(images.float())
     return tuple(z.shape[1:])  # (C, H, W)
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--epochs", type=int, default=40)
-    p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--num-workers", type=int, default=7)
-    p.add_argument("--grad-clip", type=float, default=1.0, help="max grad norm (0 disables)")
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--data-dir", default="/mnt/ai/data", help="where MNIST is downloaded/cached")
-    p.add_argument("--project", default=PROJECT_DEFAULT)
-    p.add_argument("--resume", metavar="RUN_ID", default=None, help="wandb flow run id to resume")
+    add_common_args(p, project=PROJECT_DEFAULT, epochs=40)
     # autoencoder source (one of --ae-run / --ae-ckpt required)
     p.add_argument("--ae-run", metavar="RUN_ID", default=None, help="autoencoder wandb run id")
     p.add_argument("--ae-project", default=AE_PROJECT_DEFAULT, help="autoencoder wandb project")
@@ -299,90 +278,86 @@ def main() -> None:
 
     seed_everything(args.seed, workers=True)
 
-    ae_ckpt = args.ae_ckpt or _find_ckpt(args.ae_run, args.ae_project, AE_OUTPUTS)
+    ae_ckpt = args.ae_ckpt or find_ckpt(args.ae_run, args.ae_project, AE_OUTPUTS)
     autoencoder, ae_config = load_autoencoder(ae_ckpt)
 
     datamodule = MNISTDataModule(
-        data_dir=args.data_dir, batch_size=args.batch_size, num_workers=args.num_workers
+        data_dir=args.data_dir,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        image_size=IMAGE_SIZE,  # materialize at 32x32 once, matching the AE's training pipeline
     )
-    latent_shape = _probe_latent_shape(autoencoder, datamodule)
-    latent_dim = latent_shape[0] * latent_shape[1] * latent_shape[2]
-    num_tokens = args.num_tokens or latent_shape[0]
-    if latent_dim % num_tokens != 0:
-        p.error(f"--num-tokens ({num_tokens}) must divide the flat latent dim ({latent_dim})")
-    print(f"[latent] shape={latent_shape} flat_dim={latent_dim} num_tokens={num_tokens}")
+    resume_ckpt = find_ckpt(args.resume, args.project, OUTPUTS) if args.resume else None
+    if resume_ckpt:
+        # Rebuild the architecture from the checkpoint's saved hyperparameters
+        # (latent_shape, flow_config) -- never the current CLI flags -- so a resume always
+        # reconstructs the model the run was trained with, mirroring the autoencoder script.
+        # The frozen AE is re-supplied here (it's excluded from the hparams); its weights are
+        # then restored from the checkpoint along with the rest of the state.
+        module = LitRectifiedFlow.load_from_checkpoint(
+            resume_ckpt, autoencoder=autoencoder, lr=args.lr
+        )
+        latent_shape, flow_config, latent_dim = (
+            module.latent_shape,
+            module.hparams["flow_config"],
+            module.latent_dim,
+        )
+    else:
+        latent_shape = _probe_latent_shape(autoencoder, datamodule)
+        latent_dim = math.prod(latent_shape)
+        num_tokens = args.num_tokens or latent_shape[0]
+        if latent_dim % num_tokens != 0:
+            p.error(f"--num-tokens ({num_tokens}) must divide the flat latent dim ({latent_dim})")
+        flow_config = dict(
+            hidden_dim=args.hidden_dim,
+            time_dim=args.time_dim,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            num_tokens=num_tokens,
+        )
+        module = LitRectifiedFlow(
+            autoencoder,
+            ae_config=ae_config,
+            latent_shape=latent_shape,
+            flow_config=flow_config,
+            lr=args.lr,
+            label_dropout=args.label_dropout,
+            guidance_scale=args.guidance_scale,
+            sample_steps=args.sample_steps,
+        )
+    print(f"[latent] shape={latent_shape} flat_dim={latent_dim} num_tokens={flow_config['num_tokens']}")
 
-    flow_config = dict(
-        hidden_dim=args.hidden_dim,
-        time_dim=args.time_dim,
-        depth=args.depth,
-        num_heads=args.num_heads,
-        num_tokens=num_tokens,
-    )
-
+    # Read the flow/sampling hyperparameters off the module so the logged config matches the
+    # live model on both a fresh run (from args) and a resume (restored from the checkpoint).
     config = {
         "flow": {**flow_config, "latent_dim": latent_dim, "num_classes": NUM_CLASSES + 1},
         "autoencoder": {"config": ae_config, "run": args.ae_run, "ckpt": ae_ckpt},
         "training": {
             "epochs": args.epochs,
             "batch_size": args.batch_size,
-            "lr": args.lr,
+            "lr": module.lr,
             "seed": args.seed,
             "precision": "bf16-mixed",
             "grad_clip": args.grad_clip,
-            "guidance_scale": args.guidance_scale,
-            "label_dropout": args.label_dropout,
-            "sample_steps": args.sample_steps,
+            "guidance_scale": module.guidance_scale,
+            "label_dropout": module.label_dropout,
+            "sample_steps": module.sample_steps,
         },
         "data": {"dataset": "MNIST", "data_dir": args.data_dir, "num_workers": args.num_workers},
     }
 
-    logger_kwargs = dict(project=args.project, config=config)
-    if args.resume:
-        logger_kwargs.update(id=args.resume, resume="must")
-    logger = WandbLogger(**logger_kwargs)
-    run_id = logger.experiment.id
-    print(f"wandb run id: {run_id}{' (resumed)' if args.resume else ''}")
+    logger, run_id = init_wandb_logger(args.project, config, resume=args.resume)
 
-    ckpt_dir = OUTPUTS / run_id
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_cb = ModelCheckpoint(dirpath=str(ckpt_dir), save_last=True, save_top_k=0, every_n_epochs=1)
-
-    module = LitRectifiedFlow(
-        autoencoder,
-        latent_shape=latent_shape,
-        flow_config=flow_config,
-        lr=args.lr,
-        label_dropout=args.label_dropout,
-        guidance_scale=args.guidance_scale,
-        sample_steps=args.sample_steps,
-    )
-
-    trainer = Trainer(
-        max_epochs=args.epochs,
-        precision="bf16-mixed",
-        accelerator="auto",
+    run_training(
+        module=module,
+        datamodule=datamodule,
+        args=args,
         logger=logger,
-        callbacks=[ckpt_cb],
-        gradient_clip_val=args.grad_clip or None,
-        gradient_clip_algorithm="norm",
-        deterministic=True,
+        run_id=run_id,
+        outputs=OUTPUTS,
+        resume_ckpt=resume_ckpt,
+        artifact_metadata=config,
     )
-
-    resume_ckpt = _find_ckpt(args.resume, args.project, OUTPUTS) if args.resume else None
-    try:
-        trainer.fit(module, datamodule=datamodule, ckpt_path=resume_ckpt)
-    except KeyboardInterrupt:
-        print("interrupted — uploading the latest checkpoint before exiting")
-
-    last_ckpt = ckpt_dir / "last.ckpt"
-    if last_ckpt.exists():
-        artifact = wandb.Artifact(name=run_id, type="model", metadata=config)
-        artifact.add_file(str(last_ckpt))
-        logger.experiment.log_artifact(artifact, aliases=["latest"])
-        print(f"logged checkpoint artifact for run {run_id}")
-
-    wandb.finish()
 
 
 if __name__ == "__main__":

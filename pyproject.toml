@@ -20,6 +20,8 @@ dependencies = [
     "torchmetrics>=1.9.0",
     "wandb>=0.21.0",
     "matplotlib>=3.9",
+    "torch-fidelity>=0.4.0",
+    "scipy>=1.18.0",
 ]
 
 [project.scripts]
