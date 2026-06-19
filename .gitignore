@@ -13,6 +13,7 @@ wheels/
 # Data, caches, and model artifacts
 .chimera_cache/
 lightning_logs/
+wandb/
 outputs/
 *.pt
 *.pth

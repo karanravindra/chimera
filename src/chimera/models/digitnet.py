@@ -83,23 +83,23 @@ class DigitNetLPIPS(nn.Module):
         net.load_state_dict(
             torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         )
-        self.blocks = nn.ModuleList([net.backbone[i] for i in self._TAP_INDICES])
-        self.pools = nn.ModuleList(
-            [
-                net.backbone[i + 1]
-                for i in self._TAP_INDICES
-                if i + 1 < len(net.backbone)
-            ]
-        )
+        # Keep the full backbone and tap by index: running it as-is reproduces
+        # DigitNet.forward exactly. (Splitting into block/pool pairs mis-handles
+        # the consecutive ResidualBlocks at indices 6,7,8 -- there is no pool
+        # between them -- and would apply some blocks twice.)
+        self.backbone = net.backbone
+        self._last_tap = max(self._TAP_INDICES)
         for p in self.parameters():
             p.requires_grad_(False)
 
     def _features(self, x):
         feats = []
-        for block, pool in zip(self.blocks, self.pools):
-            x = block(x)
-            feats.append(x)
-            x = pool(x)
+        for i, layer in enumerate(self.backbone):
+            x = layer(x)
+            if i in self._TAP_INDICES:
+                feats.append(x)
+            if i == self._last_tap:  # no taps past here; skip the rest
+                break
         return feats
 
     @staticmethod

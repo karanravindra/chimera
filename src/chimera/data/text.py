@@ -297,6 +297,15 @@ class StreamingTextDataModule(LightningDataModule):
         self.seed = seed
 
         self.tokenizer = tiktoken.get_encoding(tokenizer_name)
+        # Token caches/packing store ids as uint16 (see PackedTokenDataset and
+        # _write_cache) -- fine for gpt2's 50257 vocab but silently wraps any id
+        # >= 65536. Fail loudly rather than corrupt the token stream.
+        if self.tokenizer.n_vocab > 65535:
+            raise ValueError(
+                f"{tokenizer_name} vocab ({self.tokenizer.n_vocab}) exceeds the "
+                f"uint16 token cache limit (65535); widen the token dtype or use "
+                f"a smaller tokenizer."
+            )
         self._train_dataset: PackedTokenDataset | None = None
         self._val_dataset: PackedTokenDataset | None = None
         self._token_ids: torch.Tensor | None = None
@@ -500,8 +509,9 @@ class StreamingTextDataModule(LightningDataModule):
         self, cache_path: Path, train_ids: list[int], val_ids: list[int]
     ) -> None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        # uint16 halves... quarters the on-disk cache vs int64 (vocab < 65536).
-        # Old int64 caches still load: _read_cache goes through .tolist().
+        # uint16 quarters the on-disk cache vs int64 (vocab < 65536, enforced in
+        # the datamodule). _read_cache returns the tensors as-is; PackedTokenDataset
+        # accepts uint16 tensors directly.
         torch.save(
             {
                 "train": torch.tensor(train_ids, dtype=torch.uint16),

@@ -38,6 +38,7 @@ from typing import Callable
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from lightning import LightningDataModule
 from PIL import Image
 from torch import bfloat16
@@ -149,12 +150,17 @@ class ImageDataModule(LightningDataModule):
         pin_memory: bool | None = None,
         in_memory: bool = True,
         augment_eval: bool = True,
+        image_size: int | None = None,
     ):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.gpu_transform = gpu_transform
+        # When set, each split is resized to image_size x image_size once at
+        # materialization time (and keyed into the cache), so loaders yield that
+        # resolution directly -- no per-batch resize in the training loop.
+        self.image_size = image_size
         # Ship uint8 (cast/augment on the GPU) only when a gpu_transform is set;
         # otherwise cast in the collate so the loader yields bf16 directly.
         self._collate = _collate_uint8 if gpu_transform else _collate_bf16
@@ -175,8 +181,12 @@ class ImageDataModule(LightningDataModule):
 
     @property
     def _cache_key(self) -> str:
-        """Identifier for the on-disk artifact dir (one per dataset)."""
-        return self.dataset_cls.__name__
+        """Identifier for the on-disk artifact dir (one per dataset[+size])."""
+        name = self.dataset_cls.__name__
+        # image_size changes the materialized tensor, so key on it (when set) to
+        # regenerate the artifact rather than reuse a stale one; None keeps the
+        # original key so existing caches stay valid.
+        return name if self.image_size is None else f"{name}-{self.image_size}"
 
     def _cache_paths(self, split: str) -> tuple[str, str]:
         d = os.path.join(self.data_dir, ".chimera_cache", self._cache_key)
@@ -191,7 +201,20 @@ class ImageDataModule(LightningDataModule):
     def _build_split(self, split: str) -> tuple[np.ndarray, np.ndarray]:
         """Materialize one split into (uint8 NCHW images, int64 labels) arrays."""
         tv = self.dataset_cls(self.data_dir, train=(split == "train"))
-        return _to_nchw_uint8(tv).numpy(), np.asarray(tv.targets, dtype=np.int64)
+        images = _to_nchw_uint8(tv)
+        if self.image_size is not None:
+            images = (
+                F.interpolate(
+                    images.float(),
+                    size=(self.image_size, self.image_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                .round()
+                .clamp(0, 255)
+                .to(torch.uint8)
+            )
+        return images.numpy(), np.asarray(tv.targets, dtype=np.int64)
 
     def _proxy(self, split: str):
         """``(data, targets)`` proxy in the original torchvision layout.

@@ -18,9 +18,13 @@ class HybridOptim:
         for o in self.optimizers:
             o.zero_grad(set_to_none=set_to_none)
 
-    def step(self):
+    def step(self, closure=None):
+        # Accept a closure so this matches the torch.optim.Optimizer.step contract
+        # (and MuonWithAuxAdam.step), e.g. for GradScaler / closure-based loops.
+        loss = closure() if closure is not None else None
         for o in self.optimizers:
             o.step()
+        return loss
 
     def state_dict(self):
         return [o.state_dict() for o in self.optimizers]
