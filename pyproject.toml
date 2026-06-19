@@ -16,6 +16,7 @@ dependencies = [
     "tiktoken>=0.13.0",
     "datasets>=5.0.0",
     "tqdm>=4.68.2",
+    "torchinfo>=1.8.0",
 ]
 
 [project.scripts]
