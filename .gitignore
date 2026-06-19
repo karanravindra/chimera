@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.ruff_cache/
+
+# Virtual environments
+.venv
+
+# Data, caches, and model artifacts
+.chimera_cache/
+lightning_logs/
+outputs/
+*.pt
+*.pth
+*.ckpt

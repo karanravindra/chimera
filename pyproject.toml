@@ -7,7 +7,16 @@ authors = [
     { name = "karan", email = "you@example.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "torch>=2.12.0",
+    "torchvision>=0.27.0",
+    "lightning>=2.6.5",
+    "numpy",
+    "pillow",
+    "tiktoken>=0.13.0",
+    "datasets>=5.0.0",
+    "tqdm>=4.68.2",
+]
 
 [project.scripts]
 chimera = "chimera:main"
