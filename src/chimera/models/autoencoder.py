@@ -10,12 +10,14 @@ class DepthwiseSeparableConv(nn.Module):
         if padding is None:
             padding = kernel_size // 2  # keep spatial dims; for k=1 this is 0, not 1
         self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size, padding=padding, groups=in_channels)
+        self.norm = nn.BatchNorm2d(in_channels)
         self.pointwise1 = nn.Conv2d(in_channels, out_channels * 2, 1)
         self.pointwise2 = nn.Conv2d(out_channels * 2, out_channels, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.depthwise(x)
-        x = F.silu(self.pointwise1(x))
+        x = self.norm(x)
+        x = F.gelu(self.pointwise1(x))
         return self.pointwise2(x)
 
 
@@ -189,7 +191,7 @@ class ConvAutoEncoder(nn.Module):
         self.decoder = nn.Sequential(*dec_blocks)
 
         # head: project hidden channels back to input_dim
-        self.head = DepthwiseSeparableConv(in_channels, input_dim)
+        self.head = nn.Conv2d(in_channels, input_dim, 3, padding=1)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)

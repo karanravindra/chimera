@@ -19,7 +19,7 @@ from pathlib import Path
 import torch
 import wandb
 from lightning import Trainer
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from torchvision.utils import make_grid
 
@@ -165,12 +165,16 @@ def run_training(
     ckpt_dir = outputs / run_id
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_cb = ModelCheckpoint(dirpath=str(ckpt_dir), save_last=True, save_top_k=0, every_n_epochs=1)
+    # Log the optimizer's learning rate to wandb as training progresses (every step, so the
+    # scheduler's curve is visible); needs a logger, which every script passes in.
+    lr_cb = LearningRateMonitor(logging_interval="step")
     mode = getattr(args, "compile_mode", "reduce-overhead")
     compile_model(module, mode)
     if mode in CUDA_GRAPH_COMPILE_MODES and hasattr(datamodule, "drop_last"):
         datamodule.drop_last = True  # avoid an extra CUDA-graph capture for the uneven last batch
         print(f"[compile] {mode!r} uses CUDA graphs -> dropping the last (uneven) batch on every split")
-    trainer = build_trainer(args, logger, [ckpt_cb])
+    trainer = build_trainer(args, logger, [ckpt_cb, lr_cb])
+    logger.watch(module, log="gradients")
     try:
         trainer.fit(module, datamodule=datamodule, ckpt_path=resume_ckpt)
         if test:
