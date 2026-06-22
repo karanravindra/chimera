@@ -42,7 +42,7 @@ import torch.nn.functional as F
 from lightning import LightningDataModule
 from PIL import Image
 from torch import bfloat16
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torchvision.datasets import ImageFolder
 from torchvision.datasets.utils import download_and_extract_archive
 
@@ -151,6 +151,7 @@ class ImageDataModule(LightningDataModule):
         in_memory: bool = True,
         augment_eval: bool = True,
         image_size: int | None = None,
+        drop_last: bool = False,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -176,6 +177,10 @@ class ImageDataModule(LightningDataModule):
         # unaugmented images. Default True preserves the augment-everywhere behavior
         # DINO relies on for its self-supervised views.
         self.augment_eval = augment_eval
+        # Drop the final uneven batch of every split (train/val/test). Off by default;
+        # turned on for CUDA-graph torch.compile modes, where a variable last-batch shape
+        # would force an extra graph capture -- so all loaders must yield one static shape.
+        self.drop_last = drop_last
 
     # ---- cache layout + per-dataset hooks (overridden by StarGAN subclass) ----
 
@@ -264,6 +269,7 @@ class ImageDataModule(LightningDataModule):
             persistent_workers=self.num_workers > 0,
             prefetch_factor=4 if self.num_workers > 0 else None,
             collate_fn=self._collate,
+            drop_last=self.drop_last,  # applies to every split (train/val/test) when enabled
         )
 
     def use_single_process_loaders(self):
@@ -301,6 +307,53 @@ class ImageDataModule(LightningDataModule):
             # but still apply the uint8->bf16 cast the collate left to this hook.
             return to_bf16_scaled(x), y
         return self.gpu_transform(x), y
+
+
+class ConcatImageDataModule(ImageDataModule):
+    """Train/eval over the *union* of several ImageDataModules.
+
+    Each child owns its own download + uint8 cache (and resize, when it sets
+    ``image_size``); this module just concatenates their per-split datasets at load time
+    with ``ConcatDataset``. The bf16 collate, ``in_memory`` handling, ``pin_memory``, and
+    the loaders all carry over unchanged from :class:`ImageDataModule`.
+
+    Children must share spatial size and channel count so their samples stack into a batch
+    -- construct them with the same ``image_size``. Labels are passed through unchanged;
+    overlapping class ids across children are fine for label-free objectives (e.g. an
+    autoencoder), which is the intended use.
+    """
+
+    def __init__(
+        self,
+        datamodules,
+        *,
+        batch_size: int = 64,
+        num_workers: int = 0,
+        pin_memory: bool | None = None,
+        in_memory: bool = True,
+    ):
+        # No gpu_transform: the loader yields ready-to-use bf16 [0,1] batches via the collate.
+        super().__init__(
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            in_memory=in_memory,
+        )
+        self.datamodules = list(datamodules)
+
+    def prepare_data(self):
+        # Single process: each child downloads + materializes its own cache.
+        for dm in self.datamodules:
+            dm.prepare_data()
+
+    def setup(self, stage: str):
+        for dm in self.datamodules:
+            dm.setup(stage)
+        # Mirror ImageDataModule's split policy (val == test) over the concatenated children.
+        if stage == "fit" and not hasattr(self, "train_set"):
+            self.train_set = ConcatDataset([dm.train_set for dm in self.datamodules])
+        if stage in ("fit", "validate", "test") and not hasattr(self, "test_set"):
+            self.test_set = ConcatDataset([dm.test_set for dm in self.datamodules])
 
 
 def _load_imagefolder_nchw_uint8(root: str, image_size: int):

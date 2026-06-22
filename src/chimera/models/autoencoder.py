@@ -2,6 +2,22 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+class DepthwiseSeparableConv(nn.Module):
+    """Depthwise separable conv: a depthwise conv followed by 2 pointwise convs with a nonlinearity in between."""
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, padding: int | None = None):
+        super().__init__()
+        if padding is None:
+            padding = kernel_size // 2  # keep spatial dims; for k=1 this is 0, not 1
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size, padding=padding, groups=in_channels)
+        self.pointwise1 = nn.Conv2d(in_channels, out_channels * 2, 1)
+        self.pointwise2 = nn.Conv2d(out_channels * 2, out_channels, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.depthwise(x)
+        x = F.silu(self.pointwise1(x))
+        return self.pointwise2(x)
+
 
 class PixelUnshuffleChannelAveragingDownSample(nn.Module):
     """space-to-channel + channel averaging. No learned params."""
@@ -49,10 +65,10 @@ class ResBlock(nn.Module):
         self.body = nn.Sequential(
             nn.GroupNorm(g, channels),
             nn.SiLU(),
-            nn.Conv2d(channels, channels, 3, padding=1),
+            DepthwiseSeparableConv(channels, channels),
             nn.GroupNorm(g, channels),
             nn.SiLU(),
-            nn.Conv2d(channels, channels, 3, padding=1),
+            DepthwiseSeparableConv(channels, channels),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -82,7 +98,7 @@ class DCDownBlock(nn.Module):
         )
         self.res = nn.Sequential(*[ResBlock(in_channels) for _ in range(n_res)])
         # conv outputs out_channels // factor^2, pixel_unshuffle inflates back to out_channels
-        self.conv = nn.Conv2d(in_channels, out_channels // factor**2, 3, padding=1)
+        self.conv = DepthwiseSeparableConv(in_channels, out_channels // factor**2)
         self.factor = factor
         self.shortcut = (
             PixelUnshuffleChannelAveragingDownSample(in_channels, out_channels, factor)
@@ -115,7 +131,7 @@ class DCUpBlock(nn.Module):
         shortcut: bool = True,
     ):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels * factor**2, 3, padding=1)
+        self.conv = DepthwiseSeparableConv(in_channels, out_channels * factor**2)
         self.factor = factor
         self.shortcut = (
             ChannelDuplicatingPixelShuffleUpSample(in_channels, out_channels, factor)
@@ -148,7 +164,7 @@ class ConvAutoEncoder(nn.Module):
         # stem: lift input_dim -> base_channels at full resolution.
         # No residual shortcut here: the channel jump (e.g. 1 -> 64) can't form a
         # space-to-channel averaging shortcut (needs in*factor^2 % out == 0).
-        self.stem = nn.Conv2d(input_dim, base_channels, 3, padding=1)
+        self.stem = DepthwiseSeparableConv(input_dim, base_channels)
 
         # encoder: residual downsample blocks operating on hidden channels
         enc_blocks = []
@@ -159,18 +175,21 @@ class ConvAutoEncoder(nn.Module):
         self.encoder = nn.Sequential(*enc_blocks)
 
         # bottleneck: project hidden channels <-> latent_dim with 1x1 convs
-        self.to_latent = nn.Conv2d(in_channels, latent_dim, 1)
-        self.from_latent = nn.Conv2d(latent_dim, in_channels, 1)
+        self.to_latent = DepthwiseSeparableConv(in_channels, latent_dim, 1)
+        self.from_latent = DepthwiseSeparableConv(latent_dim, in_channels, 1)
 
-        # decoder: mirror of the encoder
+        # decoder: mirror of the encoder. Each encoder block maps enc_in -> enc_out
+        # (at a halved resolution); the matching decoder block must invert that,
+        # mapping enc_out -> enc_in while doubling the resolution back.
         dec_blocks = []
-        for out_channels, n_res in reversed(list(zip(dim_per_block, layers_per_block))):
-            dec_blocks.append(DCUpBlock(in_channels, out_channels, n_res=n_res))
-            in_channels = out_channels
+        enc_in_channels = [base_channels, *dim_per_block[:-1]]
+        for enc_in, n_res in reversed(list(zip(enc_in_channels, layers_per_block))):
+            dec_blocks.append(DCUpBlock(in_channels, enc_in, n_res=n_res))
+            in_channels = enc_in
         self.decoder = nn.Sequential(*dec_blocks)
 
         # head: project hidden channels back to input_dim
-        self.head = nn.Conv2d(in_channels, input_dim, 3, padding=1)
+        self.head = DepthwiseSeparableConv(in_channels, input_dim)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
@@ -202,9 +221,10 @@ if __name__ == "__main__":
     # 3x128x128
     model = ConvAutoEncoder(
         input_dim=3,
-        latent_dim=16,
+        latent_dim=8,
         base_channels=64,
-        dim_per_block=(64, 128, 256),
-        layers_per_block=(1, 2, 2),
+        dim_per_block=(128, 256, 256, 256),
+        layers_per_block=(2, 2, 3, 3),
+        
     )
     summary(model, input_size=(1, 3, 128, 128))

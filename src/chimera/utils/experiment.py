@@ -65,6 +65,12 @@ def add_common_args(parser: argparse.ArgumentParser, *, project: str, epochs: in
     parser.add_argument("--data-dir", default="/mnt/ai/data", help="where the dataset is downloaded/cached")
     parser.add_argument("--project", default=project)
     parser.add_argument("--resume", metavar="RUN_ID", default=None, help="wandb run id to resume")
+    parser.add_argument(
+        "--compile-mode",
+        default="reduce-overhead",
+        choices=["off", "default", "reduce-overhead", "max-autotune"],
+        help="torch.compile mode for the model ('off' disables)",
+    )
 
 
 def init_wandb_logger(
@@ -84,6 +90,9 @@ def init_wandb_logger(
 
 def build_trainer(args, logger, callbacks) -> Trainer:
     """The Trainer configuration shared by every training script."""
+    # Use TF32 for fp32 matmuls (the ones bf16-mixed autocast doesn't already cover) so the
+    # GPU's Tensor Cores are utilized -- silences Lightning's warning at negligible precision cost.
+    torch.set_float32_matmul_precision("high")
     return Trainer(
         max_epochs=args.epochs,
         precision="bf16-mixed",
@@ -109,6 +118,31 @@ def upload_checkpoint_artifact(
     print(f"logged checkpoint artifact for run {run_id}")
 
 
+# torch.compile modes that use CUDA graphs (static input shapes); an uneven last batch on
+# any split forces an extra graph capture, so we drop it on all loaders (see run_training).
+CUDA_GRAPH_COMPILE_MODES = frozenset({"reduce-overhead", "max-autotune"})
+
+
+def compile_model(module, mode: str = "reduce-overhead") -> None:
+    """Compile the LightningModule's core ``model`` in place with ``torch.compile`` (no-op
+    when ``mode`` is ``"off"`` or the module has no ``model`` attribute).
+
+    Uses ``nn.Module.compile`` (in place) rather than ``torch.compile(model)``: the latter
+    wraps the model in an ``OptimizedModule`` that prefixes every ``state_dict`` key with
+    ``_orig_mod.``, which would corrupt checkpoints and break the prefix-based weight loading
+    in the rectified-flow project. In-place compile leaves keys and parameters untouched, so
+    checkpoints, resume, and artifact rebuilds keep working unchanged. Only the trainable
+    core ``model`` is compiled; loss/metric networks and logging stay eager."""
+    if not mode or mode == "off":
+        return
+    model = getattr(module, "model", None)
+    if model is None:
+        print(f"[compile] skipped: {type(module).__name__} has no .model attribute")
+        return
+    model.compile(mode=mode)
+    print(f"[compile] torch.compile(mode={mode!r}) on {type(model).__name__}")
+
+
 def run_training(
     *,
     module,
@@ -131,6 +165,11 @@ def run_training(
     ckpt_dir = outputs / run_id
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_cb = ModelCheckpoint(dirpath=str(ckpt_dir), save_last=True, save_top_k=0, every_n_epochs=1)
+    mode = getattr(args, "compile_mode", "reduce-overhead")
+    compile_model(module, mode)
+    if mode in CUDA_GRAPH_COMPILE_MODES and hasattr(datamodule, "drop_last"):
+        datamodule.drop_last = True  # avoid an extra CUDA-graph capture for the uneven last batch
+        print(f"[compile] {mode!r} uses CUDA graphs -> dropping the last (uneven) batch on every split")
     trainer = build_trainer(args, logger, [ckpt_cb])
     try:
         trainer.fit(module, datamodule=datamodule, ckpt_path=resume_ckpt)

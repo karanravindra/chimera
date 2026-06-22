@@ -1,6 +1,7 @@
-"""Train a ConvAutoEncoder on CelebA-HQ or AFHQ with Weights & Biases logging.
+"""Train a ConvAutoEncoder on the union of CelebA-HQ and AFHQ with W&B logging.
 
-One script for both StarGAN-v2 256x256 datasets (pick with ``--dataset``):
+A single autoencoder over the *merged* StarGAN-v2 256x256 datasets (CelebA-HQ faces +
+AFHQ animal faces, concatenated into one train/eval set):
 
   * 8x spatial downsample (3 halving blocks) to an ``8 x (S/8) x (S/8)`` latent -- 8 latent
     channels -- via the deep-compression :class:`~chimera.models.ConvAutoEncoder`;
@@ -8,21 +9,20 @@ One script for both StarGAN-v2 256x256 datasets (pick with ``--dataset``):
     SSIM are logged every phase (train/val/test);
   * reconstruction FID (rFID = FID between originals and their reconstructions, via
     torchmetrics) is logged on the val and test phases -- expensive, so eval-only;
-  * saves a full Lightning checkpoint to ``outputs/<dataset>/<run_id>/last.ckpt`` every
-    epoch and uploads it as a wandb model artifact; ``--resume`` continues the same run
-    and rebuilds the architecture from the checkpoint's saved hyperparameters.
+  * saves a full Lightning checkpoint to ``outputs/<run_id>/last.ckpt`` every epoch and
+    uploads it as a wandb model artifact; ``--resume`` continues the same run and rebuilds
+    the architecture from the checkpoint's saved hyperparameters.
 
 The LPIPS (VGG) and FID (Inception) networks are eval-only, held off the module's
 state_dict (see ``LitAutoEncoder._ensure_metrics``) so they never bloat the checkpoint.
 
 Examples
 --------
-    # fresh run on AFHQ
-    uv run python projects/celeba_afhq/autoencoder/train.py --dataset afhq --epochs 100
+    # fresh run on the merged CelebA-HQ + AFHQ set
+    uv run python projects/celeba_afhq/autoencoder/train.py --epochs 100
 
-    # resume run <id> on CelebA-HQ for more epochs (same wandb run, continues its ckpt)
-    uv run python projects/celeba_afhq/autoencoder/train.py --dataset celeba_hq \
-        --resume <run_id> --epochs 200
+    # resume run <id> for more epochs (same wandb run, continues from its checkpoint)
+    uv run python projects/celeba_afhq/autoencoder/train.py --resume <run_id> --epochs 200
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from torchmetrics.functional.image import (
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-from chimera.data import AFHQDataModule, CelebAHQDataModule
+from chimera.data import AFHQDataModule, CelebAHQDataModule, ConcatImageDataModule
 from chimera.models import ConvAutoEncoder
 from chimera.utils.experiment import (
     add_common_args,
@@ -51,11 +51,14 @@ from chimera.utils.experiment import (
     run_training,
 )
 
-DATAMODULES = {"celeba_hq": CelebAHQDataModule, "afhq": AFHQDataModule}
+# Sources merged (via ConcatImageDataModule) into one train/eval set; the AE is label-free,
+# so the datasets' disjoint class ids don't matter.
+SOURCE_DATAMODULES = {"celeba_hq": CelebAHQDataModule, "afhq": AFHQDataModule}
+DATASET_NAME = "+".join(SOURCE_DATAMODULES)  # "celeba_hq+afhq"
 DOWNSAMPLE = 8  # 3 halving DCDownBlocks: S -> S/2 -> S/4 -> S/8
 LATENT_CHANNELS = 8
 
-OUTPUTS = Path(__file__).parent / "outputs"  # checkpoints live under OUTPUTS/<dataset>/<run_id>
+OUTPUTS = Path(__file__).parent / "outputs"  # checkpoints live under OUTPUTS/<run_id>
 
 
 class LitAutoEncoder(LightningModule):
@@ -197,44 +200,61 @@ class LitAutoEncoder(LightningModule):
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__)
-    add_common_args(p, project=None, epochs=100)  # project defaults to <dataset>-autoencoder below
-    p.set_defaults(batch_size=32, lr=1e-4)  # high-res images + a larger model than MNIST
-    p.add_argument("--dataset", choices=list(DATAMODULES), required=True)
-    p.add_argument("--image-size", type=int, default=256)
-    p.add_argument("--base-channels", type=int, default=128, help="stem width; blocks are (1,2,4)x this")
-    p.add_argument("--lpips-weight", type=float, default=1.0, help="weight of the LPIPS term in the loss")
-    p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="vgg")
-    p.add_argument("--fid-feature", type=int, default=2048, help="InceptionV3 feature dim for rFID")
-    p.add_argument("--mmap", action="store_true", help="memory-map the dataset instead of loading into RAM")
-    args = p.parse_args()
-    args.project = args.project or f"{args.dataset}-autoencoder"
-
-    seed_everything(args.seed, workers=True)  # seed python/numpy/torch + dataloader workers
-
-    # 8x downsample = 3 halving blocks; widths grow (1, 2, 4)x base_channels, latent is
-    # LATENT_CHANNELS x (image_size/8) x (image_size/8). The geometry is asserted at
-    # construction (see LitAutoEncoder.__init__) so this can't silently drift.
-    c = args.base_channels
-    model_config = dict(
+def build_model_config(base_channels: int) -> dict:
+    """The ConvAutoEncoder config: 8x downsample = 3 halving blocks whose widths grow
+    (1, 2, 4)x base_channels, to a LATENT_CHANNELS x (S/8) x (S/8) latent. Shared by main()
+    and benchmark.py so they construct the identical model."""
+    c = base_channels
+    return dict(
         input_dim=3,
         latent_dim=LATENT_CHANNELS,
         base_channels=c,
         dim_per_block=(c, 2 * c, 4 * c),
-        layers_per_block=(2, 2, 2),
+        layers_per_block=(1, 2, 3),
     )
 
-    datamodule = DATAMODULES[args.dataset](
+
+def build_datamodule(
+    *, data_dir: str, image_size: int, batch_size: int, num_workers: int, in_memory: bool = True
+) -> ConcatImageDataModule:
+    """Build the merged CelebA-HQ + AFHQ datamodule. Each source materializes + caches its own
+    uint8 store at image_size; the merged module concatenates their splits and yields the
+    bf16 [0,1] batches the model trains on. Shared by main() and benchmark.py."""
+    sources = [
+        cls(data_dir=data_dir, image_size=image_size, in_memory=in_memory)
+        for cls in SOURCE_DATAMODULES.values()
+    ]
+    return ConcatImageDataModule(
+        sources, batch_size=batch_size, num_workers=num_workers, in_memory=in_memory
+    )
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__)
+    add_common_args(p, project="celeba-afhq-autoencoder", epochs=10)
+    p.set_defaults(batch_size=64, lr=1e-3)  # high-res images + a larger model than MNIST
+    p.add_argument("--image-size", type=int, default=128)
+    p.add_argument("--base-channels", type=int, default=32, help="stem width; blocks are (1,2,4)x this")
+    p.add_argument("--lpips-weight", type=float, default=0.1, help="weight of the LPIPS term in the loss")
+    p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="alex")
+    p.add_argument("--fid-feature", type=int, default=2048, help="InceptionV3 feature dim for rFID")
+    p.add_argument("--mmap", action="store_true", help="memory-map the dataset instead of loading into RAM")
+    args = p.parse_args()
+
+    seed_everything(args.seed, workers=True)  # seed python/numpy/torch + dataloader workers
+
+    # 8x downsample, LATENT_CHANNELS x (image_size/8) x (image_size/8) latent. The geometry is
+    # asserted at construction (see LitAutoEncoder.__init__) so this can't silently drift.
+    model_config = build_model_config(args.base_channels)
+    datamodule = build_datamodule(
         data_dir=args.data_dir,
+        image_size=args.image_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        image_size=args.image_size,
         in_memory=not args.mmap,
     )
 
-    outputs = OUTPUTS / args.dataset
-    resume_ckpt = find_ckpt(args.resume, args.project, outputs) if args.resume else None
+    resume_ckpt = find_ckpt(args.resume, args.project, OUTPUTS) if args.resume else None
     if resume_ckpt:
         # Rebuild from the checkpoint's saved hyperparameters (model_config, image_size,
         # lpips/fid settings), not the current CLI flags, so a resume always reconstructs
@@ -255,7 +275,7 @@ def main() -> None:
     hp = module.hparams
     config = {
         "model": hp["model_config"],
-        "dataset": args.dataset,
+        "dataset": DATASET_NAME,
         "training": {
             "epochs": args.epochs,
             "batch_size": args.batch_size,
@@ -271,7 +291,8 @@ def main() -> None:
             "fid_feature": module.fid_feature,
         },
         "data": {
-            "dataset": args.dataset,
+            "dataset": DATASET_NAME,
+            "sources": list(SOURCE_DATAMODULES),
             "data_dir": args.data_dir,
             "num_workers": args.num_workers,
             "in_memory": not args.mmap,
@@ -286,7 +307,7 @@ def main() -> None:
         args=args,
         logger=logger,
         run_id=run_id,
-        outputs=outputs,
+        outputs=OUTPUTS,
         resume_ckpt=resume_ckpt,
         artifact_metadata=config,
         test=True,  # report rFID/PSNR/SSIM/LPIPS on the test split after training
