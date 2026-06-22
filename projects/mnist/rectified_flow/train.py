@@ -205,7 +205,9 @@ class LitRectifiedFlow(LightningModule):
                     v = self.model(z, t, y)
                 else:  # classifier-free guidance: one batched cond+uncond pass
                     zin, tin = torch.cat([z, z]), torch.cat([t, t])
-                    v_cond, v_uncond = self.model(zin, tin, torch.cat([y, null])).chunk(2)
+                    v_cond, v_uncond = self.model(zin, tin, torch.cat([y, null])).chunk(
+                        2
+                    )
                     v = v_uncond + scale * (v_cond - v_uncond)
                 z = z + dt * v
         return self.decode(z)
@@ -222,7 +224,9 @@ class LitRectifiedFlow(LightningModule):
         imgs = self.sample(y, z0).float().cpu()
         image = grid(imgs, nrow=n)
         self.logger.log_image(
-            "samples/grid", [image], caption=[f"rows = digits 0-9, cfg={self.guidance_scale}"]
+            "samples/grid",
+            [image],
+            caption=[f"rows = digits 0-9, cfg={self.guidance_scale}"],
         )
 
     def configure_optimizers(self):
@@ -238,13 +242,19 @@ def load_autoencoder(ckpt_path: str) -> tuple[ConvAutoEncoder, dict]:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     config = ckpt["hyper_parameters"]["model_config"]
     ae = ConvAutoEncoder(**config)
-    weights = {k[len("model.") :]: v for k, v in ckpt["state_dict"].items() if k.startswith("model.")}
+    weights = {
+        k[len("model.") :]: v
+        for k, v in ckpt["state_dict"].items()
+        if k.startswith("model.")
+    }
     ae.load_state_dict(weights)
     print(f"[ae] loaded ConvAutoEncoder {config}")
     return ae.eval().requires_grad_(False), config
 
 
-def _probe_latent_shape(ae: ConvAutoEncoder, datamodule: MNISTDataModule) -> tuple[int, int, int]:
+def _probe_latent_shape(
+    ae: ConvAutoEncoder, datamodule: MNISTDataModule
+) -> tuple[int, int, int]:
     """Encode one (already IMAGE_SIZE) batch to learn the latent (C, H, W)."""
     datamodule.prepare_data()
     datamodule.setup("fit")
@@ -258,15 +268,38 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     add_common_args(p, project=PROJECT_DEFAULT, epochs=40)
     # autoencoder source (one of --ae-run / --ae-ckpt required)
-    p.add_argument("--ae-run", metavar="RUN_ID", default=None, help="autoencoder wandb run id")
-    p.add_argument("--ae-project", default=AE_PROJECT_DEFAULT, help="autoencoder wandb project")
-    p.add_argument("--ae-ckpt", default=None, help="direct path to an autoencoder checkpoint")
+    p.add_argument(
+        "--ae-run", metavar="RUN_ID", default=None, help="autoencoder wandb run id"
+    )
+    p.add_argument(
+        "--ae-project", default=AE_PROJECT_DEFAULT, help="autoencoder wandb project"
+    )
+    p.add_argument(
+        "--ae-ckpt", default=None, help="direct path to an autoencoder checkpoint"
+    )
     # rectified-flow / CFG
-    p.add_argument("--guidance-scale", type=float, default=3.0, help="CFG scale at sampling (1=off)")
-    p.add_argument("--label-dropout", type=float, default=0.1, help="prob of dropping the label (CFG)")
-    p.add_argument("--sample-steps", type=int, default=50, help="Euler ODE steps for sampling")
+    p.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=3.0,
+        help="CFG scale at sampling (1=off)",
+    )
+    p.add_argument(
+        "--label-dropout",
+        type=float,
+        default=0.1,
+        help="prob of dropping the label (CFG)",
+    )
+    p.add_argument(
+        "--sample-steps", type=int, default=50, help="Euler ODE steps for sampling"
+    )
     # VelocityDiT hyperparameters
-    p.add_argument("--num-tokens", type=int, default=None, help="latent tokens (default: latent channels)")
+    p.add_argument(
+        "--num-tokens",
+        type=int,
+        default=None,
+        help="latent tokens (default: latent channels)",
+    )
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--depth", type=int, default=6)
     p.add_argument("--num-heads", type=int, default=4)
@@ -274,7 +307,9 @@ def main() -> None:
     args = p.parse_args()
 
     if not args.ae_run and not args.ae_ckpt:
-        p.error("supply --ae-run <id> or --ae-ckpt <path> to source the frozen autoencoder")
+        p.error(
+            "supply --ae-run <id> or --ae-ckpt <path> to source the frozen autoencoder"
+        )
 
     seed_everything(args.seed, workers=True)
 
@@ -307,7 +342,9 @@ def main() -> None:
         latent_dim = math.prod(latent_shape)
         num_tokens = args.num_tokens or latent_shape[0]
         if latent_dim % num_tokens != 0:
-            p.error(f"--num-tokens ({num_tokens}) must divide the flat latent dim ({latent_dim})")
+            p.error(
+                f"--num-tokens ({num_tokens}) must divide the flat latent dim ({latent_dim})"
+            )
         flow_config = dict(
             hidden_dim=args.hidden_dim,
             time_dim=args.time_dim,
@@ -325,12 +362,18 @@ def main() -> None:
             guidance_scale=args.guidance_scale,
             sample_steps=args.sample_steps,
         )
-    print(f"[latent] shape={latent_shape} flat_dim={latent_dim} num_tokens={flow_config['num_tokens']}")
+    print(
+        f"[latent] shape={latent_shape} flat_dim={latent_dim} num_tokens={flow_config['num_tokens']}"
+    )
 
     # Read the flow/sampling hyperparameters off the module so the logged config matches the
     # live model on both a fresh run (from args) and a resume (restored from the checkpoint).
     config = {
-        "flow": {**flow_config, "latent_dim": latent_dim, "num_classes": NUM_CLASSES + 1},
+        "flow": {
+            **flow_config,
+            "latent_dim": latent_dim,
+            "num_classes": NUM_CLASSES + 1,
+        },
         "autoencoder": {"config": ae_config, "run": args.ae_run, "ckpt": ae_ckpt},
         "training": {
             "epochs": args.epochs,
@@ -343,7 +386,11 @@ def main() -> None:
             "label_dropout": module.label_dropout,
             "sample_steps": module.sample_steps,
         },
-        "data": {"dataset": "MNIST", "data_dir": args.data_dir, "num_workers": args.num_workers},
+        "data": {
+            "dataset": "MNIST",
+            "data_dir": args.data_dir,
+            "num_workers": args.num_workers,
+        },
     }
 
     logger, run_id = init_wandb_logger(args.project, config, resume=args.resume)

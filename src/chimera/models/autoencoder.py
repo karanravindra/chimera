@@ -2,14 +2,23 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+
 class DepthwiseSeparableConv(nn.Module):
     """Depthwise separable conv: a depthwise conv followed by 2 pointwise convs with a nonlinearity in between."""
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, padding: int | None = None):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        padding: int | None = None,
+    ):
         super().__init__()
         if padding is None:
             padding = kernel_size // 2  # keep spatial dims; for k=1 this is 0, not 1
-        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size, padding=padding, groups=in_channels)
+        self.depthwise = nn.Conv2d(
+            in_channels, in_channels, kernel_size, padding=padding, groups=in_channels
+        )
         self.norm = nn.BatchNorm2d(in_channels)
         self.pointwise1 = nn.Conv2d(in_channels, out_channels * 2, 1)
         self.pointwise2 = nn.Conv2d(out_channels * 2, out_channels, 1)
@@ -227,6 +236,5 @@ if __name__ == "__main__":
         base_channels=64,
         dim_per_block=(128, 256, 256, 256),
         layers_per_block=(2, 2, 3, 3),
-        
     )
     summary(model, input_size=(1, 3, 128, 128))

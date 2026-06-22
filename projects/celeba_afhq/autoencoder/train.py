@@ -90,8 +90,14 @@ class LitAutoEncoder(LightningModule):
         # latent_dim x (S/8) x (S/8) latent (8x downsample). Catches a block-count or
         # latent_dim change that would silently disagree with the docstring / config.
         with torch.no_grad():
-            probe = self.model.encode(torch.zeros(1, model_config["input_dim"], image_size, image_size))
-        expect = (model_config["latent_dim"], image_size // DOWNSAMPLE, image_size // DOWNSAMPLE)
+            probe = self.model.encode(
+                torch.zeros(1, model_config["input_dim"], image_size, image_size)
+            )
+        expect = (
+            model_config["latent_dim"],
+            image_size // DOWNSAMPLE,
+            image_size // DOWNSAMPLE,
+        )
         assert tuple(probe.shape[1:]) == expect, (
             f"expected a {expect} latent for a {image_size}x{image_size} input, got "
             f"{tuple(probe.shape[1:])}; MODEL_CONFIG block count / latent_dim disagree with {DOWNSAMPLE}x"
@@ -106,10 +112,15 @@ class LitAutoEncoder(LightningModule):
         from the optimizer, ``.train()`` and ``.to()``."""
         if self._metrics:
             return
-        lpips = LearnedPerceptualImagePatchSimilarity(net_type=self.lpips_net, normalize=True)
+        lpips = LearnedPerceptualImagePatchSimilarity(
+            net_type=self.lpips_net, normalize=True
+        )
         lpips.requires_grad_(False)  # input still gets gradients; net stays frozen
         fid = FrechetInceptionDistance(feature=self.fid_feature, normalize=True)
-        self._metrics = {"lpips": lpips.to(self.device).eval(), "fid": fid.to(self.device)}
+        self._metrics = {
+            "lpips": lpips.to(self.device).eval(),
+            "fid": fid.to(self.device),
+        }
 
     def on_fit_start(self) -> None:
         self._ensure_metrics()  # LPIPS is needed for the very first training_step loss
@@ -156,7 +167,10 @@ class LitAutoEncoder(LightningModule):
             self._metrics["fid"].update(recon.float().clamp(0, 1), real=False)
         if batch_idx == 0:  # stash a fixed set of reconstructions to log this epoch
             n = self.n_log_images
-            self._sample = (x[:n].float().cpu().clamp(0, 1), recon[:n].float().cpu().clamp(0, 1))
+            self._sample = (
+                x[:n].float().cpu().clamp(0, 1),
+                recon[:n].float().cpu().clamp(0, 1),
+            )
 
     def validation_step(self, batch, batch_idx):
         self._eval_step(batch, batch_idx, "val")
@@ -186,9 +200,13 @@ class LitAutoEncoder(LightningModule):
         # One image, three rows: originals / reconstructions / absolute difference.
         x, recon = self._sample
         panel = torch.cat([x, recon, (x - recon).abs()], dim=0)
-        image = grid(panel, nrow=x.shape[0])  # nrow = samples -> each category on its own row
+        image = grid(
+            panel, nrow=x.shape[0]
+        )  # nrow = samples -> each category on its own row
         self.logger.log_image(
-            f"{stage}/reconstructions", [image], caption=["rows: original / reconstruction / |diff|"]
+            f"{stage}/reconstructions",
+            [image],
+            caption=["rows: original / reconstruction / |diff|"],
         )
         self._sample = None
 
@@ -215,7 +233,12 @@ def build_model_config(base_channels: int) -> dict:
 
 
 def build_datamodule(
-    *, data_dir: str, image_size: int, batch_size: int, num_workers: int, in_memory: bool = True
+    *,
+    data_dir: str,
+    image_size: int,
+    batch_size: int,
+    num_workers: int,
+    in_memory: bool = True,
 ) -> ConcatImageDataModule:
     """Build the merged CelebA-HQ + AFHQ datamodule. Each source materializes + caches its own
     uint8 store at image_size; the merged module concatenates their splits and yields the
@@ -232,16 +255,36 @@ def build_datamodule(
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     add_common_args(p, project="celeba-afhq-autoencoder", epochs=10)
-    p.set_defaults(batch_size=64, lr=1e-3)  # high-res images + a larger model than MNIST
+    p.set_defaults(
+        batch_size=64, lr=1e-3
+    )  # high-res images + a larger model than MNIST
     p.add_argument("--image-size", type=int, default=128)
-    p.add_argument("--base-channels", type=int, default=32, help="stem width; blocks are (1,2,4)x this")
-    p.add_argument("--lpips-weight", type=float, default=0.1, help="weight of the LPIPS term in the loss")
+    p.add_argument(
+        "--base-channels",
+        type=int,
+        default=32,
+        help="stem width; blocks are (1,2,4)x this",
+    )
+    p.add_argument(
+        "--lpips-weight",
+        type=float,
+        default=0.1,
+        help="weight of the LPIPS term in the loss",
+    )
     p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="alex")
-    p.add_argument("--fid-feature", type=int, default=2048, help="InceptionV3 feature dim for rFID")
-    p.add_argument("--mmap", action="store_true", help="memory-map the dataset instead of loading into RAM")
+    p.add_argument(
+        "--fid-feature", type=int, default=2048, help="InceptionV3 feature dim for rFID"
+    )
+    p.add_argument(
+        "--mmap",
+        action="store_true",
+        help="memory-map the dataset instead of loading into RAM",
+    )
     args = p.parse_args()
 
-    seed_everything(args.seed, workers=True)  # seed python/numpy/torch + dataloader workers
+    seed_everything(
+        args.seed, workers=True
+    )  # seed python/numpy/torch + dataloader workers
 
     # 8x downsample, LATENT_CHANNELS x (image_size/8) x (image_size/8) latent. The geometry is
     # asserted at construction (see LitAutoEncoder.__init__) so this can't silently drift.

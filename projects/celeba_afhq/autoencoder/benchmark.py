@@ -65,6 +65,7 @@ def make_step_fn(model, opt, lpips, lpips_weight, device, *, mark_step=False):
 
     ``mark_step`` marks a new CUDA-graph iteration each step (required by cudagraph-trees under
     reduce-overhead/max-autotune so a replay may reuse the previous step's output memory)."""
+
     def step(gpu_batch):
         if mark_step:
             torch.compiler.cudagraph_mark_step_begin()
@@ -78,6 +79,7 @@ def make_step_fn(model, opt, lpips, lpips_weight, device, *, mark_step=False):
         loss.backward()
         opt.step()
         return loss
+
     return step
 
 
@@ -89,7 +91,10 @@ def time_loop(iter_fn, steps, warmup, *, per_step=True):
         iter_fn()
     torch.cuda.synchronize()
     evs = (
-        [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(steps)]
+        [
+            (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            for _ in range(steps)
+        ]
         if per_step
         else None
     )
@@ -132,7 +137,9 @@ def measure_per_stage_eager(loader_iter, step_inputs, steps, device):
         t = tick()
         with torch.autocast(device.type, dtype=torch.bfloat16):
             lp = lpips(recon, x)
-            loss = F.mse_loss(recon, x) + w * lp  # mse is negligible; folded into the LPIPS stage
+            loss = (
+                F.mse_loss(recon, x) + w * lp
+            )  # mse is negligible; folded into the LPIPS stage
         acc["lpips"] += tick() - t
 
         t = tick()
@@ -152,7 +159,9 @@ def count_forward_flops(model_config, image_size, batch_size, device):
     bypasses autocast/compiled regions, so count uncompiled & fp32). Counts conv/matmul-class
     ops only -- GroupNorm/SiLU/pixel-shuffle are not counted, so this is a lower bound."""
     m = ConvAutoEncoder(**model_config).to(device).eval()
-    x = torch.randn(batch_size, model_config["input_dim"], image_size, image_size, device=device)
+    x = torch.randn(
+        batch_size, model_config["input_dim"], image_size, image_size, device=device
+    )
     fc = FlopCounterMode(display=False)
     with fc, torch.no_grad():
         m(x)
@@ -162,18 +171,31 @@ def count_forward_flops(model_config, image_size, batch_size, device):
     return flops
 
 
-def dump_compile_artifacts(model_config, image_size, batch_size, mode, device, out_path):
+def dump_compile_artifacts(
+    model_config, image_size, batch_size, mode, device, out_path
+):
     """Write graph-break summary + inductor output_code for the compiled forward to a file."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     m = ConvAutoEncoder(**model_config).to(device).train()
-    x = torch.randn(batch_size, model_config["input_dim"], image_size, image_size, device=device)
+    x = torch.randn(
+        batch_size, model_config["input_dim"], image_size, image_size, device=device
+    )
     cuda_graphs = mode in CUDA_GRAPH_COMPILE_MODES
     summary = {}
     with contextlib.suppress(Exception):
-        expl = torch._dynamo.explain(m)(x)  # structured break info, before compiling in place
-        summary = {"graph_count": expl.graph_count, "graph_break_count": expl.graph_break_count,
-                   "break_reasons": [str(r) for r in getattr(expl, "break_reasons", [])]}
-    with open(out_path, "w") as f, contextlib.redirect_stderr(f), contextlib.redirect_stdout(f):
+        expl = torch._dynamo.explain(m)(
+            x
+        )  # structured break info, before compiling in place
+        summary = {
+            "graph_count": expl.graph_count,
+            "graph_break_count": expl.graph_break_count,
+            "break_reasons": [str(r) for r in getattr(expl, "break_reasons", [])],
+        }
+    with (
+        open(out_path, "w") as f,
+        contextlib.redirect_stderr(f),
+        contextlib.redirect_stdout(f),
+    ):
         torch._logging.set_logs(output_code=True, graph_breaks=True, recompiles=True)
         try:
             m.compile(mode=mode)
@@ -183,7 +205,9 @@ def dump_compile_artifacts(model_config, image_size, batch_size, mode, device, o
                         torch.compiler.cudagraph_mark_step_begin()
                     m(x).sum().backward()
             torch.cuda.synchronize()
-        except Exception as e:  # the dump is auxiliary -- never let it sink the benchmark
+        except (
+            Exception
+        ) as e:  # the dump is auxiliary -- never let it sink the benchmark
             summary["dump_error"] = str(e).splitlines()[0][:160]
         finally:
             torch._logging.set_logs()  # reset handlers
@@ -198,15 +222,32 @@ def fmt_thru(name, imgs_per_sec, gpu_ms=None):
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--image-size", type=int, default=128)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=7)
-    p.add_argument("--compile", default="off", choices=["off", "default", "reduce-overhead", "max-autotune"])
-    p.add_argument("--steps", type=int, default=50, help="timed steps (warmup excluded)")
-    p.add_argument("--warmup", type=int, default=10, help="discarded warmup steps (>=3 for compile)")
-    p.add_argument("--peak-tflops", type=float, default=DEFAULT_PEAK_TFLOPS,
-                   help="GPU bf16 peak TFLOPS for MFU -- VERIFY for your card; default is an estimate")
+    p.add_argument(
+        "--compile",
+        default="off",
+        choices=["off", "default", "reduce-overhead", "max-autotune"],
+    )
+    p.add_argument(
+        "--steps", type=int, default=50, help="timed steps (warmup excluded)"
+    )
+    p.add_argument(
+        "--warmup",
+        type=int,
+        default=10,
+        help="discarded warmup steps (>=3 for compile)",
+    )
+    p.add_argument(
+        "--peak-tflops",
+        type=float,
+        default=DEFAULT_PEAK_TFLOPS,
+        help="GPU bf16 peak TFLOPS for MFU -- VERIFY for your card; default is an estimate",
+    )
     p.add_argument("--data-dir", default="/mnt/ai/data")
     p.add_argument("--base-channels", type=int, default=32)
     p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="alex")
@@ -223,39 +264,58 @@ def main() -> None:
     # --- build the real module/datamodule/optimizer (reused from train.py) -------------------
     model_config = build_model_config(args.base_channels)
     module = LitAutoEncoder(
-        model_config, image_size=args.image_size, lr=args.lr,
-        lpips_weight=args.lpips_weight, lpips_net=args.lpips_net,
+        model_config,
+        image_size=args.image_size,
+        lr=args.lr,
+        lpips_weight=args.lpips_weight,
+        lpips_net=args.lpips_net,
     )
     module.to(device).train()
     module._ensure_metrics()  # builds LPIPS (and FID, unused here) on the module's device
     lpips = module._metrics["lpips"]
-    opt = torch.optim.AdamW(module.model.parameters(), lr=args.lr)  # mirrors configure_optimizers
+    opt = torch.optim.AdamW(
+        module.model.parameters(), lr=args.lr
+    )  # mirrors configure_optimizers
     if args.compile != "off":
         compile_model(module, args.compile)
     model = module.model
 
     datamodule = build_datamodule(
-        data_dir=args.data_dir, image_size=args.image_size,
-        batch_size=args.batch_size, num_workers=args.num_workers,
+        data_dir=args.data_dir,
+        image_size=args.image_size,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
     )
-    datamodule.drop_last = cuda_graphs  # static shape for CUDA graphs (mirrors run_training)
+    datamodule.drop_last = (
+        cuda_graphs  # static shape for CUDA graphs (mirrors run_training)
+    )
     datamodule.prepare_data()
     datamodule.setup("fit")
     loader = datamodule.train_dataloader()
 
-    step = make_step_fn(model, opt, lpips, args.lpips_weight, device, mark_step=cuda_graphs)
-    bs, steps, warmup = args.batch_size, args.steps, max(args.warmup, 3 if cuda_graphs else 0)
+    step = make_step_fn(
+        model, opt, lpips, args.lpips_weight, device, mark_step=cuda_graphs
+    )
+    bs, steps, warmup = (
+        args.batch_size,
+        args.steps,
+        max(args.warmup, 3 if cuda_graphs else 0),
+    )
     thru = lambda wall: bs * steps / wall  # noqa: E731
 
     # --- 1+2. throughput: real loader / cached compute / dataloader-only ---------------------
     real_iter = cycle(loader)
-    real_wall, real_gpu = time_loop(lambda: step(move(next(real_iter), device)), steps, warmup)
+    real_wall, real_gpu = time_loop(
+        lambda: step(move(next(real_iter), device)), steps, warmup
+    )
 
     cached = move(next(cycle(loader)), device)  # one constant batch, kept on GPU
     cached_wall, cached_gpu = time_loop(lambda: step(cached), steps, warmup)
 
     dl_iter = cycle(loader)
-    dl_wall, _ = time_loop(lambda: move(next(dl_iter), device), steps, warmup, per_step=False)
+    dl_wall, _ = time_loop(
+        lambda: move(next(dl_iter), device), steps, warmup, per_step=False
+    )
 
     real_thru, cached_thru, dl_thru = thru(real_wall), thru(cached_wall), thru(dl_wall)
 
@@ -269,14 +329,25 @@ def main() -> None:
     # --- per-stage breakdown (eager only) ----------------------------------------------------
     stages = None
     if args.compile == "off":
-        stages = measure_per_stage_eager(cycle(loader), (model, opt, lpips, args.lpips_weight),
-                                         max(steps // 2, 5), device)
+        stages = measure_per_stage_eager(
+            cycle(loader),
+            (model, opt, lpips, args.lpips_weight),
+            max(steps // 2, 5),
+            device,
+        )
 
     # --- 4. compiled graph dump --------------------------------------------------------------
     dump_path, dump_summary = None, None
     if args.compile != "off":
-        dump_path = Path(__file__).parent / "outputs" / "benchmark" / f"compile_{args.compile}.log"
-        dump_summary = dump_compile_artifacts(model_config, args.image_size, bs, args.compile, device, dump_path)
+        dump_path = (
+            Path(__file__).parent
+            / "outputs"
+            / "benchmark"
+            / f"compile_{args.compile}.log"
+        )
+        dump_summary = dump_compile_artifacts(
+            model_config, args.image_size, bs, args.compile, device, dump_path
+        )
 
     # --- starvation verdict ------------------------------------------------------------------
     starved = real_thru < 0.9 * cached_thru and real_thru <= 1.15 * dl_thru
@@ -286,10 +357,14 @@ def main() -> None:
     print("\n" + "=" * 78)
     print("  CelebA-HQ+AFHQ autoencoder — training-step benchmark")
     print("=" * 78)
-    print(f"  image={args.image_size}  batch={bs}  workers={args.num_workers}  "
-          f"compile={args.compile}  steps={steps}  warmup={warmup}")
-    print(f"  base_channels={args.base_channels}  lpips_net={args.lpips_net}  "
-          f"latent={LATENT_CHANNELS}x{args.image_size // 8}x{args.image_size // 8}")
+    print(
+        f"  image={args.image_size}  batch={bs}  workers={args.num_workers}  "
+        f"compile={args.compile}  steps={steps}  warmup={warmup}"
+    )
+    print(
+        f"  base_channels={args.base_channels}  lpips_net={args.lpips_net}  "
+        f"latent={LATENT_CHANNELS}x{args.image_size // 8}x{args.image_size // 8}"
+    )
     print("  precision: fp32 input + bf16-mixed autocast (matches train.py)")
 
     print("\n  THROUGHPUT")
@@ -297,26 +372,38 @@ def main() -> None:
     print(fmt_thru("cached batch (compute)", cached_thru, cached_gpu))
     print(fmt_thru("dataloader-only", dl_thru))
     print(f"\n  VERDICT: {bound}")
-    print(f"           real={real_thru:.0f}  cached-compute={cached_thru:.0f}  "
-          f"dataloader-only={dl_thru:.0f} img/s")
+    print(
+        f"           real={real_thru:.0f}  cached-compute={cached_thru:.0f}  "
+        f"dataloader-only={dl_thru:.0f} img/s"
+    )
 
     if stages is not None:
         total = sum(stages.values())
-        print("\n  PER-STAGE (eager, serialized — sum > end-to-end; shows where work is)")
+        print(
+            "\n  PER-STAGE (eager, serialized — sum > end-to-end; shows where work is)"
+        )
         for k in ("dataloader", "forward", "lpips", "backward", "optimizer"):
             print(f"    {k:<12} {stages[k]:7.2f} ms  ({100 * stages[k] / total:4.1f}%)")
     elif args.compile != "off":
-        print("\n  PER-STAGE: skipped (can't sync inside a CUDA graph; run --compile off for it)")
+        print(
+            "\n  PER-STAGE: skipped (can't sync inside a CUDA graph; run --compile off for it)"
+        )
 
     print("\n  ROOFLINE  (model-only conv/matmul FLOPs; excludes LPIPS; lower bound)")
-    print(f"    fwd {fwd_flops / 1e9:.1f} GFLOP  ->  step ~{step_flops / 1e9:.1f} GFLOP (3x)")
+    print(
+        f"    fwd {fwd_flops / 1e9:.1f} GFLOP  ->  step ~{step_flops / 1e9:.1f} GFLOP (3x)"
+    )
     print(f"    peak {args.peak_tflops:.0f} TFLOPS bf16 (VERIFY for your GPU)")
-    print(f"    MFU: {mfu_real:.1f}% at real throughput, {mfu_cached:.1f}% compute-bound ceiling")
+    print(
+        f"    MFU: {mfu_real:.1f}% at real throughput, {mfu_cached:.1f}% compute-bound ceiling"
+    )
 
     if dump_summary is not None:
         print("\n  COMPILED GRAPH")
-        print(f"    graphs={dump_summary.get('graph_count', '?')}  "
-              f"breaks={dump_summary.get('graph_break_count', '?')}")
+        print(
+            f"    graphs={dump_summary.get('graph_count', '?')}  "
+            f"breaks={dump_summary.get('graph_break_count', '?')}"
+        )
         for r in dump_summary.get("break_reasons", [])[:3]:
             print(f"      break: {r[:90]}")
     if dump_path is not None:
@@ -326,29 +413,43 @@ def main() -> None:
     print("\n  DIAGNOSIS")
     print("  " + "-" * 76)
     if starved:
-        head = max(stages or {"dataloader": 1}, key=(stages or {}).get) if stages else "dataloader"
-        msg = (f"The GPU is starved: real throughput ({real_thru:.0f} img/s) tracks the "
-               f"dataloader-only ceiling ({dl_thru:.0f} img/s) and sits well below the "
-               f"cached-compute rate ({cached_thru:.0f} img/s) — time goes to feeding data, "
-               f"not the model. Highest-leverage fix: relieve the input pipeline — raise "
-               f"--num-workers (currently {args.num_workers}), keep in_memory=True (avoid --mmap), "
-               f"and ensure the materialized cache exists so no per-epoch resize happens.")
+        head = (
+            max(stages or {"dataloader": 1}, key=(stages or {}).get)
+            if stages
+            else "dataloader"
+        )
+        msg = (
+            f"The GPU is starved: real throughput ({real_thru:.0f} img/s) tracks the "
+            f"dataloader-only ceiling ({dl_thru:.0f} img/s) and sits well below the "
+            f"cached-compute rate ({cached_thru:.0f} img/s) — time goes to feeding data, "
+            f"not the model. Highest-leverage fix: relieve the input pipeline — raise "
+            f"--num-workers (currently {args.num_workers}), keep in_memory=True (avoid --mmap), "
+            f"and ensure the materialized cache exists so no per-epoch resize happens."
+        )
     else:
-        lp = (f" LPIPS is {stages['lpips'] / sum(stages.values()) * 100:.0f}% of the step."
-              if stages else "")
-        fix = ("enable torch.compile (currently off) for kernel fusion"
-               if args.compile == "off"
-               else "switch to channels_last memory format and/or grow the batch to raise utilization")
-        msg = (f"Compute-bound: real ({real_thru:.0f} img/s) ≈ cached-compute "
-               f"({cached_thru:.0f} img/s), so the dataloader keeps up.{lp} MFU is "
-               f"{mfu_cached:.1f}% of the {args.peak_tflops:.0f}-TFLOP roofline — a conv "
-               f"autoencoder is GroupNorm/SiLU/pixel-shuffle heavy (memory-bound, few matmuls), "
-               f"so low MFU is expected. Highest-leverage fix: {fix}.")
+        lp = (
+            f" LPIPS is {stages['lpips'] / sum(stages.values()) * 100:.0f}% of the step."
+            if stages
+            else ""
+        )
+        fix = (
+            "enable torch.compile (currently off) for kernel fusion"
+            if args.compile == "off"
+            else "switch to channels_last memory format and/or grow the batch to raise utilization"
+        )
+        msg = (
+            f"Compute-bound: real ({real_thru:.0f} img/s) ≈ cached-compute "
+            f"({cached_thru:.0f} img/s), so the dataloader keeps up.{lp} MFU is "
+            f"{mfu_cached:.1f}% of the {args.peak_tflops:.0f}-TFLOP roofline — a conv "
+            f"autoencoder is GroupNorm/SiLU/pixel-shuffle heavy (memory-bound, few matmuls), "
+            f"so low MFU is expected. Highest-leverage fix: {fix}."
+        )
     # wrap to ~76 cols
     words, line = msg.split(), "  "
     for w in words:
         if len(line) + len(w) + 1 > 78:
-            print(line); line = "  "
+            print(line)
+            line = "  "
         line += w + " "
     print(line.rstrip())
     print("=" * 78 + "\n")

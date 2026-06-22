@@ -55,7 +55,7 @@ MODEL_CONFIG = dict(
     latent_dim=4,
     base_channels=4,
     dim_per_block=(8, 16, 16, 16),
-    layers_per_block=(2, 2, 3, 3)
+    layers_per_block=(2, 2, 3, 3),
 )
 
 OUTPUTS = Path(__file__).parent / "outputs"
@@ -77,7 +77,9 @@ class LitAutoEncoder(LightningModule):
         # (latent_dim) x 2 x 2 latent. Catches a block-count change that would
         # silently make the comment / notebook ("4x2x2 = 16-dim") wrong.
         with torch.no_grad():
-            probe = self.model.encode(torch.zeros(1, model_config["input_dim"], IMAGE_SIZE, IMAGE_SIZE))
+            probe = self.model.encode(
+                torch.zeros(1, model_config["input_dim"], IMAGE_SIZE, IMAGE_SIZE)
+            )
         assert probe.shape[-2:] == (2, 2), (
             f"expected a 2x2 latent for a {IMAGE_SIZE}x{IMAGE_SIZE} input, got "
             f"{tuple(probe.shape[-2:])}; MODEL_CONFIG block count and the docstring disagree"
@@ -101,7 +103,9 @@ class LitAutoEncoder(LightningModule):
         # so compute the reconstruction-quality metrics on eval batches only.
         if stage != "train":
             psnr = -10.0 * torch.log10(loss.detach().clamp_min(1e-12))
-            ssim_val = ssim(recon.detach().float().clamp(0, 1), x.float(), data_range=1.0)
+            ssim_val = ssim(
+                recon.detach().float().clamp(0, 1), x.float(), data_range=1.0
+            )
             self.log(f"{stage}/psnr", psnr, prog_bar=True)
             self.log(f"{stage}/ssim", ssim_val, prog_bar=True)
         return loss
@@ -125,9 +129,13 @@ class LitAutoEncoder(LightningModule):
             return
         x, recon = self._val_sample
         panel = torch.cat([x, recon, (x - recon).abs()], dim=0)
-        image = grid(panel, nrow=x.shape[0])  # nrow = samples -> each category on its own row
+        image = grid(
+            panel, nrow=x.shape[0]
+        )  # nrow = samples -> each category on its own row
         self.logger.log_image(
-            "val/reconstructions", [image], caption=["rows: original / reconstruction / |diff|"]
+            "val/reconstructions",
+            [image],
+            caption=["rows: original / reconstruction / |diff|"],
         )
         self._val_sample = None
 
@@ -144,7 +152,9 @@ def main() -> None:
     add_common_args(p, project=PROJECT_DEFAULT, epochs=25)
     args = p.parse_args()
 
-    seed_everything(args.seed, workers=True)  # seed python/numpy/torch + dataloader workers
+    seed_everything(
+        args.seed, workers=True
+    )  # seed python/numpy/torch + dataloader workers
 
     config = {
         "model": MODEL_CONFIG,
@@ -158,7 +168,11 @@ def main() -> None:
             "image_size": IMAGE_SIZE,
             "augment": "RandomAffine(degrees=10, translate=(0.1, 0.1))",
         },
-        "data": {"dataset": "MNIST", "data_dir": args.data_dir, "num_workers": args.num_workers},
+        "data": {
+            "dataset": "MNIST",
+            "data_dir": args.data_dir,
+            "num_workers": args.num_workers,
+        },
     }
 
     logger, run_id = init_wandb_logger(args.project, config, resume=args.resume)

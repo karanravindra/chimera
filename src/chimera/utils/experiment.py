@@ -19,7 +19,7 @@ from pathlib import Path
 import torch
 import wandb
 from lightning import Trainer
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from torchvision.utils import make_grid
 
@@ -50,21 +50,39 @@ def find_ckpt(run_id: str, project: str, outputs: Path) -> str:
         if ckpts:
             print(f"[ckpt] downloaded {ckpts[0]}")
             return str(ckpts[0])
-    raise FileNotFoundError(f"No checkpoint found locally or as an artifact for run {run_id}")
+    raise FileNotFoundError(
+        f"No checkpoint found locally or as an artifact for run {run_id}"
+    )
 
 
-def add_common_args(parser: argparse.ArgumentParser, *, project: str, epochs: int) -> None:
+def add_common_args(
+    parser: argparse.ArgumentParser, *, project: str, epochs: int
+) -> None:
     """Add the argument block shared by every training script. ``project`` and ``epochs``
     set the per-script defaults; the rest are common across projects."""
     parser.add_argument("--epochs", type=int, default=epochs)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--num-workers", type=int, default=7)
-    parser.add_argument("--grad-clip", type=float, default=1.0, help="max grad norm (0 disables)")
+    parser.add_argument(
+        "--grad-clip", type=float, default=1.0, help="max grad norm (0 disables)"
+    )
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.999,
+        help="EMA decay for eval-time weights (0 disables EMA)",
+    )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--data-dir", default="/mnt/ai/data", help="where the dataset is downloaded/cached")
+    parser.add_argument(
+        "--data-dir",
+        default="/mnt/ai/data",
+        help="where the dataset is downloaded/cached",
+    )
     parser.add_argument("--project", default=project)
-    parser.add_argument("--resume", metavar="RUN_ID", default=None, help="wandb run id to resume")
+    parser.add_argument(
+        "--resume", metavar="RUN_ID", default=None, help="wandb run id to resume"
+    )
     parser.add_argument(
         "--compile-mode",
         default="reduce-overhead",
@@ -103,6 +121,86 @@ def build_trainer(args, logger, callbacks) -> Trainer:
         gradient_clip_algorithm="norm",
         deterministic=True,
     )
+
+
+class EMA(Callback):
+    """Maintains an exponential moving average of the LightningModule's trainable ``model``
+    weights and evaluates with the averaged weights.
+
+    Training proceeds on the live (raw) weights; after every optimizer step the shadow is
+    nudged ``ema = decay * ema + (1 - decay) * live``. For validation and test the averaged
+    weights are swapped into ``model`` and the raw weights restored afterward, so logged
+    metrics and reconstruction images reflect the EMA model (which is typically smoother and
+    scores better than the raw SGD iterate) while training continues unperturbed.
+
+    The shadow is saved in the checkpoint as Lightning callback state (see ``state_dict`` /
+    ``load_state_dict``), so a resumed run *continues* the average rather than restarting it.
+    The model's own ``state_dict`` keeps the raw training weights, so resume and the artifact
+    rebuild stay byte-for-byte what they were before EMA — only eval-time weights change.
+    Non-float entries (e.g. ``num_batches_tracked``) are copied, not averaged."""
+
+    def __init__(self, decay: float = 0.999):
+        self.decay = decay
+        self.ema: dict | None = (
+            None  # shadow of model.state_dict(); None until fit start
+        )
+        self._backup: dict | None = None  # raw weights stashed during an eval swap
+
+    @staticmethod
+    def _model(pl_module):
+        """The trainable core that EMA tracks — the same ``.model`` that ``compile_model``
+        targets — falling back to the module itself if it has no ``.model``."""
+        return getattr(pl_module, "model", pl_module)
+
+    def on_fit_start(self, trainer, pl_module) -> None:
+        model = self._model(pl_module)
+        if self.ema is None:
+            self.ema = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        else:  # resumed: align the restored shadow with the (possibly GPU) model's devices
+            reference = model.state_dict()
+            self.ema = {k: v.to(reference[k].device) for k, v in self.ema.items()}
+
+    @torch.no_grad()
+    def on_train_batch_end(self, trainer, pl_module, *args) -> None:
+        for key, value in self._model(pl_module).state_dict().items():
+            shadow = self.ema[key]
+            if value.dtype.is_floating_point:
+                shadow.mul_(self.decay).add_(value.detach(), alpha=1.0 - self.decay)
+            else:
+                shadow.copy_(
+                    value
+                )  # integer buffers (e.g. BN counts): track, don't average
+
+    def _swap_in(self, pl_module) -> None:
+        if self.ema is None:
+            return
+        model = self._model(pl_module)
+        self._backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(self.ema)
+
+    def _swap_out(self, pl_module) -> None:
+        if self._backup is not None:
+            self._model(pl_module).load_state_dict(self._backup)
+            self._backup = None
+
+    def on_validation_start(self, trainer, pl_module) -> None:
+        self._swap_in(pl_module)
+
+    def on_validation_end(self, trainer, pl_module) -> None:
+        self._swap_out(pl_module)
+
+    def on_test_start(self, trainer, pl_module) -> None:
+        self._swap_in(pl_module)
+
+    def on_test_end(self, trainer, pl_module) -> None:
+        self._swap_out(pl_module)
+
+    def state_dict(self) -> dict:
+        return {"decay": self.decay, "ema": self.ema}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self.decay = state_dict["decay"]
+        self.ema = state_dict["ema"]
 
 
 def upload_checkpoint_artifact(
@@ -166,16 +264,29 @@ def run_training(
     (which still propagates after the latest per-epoch ``last.ckpt`` is preserved)."""
     ckpt_dir = outputs / run_id
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_cb = ModelCheckpoint(dirpath=str(ckpt_dir), save_last=True, save_top_k=0, every_n_epochs=1)
+    ckpt_cb = ModelCheckpoint(
+        dirpath=str(ckpt_dir), save_last=True, save_top_k=0, every_n_epochs=1
+    )
     # Log the optimizer's learning rate to wandb as training progresses (every step, so the
     # scheduler's curve is visible); needs a logger, which every script passes in.
     lr_cb = LearningRateMonitor(logging_interval="step")
+    callbacks = [ckpt_cb, lr_cb]
+    # Maintain EMA weights and evaluate with them (0 disables). Append last so the eval-time
+    # weight swap wraps the validation/test the other callbacks observe.
+    ema_decay = getattr(args, "ema_decay", 0.0)
+    if ema_decay:
+        callbacks.append(EMA(decay=ema_decay))
+        print(f"[ema] tracking eval weights with decay={ema_decay}")
     mode = getattr(args, "compile_mode", "reduce-overhead")
     compile_model(module, mode)
     if mode in CUDA_GRAPH_COMPILE_MODES and hasattr(datamodule, "drop_last"):
-        datamodule.drop_last = True  # avoid an extra CUDA-graph capture for the uneven last batch
-        print(f"[compile] {mode!r} uses CUDA graphs -> dropping the last (uneven) batch on every split")
-    trainer = build_trainer(args, logger, [ckpt_cb, lr_cb])
+        datamodule.drop_last = (
+            True  # avoid an extra CUDA-graph capture for the uneven last batch
+        )
+        print(
+            f"[compile] {mode!r} uses CUDA graphs -> dropping the last (uneven) batch on every split"
+        )
+    trainer = build_trainer(args, logger, callbacks)
     logger.watch(module, log="gradients")
     try:
         try:
@@ -183,8 +294,11 @@ def run_training(
         except KeyboardInterrupt:
             # Interrupting training falls through to the test phase (below) on the
             # current weights rather than quitting outright.
-            print("training interrupted — running test on the current weights" if test
-                  else "training interrupted — exiting")
+            print(
+                "training interrupted — running test on the current weights"
+                if test
+                else "training interrupted — exiting"
+            )
         if test:
             try:
                 trainer.test(module, datamodule=datamodule)
@@ -192,5 +306,7 @@ def run_training(
                 # Interrupting the test just quits; there's nothing left to run.
                 print("test interrupted — exiting")
     finally:
-        upload_checkpoint_artifact(logger, run_id, ckpt_dir / "last.ckpt", artifact_metadata)
+        upload_checkpoint_artifact(
+            logger, run_id, ckpt_dir / "last.ckpt", artifact_metadata
+        )
         wandb.finish()
