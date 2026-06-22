@@ -132,6 +132,19 @@ class LitAutoEncoder(LightningModule):
         x = images.float()  # bf16 [0,1] from the collate -> float32 in [0,1]
         return x, self.model(x)  # recon is sigmoid'd into [0,1]
 
+    def _lpips(self, recon: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Per-batch LPIPS (differentiable w.r.t. ``recon``) via the underlying LPIPS net.
+
+        We deliberately do NOT call the ``LearnedPerceptualImagePatchSimilarity`` *metric*
+        (``self._metrics["lpips"](recon, x)``): its ``forward`` appends every batch's score to
+        an internal ``all_scores`` list that we never read (``compute()`` is never called) and
+        never reset, so it grows for the whole run and makes per-step cost climb -- the cause
+        of the per-epoch training slowdown. The metric only ever holds the frozen net for us;
+        calling that net directly gives the same value statelessly and skips the metric's
+        per-call input-range validation (a host-device sync) too."""
+        lpips = self._metrics["lpips"]  # read normalize off the metric so the two can't drift
+        return lpips.net(recon, x, normalize=lpips.normalize).squeeze().mean()
+
     def _log_quality(self, x: torch.Tensor, recon: torch.Tensor, stage: str) -> None:
         # PSNR/SSIM in fp32 (autocast off) so the logged numbers are precision-independent.
         with torch.autocast(self.device.type, enabled=False):
@@ -144,7 +157,7 @@ class LitAutoEncoder(LightningModule):
     def training_step(self, batch, batch_idx):
         x, recon = self._reconstruct(batch)
         mse = F.mse_loss(recon, x)
-        lpips = self._metrics["lpips"](recon, x)
+        lpips = self._lpips(recon, x)
         loss = mse + self.lpips_weight * lpips
         self.log("train/loss", loss, prog_bar=True)
         self.log("train/mse", mse)
@@ -155,7 +168,7 @@ class LitAutoEncoder(LightningModule):
     def _eval_step(self, batch, batch_idx: int, stage: str) -> None:
         x, recon = self._reconstruct(batch)
         mse = F.mse_loss(recon, x)
-        lpips = self._metrics["lpips"](recon, x)
+        lpips = self._lpips(recon, x)
         self.log(f"{stage}/loss", mse + self.lpips_weight * lpips, prog_bar=True)
         self.log(f"{stage}/mse", mse)
         self.log(f"{stage}/lpips", lpips, prog_bar=True)

@@ -272,7 +272,11 @@ def main() -> None:
     )
     module.to(device).train()
     module._ensure_metrics()  # builds LPIPS (and FID, unused here) on the module's device
-    lpips = module._metrics["lpips"]
+    # Mirror training's LPIPS exactly: LitAutoEncoder._lpips calls the net directly rather than
+    # the stateful metric (whose forward appends to an unbounded `all_scores` list that would
+    # inflate the very per-step timing this benchmark measures). Reusing it keeps the benchmark
+    # and the real training step from drifting apart.
+    lpips = module._lpips
     opt = torch.optim.AdamW(
         module.model.parameters(), lr=args.lr
     )  # mirrors configure_optimizers
