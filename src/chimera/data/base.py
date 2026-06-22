@@ -309,6 +309,26 @@ class ImageDataModule(LightningDataModule):
         return self.gpu_transform(x), y
 
 
+class _OffsetLabelDataset(Dataset):
+    """Wraps a dataset, shifting every label by a fixed ``offset`` (images untouched).
+
+    Used by :class:`ConcatImageDataModule` with ``unify_labels=True`` to map each child's
+    dense ``0..K-1`` labels into a contiguous slice of one shared class space, without
+    rewriting the materialized uint8 stores.
+    """
+
+    def __init__(self, base: Dataset, offset: int):
+        self.base = base
+        self.offset = offset
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, i: int):
+        img, label = self.base[i]
+        return img, label + self.offset
+
+
 class ConcatImageDataModule(ImageDataModule):
     """Train/eval over the *union* of several ImageDataModules.
 
@@ -318,9 +338,15 @@ class ConcatImageDataModule(ImageDataModule):
     the loaders all carry over unchanged from :class:`ImageDataModule`.
 
     Children must share spatial size and channel count so their samples stack into a batch
-    -- construct them with the same ``image_size``. Labels are passed through unchanged;
-    overlapping class ids across children are fine for label-free objectives (e.g. an
-    autoencoder), which is the intended use.
+    -- construct them with the same ``image_size``.
+
+    Labels: by default they are passed through unchanged, so overlapping class ids across
+    children collide -- fine for label-free objectives (e.g. an autoencoder), which was the
+    original use. With ``unify_labels=True`` each child's dense ``0..K-1`` labels are offset
+    by the running total of classes in earlier children, producing one contiguous
+    ``0..(sum K_i - 1)`` space (e.g. CelebA-HQ {0,1} + AFHQ {0,1,2} -> {0,1} + {2,3,4}). The
+    offsets follow the order ``datamodules`` is given in, so that order defines the unified
+    class ids -- needed for class-conditioned training over the merged set.
     """
 
     def __init__(
@@ -331,6 +357,7 @@ class ConcatImageDataModule(ImageDataModule):
         num_workers: int = 0,
         pin_memory: bool | None = None,
         in_memory: bool = True,
+        unify_labels: bool = False,
     ):
         # No gpu_transform: the loader yields ready-to-use bf16 [0,1] batches via the collate.
         super().__init__(
@@ -340,20 +367,37 @@ class ConcatImageDataModule(ImageDataModule):
             in_memory=in_memory,
         )
         self.datamodules = list(datamodules)
+        self.unify_labels = unify_labels
 
     def prepare_data(self):
         # Single process: each child downloads + materializes its own cache.
         for dm in self.datamodules:
             dm.prepare_data()
 
+    def _concat(self, split: str) -> ConcatDataset:
+        """Concatenate the children's ``{split}_set``s, offsetting labels into one contiguous
+        class space when ``unify_labels`` is set. The offset for child i is the running sum of
+        the earlier children's class counts (max label + 1). Each split carries all of a
+        dataset's classes (ImageFolder's train/val both have every class dir), so the offset is
+        derived from the split being concatenated -- no dependency on a possibly-unloaded
+        train_set during a test-only setup."""
+        sets = [getattr(dm, f"{split}_set") for dm in self.datamodules]
+        if not self.unify_labels:
+            return ConcatDataset(sets)
+        wrapped, offset = [], 0
+        for ds in sets:
+            wrapped.append(_OffsetLabelDataset(ds, offset))
+            offset += int(ds._labels.max()) + 1  # class count of this child
+        return ConcatDataset(wrapped)
+
     def setup(self, stage: str):
         for dm in self.datamodules:
             dm.setup(stage)
         # Mirror ImageDataModule's split policy (val == test) over the concatenated children.
         if stage == "fit" and not hasattr(self, "train_set"):
-            self.train_set = ConcatDataset([dm.train_set for dm in self.datamodules])
+            self.train_set = self._concat("train")
         if stage in ("fit", "validate", "test") and not hasattr(self, "test_set"):
-            self.test_set = ConcatDataset([dm.test_set for dm in self.datamodules])
+            self.test_set = self._concat("test")
 
 
 def _load_imagefolder_nchw_uint8(root: str, image_size: int):

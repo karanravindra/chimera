@@ -1,7 +1,7 @@
 from chimera.models.autoencoder import ConvAutoEncoder
 from chimera.models.backbone import Backbone
 from chimera.models.digitnet import DigitNet, DigitNetLPIPS
-from chimera.models.flow import TextVelocityDiT, VelocityDiT
+from chimera.models.flow import ClassVelocityDiT, TextVelocityDiT, VelocityDiT
 from chimera.models.gpt2 import GPT, gpt2_large, gpt2_medium, gpt2_xl, gpt2_xs
 from chimera.models.stellarnet import StellarNet
 from chimera.models.titok import TiTokAutoEncoder
@@ -11,6 +11,7 @@ __all__ = [
     "Backbone",
     "VelocityDiT",
     "TextVelocityDiT",
+    "ClassVelocityDiT",
     "TiTokAutoEncoder",
     "DigitNet",
     "DigitNetLPIPS",
