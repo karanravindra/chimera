@@ -159,9 +159,11 @@ def run_training(
     and callback, build the Trainer, and fit (resuming from ``resume_ckpt`` if given). When
     ``test`` is set, ``trainer.test`` runs on the just-trained weights after a clean fit.
 
-    The final-checkpoint upload and ``wandb.finish()`` run in a ``finally`` so they happen
-    on a clean finish, a ``KeyboardInterrupt`` (swallowed), *and* any other exception (which
-    still propagates after the latest per-epoch ``last.ckpt`` is preserved as an artifact)."""
+    A ``KeyboardInterrupt`` during ``fit`` falls through to the test phase (when ``test`` is
+    set) so an interrupted run is still evaluated on its current weights; a second interrupt
+    during ``test`` just quits. The final-checkpoint upload and ``wandb.finish()`` run in a
+    ``finally`` so they happen on a clean finish, either interrupt, *and* any other exception
+    (which still propagates after the latest per-epoch ``last.ckpt`` is preserved)."""
     ckpt_dir = outputs / run_id
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_cb = ModelCheckpoint(dirpath=str(ckpt_dir), save_last=True, save_top_k=0, every_n_epochs=1)
@@ -176,11 +178,19 @@ def run_training(
     trainer = build_trainer(args, logger, [ckpt_cb, lr_cb])
     logger.watch(module, log="gradients")
     try:
-        trainer.fit(module, datamodule=datamodule, ckpt_path=resume_ckpt)
+        try:
+            trainer.fit(module, datamodule=datamodule, ckpt_path=resume_ckpt)
+        except KeyboardInterrupt:
+            # Interrupting training falls through to the test phase (below) on the
+            # current weights rather than quitting outright.
+            print("training interrupted — running test on the current weights" if test
+                  else "training interrupted — exiting")
         if test:
-            trainer.test(module, datamodule=datamodule)
-    except KeyboardInterrupt:
-        print("interrupted — uploading the latest checkpoint before exiting")
+            try:
+                trainer.test(module, datamodule=datamodule)
+            except KeyboardInterrupt:
+                # Interrupting the test just quits; there's nothing left to run.
+                print("test interrupted — exiting")
     finally:
         upload_checkpoint_artifact(logger, run_id, ckpt_dir / "last.ckpt", artifact_metadata)
         wandb.finish()
