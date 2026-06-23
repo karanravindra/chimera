@@ -230,11 +230,12 @@ if __name__ == "__main__":
     # summary(model, input_size=(1, 1, 32, 32))
 
     # 3x128x128
+    c = 32
     model = ConvAutoEncoder(
         input_dim=3,
         latent_dim=8,
-        base_channels=64,
-        dim_per_block=(128, 256, 256, 256),
-        layers_per_block=(2, 2, 3, 3),
+        base_channels=c,
+        dim_per_block=(c, 2 * c, 4 * c, 4 * c),
+        layers_per_block=(1, 2, 3, 3),
     )
     summary(model, input_size=(1, 3, 128, 128))

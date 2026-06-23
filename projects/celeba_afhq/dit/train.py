@@ -344,7 +344,7 @@ def build_datamodule(
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    add_common_args(p, project=PROJECT_DEFAULT, epochs=10)
+    add_common_args(p, project=PROJECT_DEFAULT, epochs=100)
     p.set_defaults(batch_size=64, lr=1e-3)  # high-res latent; smaller batch than MNIST
     # autoencoder source (one of --ae-run / --ae-ckpt required)
     p.add_argument(

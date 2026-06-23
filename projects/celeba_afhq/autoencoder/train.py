@@ -3,7 +3,7 @@
 A single autoencoder over the *merged* StarGAN-v2 256x256 datasets (CelebA-HQ faces +
 AFHQ animal faces, concatenated into one train/eval set):
 
-  * 8x spatial downsample (3 halving blocks) to an ``8 x (S/8) x (S/8)`` latent -- 8 latent
+  * 16x spatial downsample (4 halving blocks) to an ``8 x (S/16) x (S/16)`` latent -- 8 latent
     channels -- via the deep-compression :class:`~chimera.models.ConvAutoEncoder`;
   * trained on MSE + an LPIPS perceptual loss (``--lpips-weight``); MSE, LPIPS, PSNR and
     SSIM are logged every phase (train/val/test);
@@ -55,7 +55,7 @@ from chimera.utils.experiment import (
 # so the datasets' disjoint class ids don't matter.
 SOURCE_DATAMODULES = {"celeba_hq": CelebAHQDataModule, "afhq": AFHQDataModule}
 DATASET_NAME = "+".join(SOURCE_DATAMODULES)  # "celeba_hq+afhq"
-DOWNSAMPLE = 8  # 3 halving DCDownBlocks: S -> S/2 -> S/4 -> S/8
+DOWNSAMPLE = 16  # 4 halving DCDownBlocks: S -> S/2 -> S/4 -> S/8 -> S/16
 LATENT_CHANNELS = 8
 
 OUTPUTS = Path(__file__).parent / "outputs"  # checkpoints live under OUTPUTS/<run_id>
@@ -87,7 +87,7 @@ class LitAutoEncoder(LightningModule):
         self._metrics: dict = {}
 
         # Guard the documented latent geometry: an SxS input must encode to a
-        # latent_dim x (S/8) x (S/8) latent (8x downsample). Catches a block-count or
+        # latent_dim x (S/16) x (S/16) latent (16x downsample). Catches a block-count or
         # latent_dim change that would silently disagree with the docstring / config.
         with torch.no_grad():
             probe = self.model.encode(
@@ -232,16 +232,16 @@ class LitAutoEncoder(LightningModule):
 
 
 def build_model_config(base_channels: int) -> dict:
-    """The ConvAutoEncoder config: 8x downsample = 3 halving blocks whose widths grow
-    (1, 2, 4)x base_channels, to a LATENT_CHANNELS x (S/8) x (S/8) latent. Shared by main()
+    """The ConvAutoEncoder config: 16x downsample = 4 halving blocks whose widths grow
+    (1, 2, 4, 4)x base_channels, to a LATENT_CHANNELS x (S/16) x (S/16) latent. Shared by main()
     and benchmark.py so they construct the identical model."""
     c = base_channels
     return dict(
         input_dim=3,
         latent_dim=LATENT_CHANNELS,
         base_channels=c,
-        dim_per_block=(c, 2 * c, 4 * c),
-        layers_per_block=(1, 2, 3),
+        dim_per_block=(c, 2 * c, 4 * c, 4 * c),
+        layers_per_block=(1, 2, 3, 3)
     )
 
 
@@ -269,14 +269,14 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     add_common_args(p, project="celeba-afhq-autoencoder", epochs=10)
     p.set_defaults(
-        batch_size=64, lr=1e-3
+        batch_size=32, lr=8e-4
     )  # high-res images + a larger model than MNIST
     p.add_argument("--image-size", type=int, default=128)
     p.add_argument(
         "--base-channels",
         type=int,
         default=32,
-        help="stem width; blocks are (1,2,4)x this",
+        help="stem width; blocks are (1,2,4,4)x this",
     )
     p.add_argument(
         "--lpips-weight",
@@ -284,7 +284,7 @@ def main() -> None:
         default=0.1,
         help="weight of the LPIPS term in the loss",
     )
-    p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="alex")
+    p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="squeeze")
     p.add_argument(
         "--fid-feature", type=int, default=2048, help="InceptionV3 feature dim for rFID"
     )
