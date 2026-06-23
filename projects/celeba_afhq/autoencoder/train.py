@@ -5,16 +5,22 @@ AFHQ animal faces, concatenated into one train/eval set):
 
   * 16x spatial downsample (4 halving blocks) to an ``8 x (S/16) x (S/16)`` latent -- 8 latent
     channels -- via the deep-compression :class:`~chimera.models.ConvAutoEncoder`;
-  * trained on MSE + an LPIPS perceptual loss (``--lpips-weight``); MSE, LPIPS, PSNR and
-    SSIM are logged every phase (train/val/test);
+  * trained on MSE + an LPIPS perceptual loss (``--lpips-weight``) + a REPA representation-
+    alignment loss (``--repa-weight``); MSE, LPIPS, REPA, PSNR and SSIM are logged every phase
+    (train/val/test);
+  * REPA (Representation Alignment, Yu et al. 2024) aligns the latent to the patch features of
+    a frozen DINOv2 encoder (``--repa-model``, loaded from HuggingFace) via a small trainable
+    projection head and a patch-wise cosine-similarity loss, structuring the latent space;
+    ``--repa-weight 0`` disables it entirely (no DINOv2 load);
   * reconstruction FID (rFID = FID between originals and their reconstructions, via
     torchmetrics) is logged on the val and test phases -- expensive, so eval-only;
   * saves a full Lightning checkpoint to ``outputs/<run_id>/last.ckpt`` every epoch and
     uploads it as a wandb model artifact; ``--resume`` continues the same run and rebuilds
     the architecture from the checkpoint's saved hyperparameters.
 
-The LPIPS (VGG) and FID (Inception) networks are eval-only, held off the module's
-state_dict (see ``LitAutoEncoder._ensure_metrics``) so they never bloat the checkpoint.
+The LPIPS (VGG), FID (Inception) and DINOv2 (REPA target) networks are eval-only, held off the
+module's state_dict (see ``LitAutoEncoder._ensure_metrics``) so they never bloat the checkpoint;
+the REPA projection head is small and trainable, so it IS checkpointed and optimized.
 
 Examples
 --------
@@ -34,6 +40,7 @@ import torch
 import torch.nn.functional as F
 from lightning import LightningModule, seed_everything
 from lightning.pytorch.loggers import WandbLogger
+from torch import nn
 from torchmetrics.functional.image import (
     peak_signal_noise_ratio,
     structural_similarity_index_measure,
@@ -42,7 +49,7 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from chimera.data import AFHQDataModule, CelebAHQDataModule, ConcatImageDataModule
-from chimera.models import ConvAutoEncoder
+from chimera.models import DINOV2_HIDDEN_SIZE, ConvAutoEncoder, Dinov2Features
 from chimera.utils.experiment import (
     add_common_args,
     find_ckpt,
@@ -55,7 +62,7 @@ from chimera.utils.experiment import (
 # so the datasets' disjoint class ids don't matter.
 SOURCE_DATAMODULES = {"celeba_hq": CelebAHQDataModule, "afhq": AFHQDataModule}
 DATASET_NAME = "+".join(SOURCE_DATAMODULES)  # "celeba_hq+afhq"
-DOWNSAMPLE = 16  # 4 halving DCDownBlocks: S -> S/2 -> S/4 -> S/8 -> S/16
+DOWNSAMPLE = 8  # 4 halving DCDownBlocks: S -> S/2 -> S/4 -> S/8 -> S/16
 LATENT_CHANNELS = 8
 
 OUTPUTS = Path(__file__).parent / "outputs"  # checkpoints live under OUTPUTS/<run_id>
@@ -72,6 +79,10 @@ class LitAutoEncoder(LightningModule):
         lpips_weight: float = 1.0,
         lpips_net: str = "vgg",
         fid_feature: int = 2048,
+        repa_weight: float = 0.5,
+        repa_model: str = "facebook/dinov2-small",
+        repa_dino_size: int = 224,
+        repa_proj_hidden: int = 512,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -80,11 +91,29 @@ class LitAutoEncoder(LightningModule):
         self.lpips_weight = lpips_weight
         self.lpips_net = lpips_net
         self.fid_feature = fid_feature
+        self.repa_weight = repa_weight
+        self.repa_model = repa_model
+        self.repa_dino_size = repa_dino_size
         self.n_log_images = 8  # how many reconstructions to log each eval epoch
         self._sample = None  # (originals, recons) stashed from the first eval batch
-        # Eval-only metric networks (LPIPS for the perceptual loss + logging, FID for rFID),
-        # filled in lazily by _ensure_metrics. Kept in a plain dict on purpose -- see there.
+        # Eval-only metric networks (LPIPS for the perceptual loss + logging, FID for rFID,
+        # and -- when REPA is on -- the frozen DINOv2 target), filled in lazily by
+        # _ensure_metrics. Kept in a plain dict on purpose -- see there.
         self._metrics: dict = {}
+
+        # REPA (Representation Alignment): a trainable head projecting each latent token onto
+        # the frozen DINOv2 patch-feature space, where a cosine-similarity loss aligns them.
+        # Unlike the frozen metric nets this IS optimized + checkpointed, so it's a real
+        # nn.Module attribute. Sized from the known DINOv2 width (no HF download in __init__).
+        if repa_weight > 0:
+            dino_dim = DINOV2_HIDDEN_SIZE[repa_model]
+            self.repa_proj = nn.Sequential(
+                nn.Linear(model_config["latent_dim"], repa_proj_hidden),
+                nn.SiLU(),
+                nn.Linear(repa_proj_hidden, repa_proj_hidden),
+                nn.SiLU(),
+                nn.Linear(repa_proj_hidden, dino_dim),
+            )
 
         # Guard the documented latent geometry: an SxS input must encode to a
         # latent_dim x (S/16) x (S/16) latent (16x downsample). Catches a block-count or
@@ -121,16 +150,25 @@ class LitAutoEncoder(LightningModule):
             "lpips": lpips.to(self.device).eval(),
             "fid": fid.to(self.device),
         }
+        # Frozen DINOv2 REPA target -- same off-state_dict treatment as LPIPS/FID.
+        if self.repa_weight > 0:
+            dino = Dinov2Features(self.repa_model, image_size=self.repa_dino_size)
+            self._metrics["dino"] = dino.to(self.device).eval()
 
     def on_fit_start(self) -> None:
         self._ensure_metrics()  # LPIPS is needed for the very first training_step loss
 
     # -- losses / quality metrics ----------------------------------------------------
 
-    def _reconstruct(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
+    def _reconstruct(
+        self, batch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         images, _ = batch
         x = images.float()  # bf16 [0,1] from the collate -> float32 in [0,1]
-        return x, self.model(x)  # recon is sigmoid'd into [0,1]
+        if self.repa_weight > 0:  # also surface the latent for the REPA loss (single pass)
+            recon, z = self.model(x, return_latent=True)
+            return x, recon, z  # recon is sigmoid'd into [0,1]
+        return x, self.model(x), None
 
     def _lpips(self, recon: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """Per-batch LPIPS (differentiable w.r.t. ``recon``) via the underlying LPIPS net.
@@ -145,6 +183,25 @@ class LitAutoEncoder(LightningModule):
         lpips = self._metrics["lpips"]  # read normalize off the metric so the two can't drift
         return lpips.net(recon, x, normalize=lpips.normalize).squeeze().mean()
 
+    def _repa(self, z: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """REPA loss: align the projected latent tokens to DINOv2 patch features of ``x``.
+
+        ``z`` is the autoencoder latent ``(B, latent_dim, g, g)``; ``x`` is the clean ``[0,1]``
+        input. The frozen DINOv2 features (computed under no_grad inside ``Dinov2Features``)
+        are resized to the latent grid, then we maximize per-token cosine similarity between
+        them and ``repa_proj(z)``. Returns ``1 - mean_cos`` (0 = perfectly aligned)."""
+        dino = self._metrics["dino"]
+        target = dino.as_grid(dino(x))  # (B, dino_dim, gh, gw), gradient-free
+        g = z.shape[-1]
+        target = F.interpolate(
+            target.float(), size=g, mode="bilinear", align_corners=False
+        )
+        target = target.flatten(2).transpose(1, 2)  # (B, g*g, dino_dim)
+        proj = self.repa_proj(z.flatten(2).transpose(1, 2))  # (B, g*g, dino_dim)
+        proj = F.normalize(proj, dim=-1)
+        target = F.normalize(target, dim=-1)
+        return (1 - (proj * target).sum(dim=-1)).mean()
+
     def _log_quality(self, x: torch.Tensor, recon: torch.Tensor, stage: str) -> None:
         # PSNR/SSIM in fp32 (autocast off) so the logged numbers are precision-independent.
         with torch.autocast(self.device.type, enabled=False):
@@ -155,10 +212,14 @@ class LitAutoEncoder(LightningModule):
         self.log(f"{stage}/ssim", ssim, prog_bar=True)
 
     def training_step(self, batch, batch_idx):
-        x, recon = self._reconstruct(batch)
+        x, recon, z = self._reconstruct(batch)
         mse = F.mse_loss(recon, x)
         lpips = self._lpips(recon, x)
         loss = mse + self.lpips_weight * lpips
+        if self.repa_weight > 0:
+            repa = self._repa(z, x)
+            loss = loss + self.repa_weight * repa
+            self.log("train/repa", repa, prog_bar=True)
         self.log("train/loss", loss, prog_bar=True)
         self.log("train/mse", mse)
         self.log("train/lpips", lpips, prog_bar=True)
@@ -166,10 +227,15 @@ class LitAutoEncoder(LightningModule):
         return loss
 
     def _eval_step(self, batch, batch_idx: int, stage: str) -> None:
-        x, recon = self._reconstruct(batch)
+        x, recon, z = self._reconstruct(batch)
         mse = F.mse_loss(recon, x)
         lpips = self._lpips(recon, x)
-        self.log(f"{stage}/loss", mse + self.lpips_weight * lpips, prog_bar=True)
+        loss = mse + self.lpips_weight * lpips
+        if self.repa_weight > 0:
+            repa = self._repa(z, x)
+            loss = loss + self.repa_weight * repa
+            self.log(f"{stage}/repa", repa, prog_bar=True)
+        self.log(f"{stage}/loss", loss, prog_bar=True)
         self.log(f"{stage}/mse", mse)
         self.log(f"{stage}/lpips", lpips, prog_bar=True)
         self._log_quality(x, recon, stage)
@@ -224,7 +290,9 @@ class LitAutoEncoder(LightningModule):
         self._sample = None
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr)
+        # self.parameters() = autoencoder + (when REPA is on) the projection head; the frozen
+        # DINOv2/LPIPS/FID nets live in self._metrics (a plain dict), so they're excluded.
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=self.trainer.max_epochs or 1
         )
@@ -240,8 +308,8 @@ def build_model_config(base_channels: int) -> dict:
         input_dim=3,
         latent_dim=LATENT_CHANNELS,
         base_channels=c,
-        dim_per_block=(c, 2 * c, 4 * c, 4 * c),
-        layers_per_block=(1, 2, 3, 3)
+        dim_per_block=(c, 2 * c, 4 * c),
+        layers_per_block=(1, 2, 3)
     )
 
 
@@ -269,14 +337,14 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     add_common_args(p, project="celeba-afhq-autoencoder", epochs=10)
     p.set_defaults(
-        batch_size=64, lr=8e-4
+        batch_size=64, lr=1e-3
     )  # high-res images + a larger model than MNIST
     p.add_argument("--image-size", type=int, default=128)
     p.add_argument(
         "--base-channels",
         type=int,
-        default=64,
-        help="stem width; blocks are (1,2,4,4)x this",
+        default=32,
+        help="stem width; blocks are (1,2,4)x this",
     )
     p.add_argument(
         "--lpips-weight",
@@ -287,6 +355,24 @@ def main() -> None:
     p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="squeeze")
     p.add_argument(
         "--fid-feature", type=int, default=2048, help="InceptionV3 feature dim for rFID"
+    )
+    p.add_argument(
+        "--repa-weight",
+        type=float,
+        default=0.5,
+        help="weight of the REPA latent-alignment term; 0 disables REPA entirely",
+    )
+    p.add_argument(
+        "--repa-model",
+        choices=list(DINOV2_HIDDEN_SIZE),
+        default="facebook/dinov2-small",
+        help="frozen DINOv2 checkpoint providing the REPA alignment target",
+    )
+    p.add_argument(
+        "--repa-dino-size",
+        type=int,
+        default=224,
+        help="resolution the input is resized to for the DINOv2 target (multiple of 14)",
     )
     p.add_argument(
         "--mmap",
@@ -324,6 +410,9 @@ def main() -> None:
             lpips_weight=args.lpips_weight,
             lpips_net=args.lpips_net,
             fid_feature=args.fid_feature,
+            repa_weight=args.repa_weight,
+            repa_model=args.repa_model,
+            repa_dino_size=args.repa_dino_size,
         )
 
     # Read model/loss hyperparameters off the module so the logged config matches the live
@@ -345,6 +434,9 @@ def main() -> None:
             "lpips_weight": module.lpips_weight,
             "lpips_net": module.lpips_net,
             "fid_feature": module.fid_feature,
+            "repa_weight": module.repa_weight,
+            "repa_model": module.repa_model,
+            "repa_dino_size": module.repa_dino_size,
         },
         "data": {
             "dataset": DATASET_NAME,

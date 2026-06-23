@@ -56,15 +56,18 @@ def move(batch, device):
     return images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
 
 
-def make_step_fn(model, opt, lpips, lpips_weight, device, *, mark_step=False):
+def make_step_fn(module, opt, lpips, lpips_weight, repa_weight, device, *, mark_step=False):
     """The canonical training step on an already-on-device batch -- mirrors
     LitAutoEncoder._reconstruct + training_step (minus the Trainer-bound self.log).
 
     Crucial fidelity detail: the real code casts ``images.float()`` BEFORE the model, then
     runs bf16-mixed autocast inside -- so the model sees fp32 input, not the loader's bf16.
+    With ``repa_weight > 0`` the model returns the latent too and the frozen-DINOv2 REPA term
+    is added, exactly as in training.
 
     ``mark_step`` marks a new CUDA-graph iteration each step (required by cudagraph-trees under
     reduce-overhead/max-autotune so a replay may reuse the previous step's output memory)."""
+    model = module.model
 
     def step(gpu_batch):
         if mark_step:
@@ -73,8 +76,13 @@ def make_step_fn(model, opt, lpips, lpips_weight, device, *, mark_step=False):
         x = images.float()
         assert x.dtype == torch.float32  # guard the fp32-input + autocast path
         with torch.autocast(device.type, dtype=torch.bfloat16):
-            recon = model(x)
+            if repa_weight > 0:
+                recon, z = model(x, return_latent=True)
+            else:
+                recon, z = model(x), None
             loss = F.mse_loss(recon, x) + lpips_weight * lpips(recon, x)
+            if repa_weight > 0:
+                loss = loss + repa_weight * module._repa(z, x)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
@@ -115,8 +123,11 @@ def measure_per_stage_eager(loader_iter, step_inputs, steps, device):
     """Serialized per-substage timing on the REAL loader (eager only). A synchronize() after
     each substage means the reported times are an upper-bound decomposition whose sum exceeds
     the fused end-to-end time -- it shows where the work is, not an additive budget."""
-    model, opt, lpips, w = step_inputs
-    acc = dict(dataloader=0.0, forward=0.0, lpips=0.0, backward=0.0, optimizer=0.0)
+    module, opt, lpips, w, repa_w = step_inputs
+    model = module.model
+    acc = dict(
+        dataloader=0.0, forward=0.0, lpips=0.0, repa=0.0, backward=0.0, optimizer=0.0
+    )
 
     def tick():
         torch.cuda.synchronize()
@@ -130,8 +141,12 @@ def measure_per_stage_eager(loader_iter, step_inputs, steps, device):
         acc["dataloader"] += tick() - t
 
         t = tick()
+        z = None
         with torch.autocast(device.type, dtype=torch.bfloat16):
-            recon = model(x)
+            if repa_w > 0:
+                recon, z = model(x, return_latent=True)
+            else:
+                recon = model(x)
         acc["forward"] += tick() - t
 
         t = tick()
@@ -141,6 +156,12 @@ def measure_per_stage_eager(loader_iter, step_inputs, steps, device):
                 F.mse_loss(recon, x) + w * lp
             )  # mse is negligible; folded into the LPIPS stage
         acc["lpips"] += tick() - t
+
+        t = tick()
+        if repa_w > 0:  # frozen DINOv2 forward + projector + cosine alignment
+            with torch.autocast(device.type, dtype=torch.bfloat16):
+                loss = loss + repa_w * module._repa(z, x)
+        acc["repa"] += tick() - t
 
         t = tick()
         opt.zero_grad(set_to_none=True)
@@ -252,6 +273,14 @@ def main() -> None:
     p.add_argument("--base-channels", type=int, default=32)
     p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="alex")
     p.add_argument("--lpips-weight", type=float, default=0.1)
+    p.add_argument(
+        "--repa-weight",
+        type=float,
+        default=0.5,
+        help="REPA latent-alignment weight; 0 disables the frozen DINOv2 forward",
+    )
+    p.add_argument("--repa-model", default="facebook/dinov2-small")
+    p.add_argument("--repa-dino-size", type=int, default=224)
     p.add_argument("--lr", type=float, default=1e-3)
     args = p.parse_args()
 
@@ -269,20 +298,22 @@ def main() -> None:
         lr=args.lr,
         lpips_weight=args.lpips_weight,
         lpips_net=args.lpips_net,
+        repa_weight=args.repa_weight,
+        repa_model=args.repa_model,
+        repa_dino_size=args.repa_dino_size,
     )
     module.to(device).train()
-    module._ensure_metrics()  # builds LPIPS (and FID, unused here) on the module's device
+    module._ensure_metrics()  # builds LPIPS (+ FID unused here, + DINOv2 when REPA is on)
     # Mirror training's LPIPS exactly: LitAutoEncoder._lpips calls the net directly rather than
     # the stateful metric (whose forward appends to an unbounded `all_scores` list that would
     # inflate the very per-step timing this benchmark measures). Reusing it keeps the benchmark
     # and the real training step from drifting apart.
     lpips = module._lpips
     opt = torch.optim.AdamW(
-        module.model.parameters(), lr=args.lr
-    )  # mirrors configure_optimizers
+        module.parameters(), lr=args.lr
+    )  # mirrors configure_optimizers (AE + REPA projector)
     if args.compile != "off":
         compile_model(module, args.compile)
-    model = module.model
 
     datamodule = build_datamodule(
         data_dir=args.data_dir,
@@ -298,7 +329,13 @@ def main() -> None:
     loader = datamodule.train_dataloader()
 
     step = make_step_fn(
-        model, opt, lpips, args.lpips_weight, device, mark_step=cuda_graphs
+        module,
+        opt,
+        lpips,
+        args.lpips_weight,
+        args.repa_weight,
+        device,
+        mark_step=cuda_graphs,
     )
     bs, steps, warmup = (
         args.batch_size,
@@ -335,7 +372,7 @@ def main() -> None:
     if args.compile == "off":
         stages = measure_per_stage_eager(
             cycle(loader),
-            (model, opt, lpips, args.lpips_weight),
+            (module, opt, lpips, args.lpips_weight, args.repa_weight),
             max(steps // 2, 5),
             device,
         )
@@ -369,6 +406,12 @@ def main() -> None:
         f"  base_channels={args.base_channels}  lpips_net={args.lpips_net}  "
         f"latent={LATENT_CHANNELS}x{args.image_size // 8}x{args.image_size // 8}"
     )
+    repa_desc = (
+        f"{args.repa_model} @ {args.repa_dino_size}px (w={args.repa_weight})"
+        if args.repa_weight > 0
+        else "off"
+    )
+    print(f"  repa: {repa_desc}")
     print("  precision: fp32 input + bf16-mixed autocast (matches train.py)")
 
     print("\n  THROUGHPUT")
@@ -386,14 +429,14 @@ def main() -> None:
         print(
             "\n  PER-STAGE (eager, serialized — sum > end-to-end; shows where work is)"
         )
-        for k in ("dataloader", "forward", "lpips", "backward", "optimizer"):
+        for k in ("dataloader", "forward", "lpips", "repa", "backward", "optimizer"):
             print(f"    {k:<12} {stages[k]:7.2f} ms  ({100 * stages[k] / total:4.1f}%)")
     elif args.compile != "off":
         print(
             "\n  PER-STAGE: skipped (can't sync inside a CUDA graph; run --compile off for it)"
         )
 
-    print("\n  ROOFLINE  (model-only conv/matmul FLOPs; excludes LPIPS; lower bound)")
+    print("\n  ROOFLINE  (AE conv/matmul FLOPs only; excludes LPIPS + REPA/DINOv2; lower bound)")
     print(
         f"    fwd {fwd_flops / 1e9:.1f} GFLOP  ->  step ~{step_flops / 1e9:.1f} GFLOP (3x)"
     )

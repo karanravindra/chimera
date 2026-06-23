@@ -212,8 +212,12 @@ class ConvAutoEncoder(nn.Module):
         x = self.decoder(x)
         return self.head(x).sigmoid()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.decode(self.encode(x))
+    def forward(
+        self, x: torch.Tensor, return_latent: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        z = self.encode(x)
+        recon = self.decode(z)
+        return (recon, z) if return_latent else recon
 
 
 if __name__ == "__main__":
