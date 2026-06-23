@@ -224,30 +224,34 @@ class TiTokAutoEncoder(nn.Module):
 
 if __name__ == "__main__":
     from torchinfo import summary
+    from torch.profiler import profile, ProfilerActivity
 
-    # 1x32x32
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+
+    torch.set_float32_matmul_precision('medium')
+
     model = TiTokAutoEncoder(
-        input_dim=1,
-        image_size=32,
+        input_dim=3,
+        image_size=128,
         patch_size=8,
         num_latent_tokens=4,
         latent_dim=4,
         embed_dim=48,
         depth=4,
         num_heads=2,
-    )
-    summary(model, input_size=(1, 1, 32, 32))
+    ).to(device, dtype=dtype)
 
-    # # 3x128x128
-    # model = TiTokAutoEncoder(
-    #     input_dim=3,
-    #     image_size=128,
-    #     patch_size=16,
-    #     num_latent_tokens=32,
-    #     latent_dim=64,
-    #     embed_dim=512,
-    #     depth=8,
-    #     num_heads=8,
-    #     mlp_ratio=4.0,
-    # )
-    # summary(model, input_size=(1, 3, 128, 128))
+    x = torch.randn(64, 3, 128, 128, device=device, dtype=dtype)
+
+    summary(model, input_size=x.shape, device=device, dtypes=[dtype])
+
+    model = torch.compile(model, mode="reduce-overhead")
+    for _ in range(50):          # warm up (skips compile time in the profile)
+        model(x)
+
+    with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU]) as prof:
+        for _ in range(50):
+            model(x)
+
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))

@@ -3,5 +3,6 @@
     "**/__pycache__": true,
     "**/*.pyc": true
   },
-  "python.terminal.activateEnvironment": false
+  "python.terminal.activateEnvironment": false,
+  "terminal.integrated.scrollback": 10000
 }

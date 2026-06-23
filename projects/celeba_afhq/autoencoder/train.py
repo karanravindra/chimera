@@ -269,13 +269,13 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     add_common_args(p, project="celeba-afhq-autoencoder", epochs=10)
     p.set_defaults(
-        batch_size=32, lr=8e-4
+        batch_size=64, lr=8e-4
     )  # high-res images + a larger model than MNIST
     p.add_argument("--image-size", type=int, default=128)
     p.add_argument(
         "--base-channels",
         type=int,
-        default=32,
+        default=64,
         help="stem width; blocks are (1,2,4,4)x this",
     )
     p.add_argument(
