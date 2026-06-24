@@ -51,6 +51,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from chimera.data import AFHQDataModule, CelebAHQDataModule, ConcatImageDataModule
 from chimera.models import DINOV2_HIDDEN_SIZE, ConvAutoEncoder, Dinov2Features
 from chimera.utils.experiment import (
+    CUDA_GRAPH_COMPILE_MODES,
     add_common_args,
     find_ckpt,
     grid,
@@ -87,6 +88,11 @@ class LitAutoEncoder(LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.model = ConvAutoEncoder(**model_config)
+        # channels_last: NHWC strides on the conv stack let cuDNN pick its faster Tensor-Core
+        # kernels. Only 4D conv weights are reordered; Linear/norm params are untouched. The
+        # input is matched to NHWC in _prep so no per-step relayout happens. .to(device)
+        # preserves the memory format, so this survives Lightning moving the module to the GPU.
+        self.model = self.model.to(memory_format=torch.channels_last)
         self.lr = lr
         self.lpips_weight = lpips_weight
         self.lpips_net = lpips_net
@@ -96,6 +102,19 @@ class LitAutoEncoder(LightningModule):
         self.repa_dino_size = repa_dino_size
         self.n_log_images = 8  # how many reconstructions to log each eval epoch
         self._sample = None  # (originals, recons) stashed from the first eval batch
+        # Runtime data-path flag (not a hyperparameter -- doesn't affect architecture or the
+        # checkpoint): when True the loader supplies precomputed DINOv2 REPA targets in the
+        # batch, so DINOv2 is never built or run in the loop. Set by main() when the cache
+        # exists; see repa_cache.py. The trainable repa_proj head is unaffected.
+        self.repa_precomputed = False
+        # Single-graph training step: when _step_compile_mode is set (by main from --compile-mode),
+        # on_fit_start compiles _forward_loss (AE fwd + LPIPS + REPA + loss) into ONE graph rather
+        # than just self.model. The step is memory-bandwidth-bound so this only edges out model-only
+        # compile, but it fuses the loss kernels in too. Plain runtime attrs (not hparams): they
+        # don't affect the checkpointed architecture.
+        self._step_compile_mode: str | None = None
+        self._compiled_forward = None
+        self._step_cuda_graphs = False
         # Eval-only metric networks (LPIPS for the perceptual loss + logging, FID for rFID,
         # and -- when REPA is on -- the frozen DINOv2 target), filled in lazily by
         # _ensure_metrics. Kept in a plain dict on purpose -- see there.
@@ -146,52 +165,91 @@ class LitAutoEncoder(LightningModule):
         )
         lpips.requires_grad_(False)  # input still gets gradients; net stays frozen
         fid = FrechetInceptionDistance(feature=self.fid_feature, normalize=True)
+        # LPIPS + DINOv2 are frozen, so they have no fp32 master-weight semantics to preserve:
+        # cast them to bf16 ONCE here and call them with autocast disabled (see _lpips/_repa).
+        # Under autocast they'd otherwise run fp32 weights with a bf16 cast inserted at every op
+        # boundary -- ~470 `bfloat16_copy` kernels/step that do no math and just starve the GPU's
+        # launch queue. Native bf16 deletes those casts; numerics match (autocast already ran
+        # these nets' conv/matmul in bf16). FID stays fp32 (it runs autocast-off already).
+        lpips.net = lpips.net.to(self.device, torch.bfloat16).eval()
         self._metrics = {
             "lpips": lpips.to(self.device).eval(),
             "fid": fid.to(self.device),
         }
-        # Frozen DINOv2 REPA target -- same off-state_dict treatment as LPIPS/FID.
-        if self.repa_weight > 0:
+        # Stash the frozen LPIPS submodules as plain Python objects so _lpips can run the
+        # perceptual distance INLINE (see there): torchmetrics' own _LPIPS.forward returns a
+        # NamedTuple and calls its backbone on two tensors with differing requires_grad, which
+        # graph-breaks torch.compile and triggers a recompile storm. Reusing the backbone
+        # slices / 1x1 lin heads / scaling layer directly keeps the whole train step one graph.
+        lp = lpips.net  # the _LPIPS module (backbone .net, .lins, .scaling_layer, .L)
+        backbone = lp.net
+        slices = (
+            list(backbone.slices)
+            if hasattr(backbone, "slices")  # squeeze: ModuleList of 7 slices
+            else [getattr(backbone, f"slice{i}") for i in range(1, backbone.N_slices + 1)]
+        )
+        self._metrics["lpips_mod"] = lp
+        self._metrics["lpips_slices"] = slices
+        # Frozen DINOv2 REPA target -- same off-state_dict treatment as LPIPS/FID, same bf16-native.
+        # Skipped entirely when targets are precomputed (repa_precomputed): the loader supplies
+        # them, so DINOv2 is never loaded or run -- removing its weights, GPU time and launches.
+        if self.repa_weight > 0 and not self.repa_precomputed:
             dino = Dinov2Features(self.repa_model, image_size=self.repa_dino_size)
-            self._metrics["dino"] = dino.to(self.device).eval()
+            self._metrics["dino"] = dino.to(self.device, torch.bfloat16).eval()
 
     def on_fit_start(self) -> None:
         self._ensure_metrics()  # LPIPS is needed for the very first training_step loss
+        mode = self._step_compile_mode
+        if mode and mode != "off":
+            # Compile the whole forward+loss as one graph (vs run_training's model-only compile,
+            # which main() disables to avoid double-compiling). Lazy: traces on first call.
+            self._compiled_forward = torch.compile(self._forward_loss, mode=mode)
+            self._step_cuda_graphs = mode in CUDA_GRAPH_COMPILE_MODES
+            print(f"[compile] single-step compile(mode={mode!r}): AE+LPIPS+REPA+loss in one graph")
 
     # -- losses / quality metrics ----------------------------------------------------
 
-    def _reconstruct(
-        self, batch
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        images, _ = batch
-        x = images.float()  # bf16 [0,1] from the collate -> float32 in [0,1]
-        if self.repa_weight > 0:  # also surface the latent for the REPA loss (single pass)
-            recon, z = self.model(x, return_latent=True)
-            return x, recon, z  # recon is sigmoid'd into [0,1]
-        return x, self.model(x), None
-
     def _lpips(self, recon: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        """Per-batch LPIPS (differentiable w.r.t. ``recon``) via the underlying LPIPS net.
+        """Per-batch LPIPS (differentiable w.r.t. ``recon``), computed INLINE from the frozen
+        backbone so the whole train step stays a single torch.compile graph.
 
-        We deliberately do NOT call the ``LearnedPerceptualImagePatchSimilarity`` *metric*
-        (``self._metrics["lpips"](recon, x)``): its ``forward`` appends every batch's score to
-        an internal ``all_scores`` list that we never read (``compute()`` is never called) and
-        never reset, so it grows for the whole run and makes per-step cost climb -- the cause
-        of the per-epoch training slowdown. The metric only ever holds the frozen net for us;
-        calling that net directly gives the same value statelessly and skips the metric's
-        per-call input-range validation (a host-device sync) too."""
-        lpips = self._metrics["lpips"]  # read normalize off the metric so the two can't drift
-        return lpips.net(recon, x, normalize=lpips.normalize).squeeze().mean()
+        This reproduces torchmetrics' ``_LPIPS.forward`` (normalize=True path) exactly --
+        scaling layer, per-slice channel-normalized squared feature diffs, 1x1 ``lin`` heads,
+        spatial mean, summed over slices -- but without calling that forward, which returns a
+        NamedTuple and runs the backbone on two tensors of differing ``requires_grad`` (recon
+        vs x): both graph-break Dynamo and trigger an endless recompile, the exact thing that
+        kept LPIPS out of the fused graph. We also avoid the stateful *metric* (its forward
+        appends to an unbounded ``all_scores`` list, the old per-epoch slowdown). bf16-native
+        with autocast off: weights are bf16 (see _ensure_metrics), so no per-op cast kernels."""
+        lp = self._metrics["lpips_mod"]
+        slices = self._metrics["lpips_slices"]
+        with torch.autocast(self.device.type, enabled=False):
+            h0 = lp.scaling_layer(2 * recon.bfloat16() - 1)  # normalize=True: [0,1] -> [-1,1]
+            h1 = lp.scaling_layer(2 * x.bfloat16() - 1)
+            val = 0.0
+            for kk in range(lp.L):  # cumulative features after each backbone slice
+                h0, h1 = slices[kk](h0), slices[kk](h1)
+                f0 = h0 * torch.rsqrt(h0.pow(2).sum(1, keepdim=True) + 1e-8)  # _normalize_tensor
+                f1 = h1 * torch.rsqrt(h1.pow(2).sum(1, keepdim=True) + 1e-8)
+                val = val + lp.lins[kk]((f0 - f1) ** 2).mean([2, 3], keepdim=True)
+        return val.float().squeeze().mean()
 
-    def _repa(self, z: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def _repa(
+        self, z: torch.Tensor, x: torch.Tensor, target: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """REPA loss: align the projected latent tokens to DINOv2 patch features of ``x``.
 
         ``z`` is the autoencoder latent ``(B, latent_dim, g, g)``; ``x`` is the clean ``[0,1]``
-        input. The frozen DINOv2 features (computed under no_grad inside ``Dinov2Features``)
-        are resized to the latent grid, then we maximize per-token cosine similarity between
-        them and ``repa_proj(z)``. Returns ``1 - mean_cos`` (0 = perfectly aligned)."""
-        dino = self._metrics["dino"]
-        target = dino.as_grid(dino(x))  # (B, dino_dim, gh, gw), gradient-free
+        input. The DINOv2 patch features are either supplied precomputed (``target``, the fast
+        path -- see repa_cache.py) or computed on the fly from the frozen DINOv2. They are
+        resized to the latent grid, then we maximize per-token cosine similarity between them
+        and ``repa_proj(z)``. Returns ``1 - mean_cos`` (0 = perfectly aligned)."""
+        if target is None:
+            dino = self._metrics["dino"]
+            # Frozen bf16 DINOv2 with autocast OFF + bf16 input -> no per-op cast kernels (the
+            # forward is @torch.no_grad already, so this is pure inference, gradient-free).
+            with torch.autocast(self.device.type, enabled=False):
+                target = dino.as_grid(dino(x.bfloat16()))  # (B, dino_dim, gh, gw)
         g = z.shape[-1]
         target = F.interpolate(
             target.float(), size=g, mode="bilinear", align_corners=False
@@ -211,33 +269,56 @@ class LitAutoEncoder(LightningModule):
         self.log(f"{stage}/psnr", psnr, prog_bar=True)
         self.log(f"{stage}/ssim", ssim, prog_bar=True)
 
-    def training_step(self, batch, batch_idx):
-        x, recon, z = self._reconstruct(batch)
+    def _prep(self, batch) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """(images, labels[, repa_target]) -> (NHWC fp32 input, precomputed REPA target | None)."""
+        x = batch[0].float().to(memory_format=torch.channels_last)
+        return x, (batch[2] if len(batch) > 2 else None)
+
+    def _forward_loss(self, x: torch.Tensor, repa_target: torch.Tensor | None):
+        """One reconstruct + full loss, returned as tensors. This is the unit torch.compile
+        fuses into a single graph (see on_fit_start). Runs under the trainer's bf16 autocast;
+        _lpips/_repa drop autocast internally for their frozen bf16 nets."""
+        if self.repa_weight > 0:
+            recon, z = self.model(x, return_latent=True)
+        else:
+            recon, z = self.model(x), None
         mse = F.mse_loss(recon, x)
         lpips = self._lpips(recon, x)
         loss = mse + self.lpips_weight * lpips
+        repa = None
         if self.repa_weight > 0:
-            repa = self._repa(z, x)
+            repa = self._repa(z, x, repa_target)
             loss = loss + self.repa_weight * repa
-            self.log("train/repa", repa, prog_bar=True)
-        self.log("train/loss", loss, prog_bar=True)
-        self.log("train/mse", mse)
-        self.log("train/lpips", lpips, prog_bar=True)
+        return loss, mse, lpips, repa, recon
+
+    def training_step(self, batch, batch_idx):
+        x, repa_target = self._prep(batch)
+        if self._compiled_forward is not None:
+            if self._step_cuda_graphs:
+                torch.compiler.cudagraph_mark_step_begin()  # new cudagraph iteration
+            loss, mse, lpips, repa, recon = self._compiled_forward(x, repa_target)
+        else:
+            loss, mse, lpips, repa, recon = self._forward_loss(x, repa_target)
+        # Clone the scalars the logger retains for epoch-end reduction: under reduce-overhead
+        # cudagraphs the compiled fn's outputs live in static memory reused next step, so a
+        # retained reference would read stale data. (recon is consumed this step in _log_quality,
+        # and `loss` is backward'd immediately, so those need no clone.)
+        self.log("train/loss", loss.detach().clone(), prog_bar=True)
+        self.log("train/mse", mse.detach().clone())
+        self.log("train/lpips", lpips.detach().clone(), prog_bar=True)
+        if repa is not None:
+            self.log("train/repa", repa.detach().clone(), prog_bar=True)
         self._log_quality(x, recon, "train")
         return loss
 
     def _eval_step(self, batch, batch_idx: int, stage: str) -> None:
-        x, recon, z = self._reconstruct(batch)
-        mse = F.mse_loss(recon, x)
-        lpips = self._lpips(recon, x)
-        loss = mse + self.lpips_weight * lpips
-        if self.repa_weight > 0:
-            repa = self._repa(z, x)
-            loss = loss + self.repa_weight * repa
-            self.log(f"{stage}/repa", repa, prog_bar=True)
+        x, repa_target = self._prep(batch)
+        loss, mse, lpips, repa, recon = self._forward_loss(x, repa_target)  # eager (no compile)
         self.log(f"{stage}/loss", loss, prog_bar=True)
         self.log(f"{stage}/mse", mse)
         self.log(f"{stage}/lpips", lpips, prog_bar=True)
+        if repa is not None:
+            self.log(f"{stage}/repa", repa, prog_bar=True)
         self._log_quality(x, recon, stage)
         # rFID: accumulate originals as the "real" distribution, reconstructions as "fake".
         # Inception runs in fp32 (autocast off) so the feature stats aren't bf16-noisy.
@@ -292,7 +373,11 @@ class LitAutoEncoder(LightningModule):
     def configure_optimizers(self):
         # self.parameters() = autoencoder + (when REPA is on) the projection head; the frozen
         # DINOv2/LPIPS/FID nets live in self._metrics (a plain dict), so they're excluded.
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        # foreach (not fused): fused AdamW does its own gradient unscaling, which Lightning's
+        # gradient clipping (grad_clip default 1.0) refuses to combine with. foreach still batches
+        # the param updates into a few kernels and the optimizer is a negligible slice of this
+        # memory-bound step, so the fused-vs-foreach difference is in the noise.
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, foreach=True)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=self.trainer.max_epochs or 1
         )
@@ -320,14 +405,27 @@ def build_datamodule(
     batch_size: int,
     num_workers: int,
     in_memory: bool = True,
+    repa_paths: dict | None = None,
 ) -> ConcatImageDataModule:
     """Build the merged CelebA-HQ + AFHQ datamodule. Each source materializes + caches its own
     uint8 store at image_size; the merged module concatenates their splits and yields the
-    bf16 [0,1] batches the model trains on. Shared by main() and benchmark.py."""
+    bf16 [0,1] batches the model trains on. Shared by main() and benchmark.py.
+
+    When ``repa_paths`` is given, returns a :class:`RepaConcatDataModule` whose loaders also
+    serve the precomputed DINOv2 REPA targets (batch becomes ``(images, labels, targets)``),
+    so DINOv2 never runs in the training loop. Lazily imported to avoid a train<->repa_cache
+    import cycle (repa_cache's precompute calls this factory *without* repa_paths)."""
     sources = [
         cls(data_dir=data_dir, image_size=image_size, in_memory=in_memory)
         for cls in SOURCE_DATAMODULES.values()
     ]
+    if repa_paths is not None:
+        from repa_cache import RepaConcatDataModule
+
+        return RepaConcatDataModule(
+            sources, paths=repa_paths, batch_size=batch_size,
+            num_workers=num_workers, in_memory=in_memory,
+        )
     return ConcatImageDataModule(
         sources, batch_size=batch_size, num_workers=num_workers, in_memory=in_memory
     )
@@ -349,7 +447,7 @@ def main() -> None:
     p.add_argument(
         "--lpips-weight",
         type=float,
-        default=0.1,
+        default=0.05,
         help="weight of the LPIPS term in the loss",
     )
     p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="squeeze")
@@ -359,7 +457,7 @@ def main() -> None:
     p.add_argument(
         "--repa-weight",
         type=float,
-        default=0.5,
+        default=0,
         help="weight of the REPA latent-alignment term; 0 disables REPA entirely",
     )
     p.add_argument(
@@ -379,6 +477,13 @@ def main() -> None:
         action="store_true",
         help="memory-map the dataset instead of loading into RAM",
     )
+    p.add_argument(
+        "--repa-cache",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="use precomputed DINOv2 REPA targets (repa_cache.py) instead of running DINOv2 in "
+        "the loop: 'auto' uses the cache if present, 'on' requires it, 'off' always runs DINOv2",
+    )
     args = p.parse_args()
 
     seed_everything(
@@ -388,13 +493,6 @@ def main() -> None:
     # 8x downsample, LATENT_CHANNELS x (image_size/8) x (image_size/8) latent. The geometry is
     # asserted at construction (see LitAutoEncoder.__init__) so this can't silently drift.
     model_config = build_model_config(args.base_channels)
-    datamodule = build_datamodule(
-        data_dir=args.data_dir,
-        image_size=args.image_size,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        in_memory=not args.mmap,
-    )
 
     resume_ckpt = find_ckpt(args.resume, args.project, OUTPUTS) if args.resume else None
     if resume_ckpt:
@@ -414,6 +512,56 @@ def main() -> None:
             repa_model=args.repa_model,
             repa_dino_size=args.repa_dino_size,
         )
+
+    # Decide the REPA data path: precomputed DINOv2 targets (fast) vs running DINOv2 in the
+    # loop. Keyed off the *module's* repa hparams (so a resume picks the cache matching the
+    # arch it was trained with) and the actual image_size fed to the loader.
+    repa_paths = None
+    if module.hparams["repa_weight"] > 0 and args.repa_cache != "off":
+        from repa_cache import cache_exists
+        from repa_cache import repa_paths as _repa_paths
+
+        key = dict(
+            data_dir=args.data_dir,
+            image_size=args.image_size,
+            repa_model=module.hparams["repa_model"],
+            repa_dino_size=module.hparams["repa_dino_size"],
+        )
+        if cache_exists(**key):
+            repa_paths = _repa_paths(**key)
+            module.repa_precomputed = True  # _ensure_metrics will skip the DINOv2 build
+            print(
+                f"[repa-cache] using precomputed DINOv2 targets "
+                f"({key['repa_model']} @ {key['repa_dino_size']}px); DINOv2 won't run in the loop"
+            )
+        elif args.repa_cache == "on":
+            raise SystemExit(
+                f"--repa-cache on but no cache at {_repa_paths(**key)['train']}\n"
+                f"  precompute it: uv run python projects/celeba_afhq/autoencoder/repa_cache.py "
+                f"--image-size {key['image_size']} --repa-model {key['repa_model']} "
+                f"--repa-dino-size {key['repa_dino_size']}"
+            )
+        else:
+            print("[repa-cache] no cache; running DINOv2 in the loop (precompute via repa_cache.py to speed up)")
+
+    datamodule = build_datamodule(
+        data_dir=args.data_dir,
+        image_size=args.image_size,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        in_memory=not args.mmap,
+        repa_paths=repa_paths,
+    )
+
+    # Single-graph training step: hand the compile mode to the module (it compiles _forward_loss
+    # in on_fit_start) and DISABLE run_training's model-only compile so we don't double-compile.
+    # The step is memory-bandwidth-bound, so this fuses the loss kernels into the AE graph for a
+    # small gain over compiling self.model alone. drop_last (static shapes for cudagraphs) is
+    # normally set by run_training for cudagraph modes, but we're zeroing its mode, so set it here.
+    module._step_compile_mode = args.compile_mode
+    if args.compile_mode in CUDA_GRAPH_COMPILE_MODES and hasattr(datamodule, "drop_last"):
+        datamodule.drop_last = True
+    args.compile_mode = "off"  # run_training.compile_model -> no-op (module owns its compile)
 
     # Read model/loss hyperparameters off the module so the logged config matches the live
     # model on both a fresh run (from args) and a resume (restored from the checkpoint).

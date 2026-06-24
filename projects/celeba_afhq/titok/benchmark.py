@@ -1,8 +1,8 @@
-"""Profile the CelebA-HQ+AFHQ autoencoder training step: throughput + bottleneck.
+"""Profile the CelebA-HQ+AFHQ TiTok autoencoder training step: throughput + bottleneck.
 
 Reuses the *real* model/datamodule/loss construction from ``train.py`` (``build_model_config``,
-``build_datamodule``, ``LitAutoEncoder``, ``compile_model``) so it measures the actual training
-step -- fp32 input + bf16-mixed autocast, MSE + LPIPS, AdamW -- not a reimplementation.
+``build_datamodule``, ``LitTiTok``, ``compile_model``) so it measures the actual training step
+-- fp32 input + bf16-mixed autocast, MSE + LPIPS, AdamW -- not a reimplementation.
 
 What it reports:
   1. Steady-state images/sec for the full step (forward + LPIPS + backward + optimizer),
@@ -15,9 +15,9 @@ What it reports:
 
 Examples
 --------
-    uv run python projects/celeba_afhq/autoencoder/benchmark.py --image-size 128 --batch-size 16 \
+    uv run python projects/celeba_afhq/titok/benchmark.py --image-size 128 --batch-size 16 \
         --num-workers 4 --compile off --steps 30 --warmup 8
-    uv run python projects/celeba_afhq/autoencoder/benchmark.py --compile reduce-overhead --steps 40
+    uv run python projects/celeba_afhq/titok/benchmark.py --compile reduce-overhead --steps 40
 """
 
 from __future__ import annotations
@@ -32,11 +32,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.flop_counter import FlopCounterMode
 
-from chimera.models import ConvAutoEncoder
+from chimera.models import TiTokAutoEncoder
 from chimera.utils.experiment import CUDA_GRAPH_COMPILE_MODES, compile_model
 
 # Reuse the exact construction from the training script (co-located; same dir on sys.path).
-from train import LATENT_CHANNELS, LitAutoEncoder, build_datamodule, build_model_config
+from train import LitTiTok, build_datamodule, build_model_config
 
 # RTX 5070 Ti (Blackwell, sm_120) bf16 dense w/ fp32 accumulate -- a rough estimate ONLY.
 # Override with --peak-tflops using your card's actual spec; MFU is meaningless otherwise.
@@ -51,19 +51,17 @@ def cycle(loader):
 
 
 def move(batch, device):
-    """Move a batch to the device (H2D; async only if pinned). Handles both (images, labels)
-    and the precomputed-REPA (images, labels, repa_target) layout."""
-    return tuple(t.to(device, non_blocking=True) for t in batch)
+    """Move a (images, labels) batch to the device (H2D; async only if pinned)."""
+    images, labels = batch
+    return images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
 
 
-def make_step_fn(module, opt, lpips, lpips_weight, repa_weight, device, *, mark_step=False):
+def make_step_fn(module, opt, lpips, lpips_weight, device, *, mark_step=False):
     """The canonical training step on an already-on-device batch -- mirrors
-    LitAutoEncoder._forward_loss + training_step (minus the Trainer-bound self.log).
+    LitTiTok._reconstruct + training_step (minus the Trainer-bound self.log).
 
     Crucial fidelity detail: the real code casts ``images.float()`` BEFORE the model, then
     runs bf16-mixed autocast inside -- so the model sees fp32 input, not the loader's bf16.
-    With ``repa_weight > 0`` the model returns the latent too and the frozen-DINOv2 REPA term
-    is added, exactly as in training.
 
     ``mark_step`` marks a new CUDA-graph iteration each step (required by cudagraph-trees under
     reduce-overhead/max-autotune so a replay may reuse the previous step's output memory)."""
@@ -72,18 +70,12 @@ def make_step_fn(module, opt, lpips, lpips_weight, repa_weight, device, *, mark_
     def step(gpu_batch):
         if mark_step:
             torch.compiler.cudagraph_mark_step_begin()
-        images = gpu_batch[0]
-        repa_target = gpu_batch[2] if len(gpu_batch) > 2 else None  # precomputed REPA target
-        x = images.float().to(memory_format=torch.channels_last)  # NHWC, matches train.py
+        images, _ = gpu_batch
+        x = images.float()
         assert x.dtype == torch.float32  # guard the fp32-input + autocast path
         with torch.autocast(device.type, dtype=torch.bfloat16):
-            if repa_weight > 0:
-                recon, z = model(x, return_latent=True)
-            else:
-                recon, z = model(x), None
+            recon = model(x)
             loss = F.mse_loss(recon, x) + lpips_weight * lpips(recon, x)
-            if repa_weight > 0:
-                loss = loss + repa_weight * module._repa(z, x, repa_target)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
@@ -124,11 +116,9 @@ def measure_per_stage_eager(loader_iter, step_inputs, steps, device):
     """Serialized per-substage timing on the REAL loader (eager only). A synchronize() after
     each substage means the reported times are an upper-bound decomposition whose sum exceeds
     the fused end-to-end time -- it shows where the work is, not an additive budget."""
-    module, opt, lpips, w, repa_w = step_inputs
+    module, opt, lpips, w = step_inputs
     model = module.model
-    acc = dict(
-        dataloader=0.0, forward=0.0, lpips=0.0, repa=0.0, backward=0.0, optimizer=0.0
-    )
+    acc = dict(dataloader=0.0, forward=0.0, lpips=0.0, backward=0.0, optimizer=0.0)
 
     def tick():
         torch.cuda.synchronize()
@@ -137,18 +127,13 @@ def measure_per_stage_eager(loader_iter, step_inputs, steps, device):
     for _ in range(steps):
         t = tick()
         gpu_batch = move(next(loader_iter), device)
-        images = gpu_batch[0]
-        repa_target = gpu_batch[2] if len(gpu_batch) > 2 else None
-        x = images.float().to(memory_format=torch.channels_last)  # NHWC, matches train.py
+        images, _ = gpu_batch
+        x = images.float()
         acc["dataloader"] += tick() - t
 
         t = tick()
-        z = None
         with torch.autocast(device.type, dtype=torch.bfloat16):
-            if repa_w > 0:
-                recon, z = model(x, return_latent=True)
-            else:
-                recon = model(x)
+            recon = model(x)
         acc["forward"] += tick() - t
 
         t = tick()
@@ -158,12 +143,6 @@ def measure_per_stage_eager(loader_iter, step_inputs, steps, device):
                 F.mse_loss(recon, x) + w * lp
             )  # mse is negligible; folded into the LPIPS stage
         acc["lpips"] += tick() - t
-
-        t = tick()
-        if repa_w > 0:  # (frozen DINOv2 forward when not precomputed) + projector + cosine
-            with torch.autocast(device.type, dtype=torch.bfloat16):
-                loss = loss + repa_w * module._repa(z, x, repa_target)
-        acc["repa"] += tick() - t
 
         t = tick()
         opt.zero_grad(set_to_none=True)
@@ -178,10 +157,10 @@ def measure_per_stage_eager(loader_iter, step_inputs, steps, device):
 
 
 def count_forward_flops(model_config, image_size, batch_size, device):
-    """Forward FLOPs of one batch through a FRESH eager fp32 ConvAutoEncoder (FlopCounterMode
+    """Forward FLOPs of one batch through a FRESH eager fp32 TiTokAutoEncoder (FlopCounterMode
     bypasses autocast/compiled regions, so count uncompiled & fp32). Counts conv/matmul-class
-    ops only -- GroupNorm/SiLU/pixel-shuffle are not counted, so this is a lower bound."""
-    m = ConvAutoEncoder(**model_config).to(device).eval()
+    ops only -- LayerNorm/GELU/softmax are not counted, so this is a lower bound."""
+    m = TiTokAutoEncoder(**model_config).to(device).eval()
     x = torch.randn(
         batch_size, model_config["input_dim"], image_size, image_size, device=device
     )
@@ -199,7 +178,7 @@ def dump_compile_artifacts(
 ):
     """Write graph-break summary + inductor output_code for the compiled forward to a file."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    m = ConvAutoEncoder(**model_config).to(device).train()
+    m = TiTokAutoEncoder(**model_config).to(device).train()
     x = torch.randn(
         batch_size, model_config["input_dim"], image_size, image_size, device=device
     )
@@ -272,23 +251,15 @@ def main() -> None:
         help="GPU bf16 peak TFLOPS for MFU -- VERIFY for your card; default is an estimate",
     )
     p.add_argument("--data-dir", default="/mnt/ai/data")
-    p.add_argument("--base-channels", type=int, default=32)
+    # ViT-Tiny knobs (mirror train.py so the benchmarked model matches a real run).
+    p.add_argument("--patch-size", type=int, default=16)
+    p.add_argument("--embed-dim", type=int, default=192)
+    p.add_argument("--depth", type=int, default=12)
+    p.add_argument("--num-heads", type=int, default=3)
+    p.add_argument("--num-latent-tokens", type=int, default=32)
+    p.add_argument("--latent-dim", type=int, default=16)
     p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="alex")
     p.add_argument("--lpips-weight", type=float, default=0.1)
-    p.add_argument(
-        "--repa-weight",
-        type=float,
-        default=0.5,
-        help="REPA latent-alignment weight; 0 disables the frozen DINOv2 forward",
-    )
-    p.add_argument("--repa-model", default="facebook/dinov2-small")
-    p.add_argument("--repa-dino-size", type=int, default=224)
-    p.add_argument(
-        "--repa-cache",
-        choices=["auto", "off"],
-        default="auto",
-        help="'auto' uses precomputed DINOv2 targets if present (no in-loop DINOv2); 'off' runs DINOv2",
-    )
     p.add_argument("--lr", type=float, default=1e-3)
     args = p.parse_args()
 
@@ -299,40 +270,32 @@ def main() -> None:
     cuda_graphs = args.compile in CUDA_GRAPH_COMPILE_MODES
 
     # --- build the real module/datamodule/optimizer (reused from train.py) -------------------
-    model_config = build_model_config(args.base_channels)
-    module = LitAutoEncoder(
+    model_config = build_model_config(
+        args.image_size,
+        patch_size=args.patch_size,
+        embed_dim=args.embed_dim,
+        depth=args.depth,
+        num_heads=args.num_heads,
+        num_latent_tokens=args.num_latent_tokens,
+        latent_dim=args.latent_dim,
+    )
+    module = LitTiTok(
         model_config,
         image_size=args.image_size,
         lr=args.lr,
         lpips_weight=args.lpips_weight,
         lpips_net=args.lpips_net,
-        repa_weight=args.repa_weight,
-        repa_model=args.repa_model,
-        repa_dino_size=args.repa_dino_size,
     )
-    # Use precomputed REPA targets when available (matches train.py's default path): skip the
-    # in-loop DINOv2 and feed cached targets through the batch. Must be set before _ensure_metrics.
-    repa_paths = None
-    if args.repa_weight > 0 and args.repa_cache != "off":
-        from repa_cache import cache_exists
-        from repa_cache import repa_paths as _repa_paths
-
-        ck = dict(data_dir=args.data_dir, image_size=args.image_size,
-                  repa_model=args.repa_model, repa_dino_size=args.repa_dino_size)
-        if cache_exists(**ck):
-            repa_paths = _repa_paths(**ck)
-            module.repa_precomputed = True
-            print("[repa-cache] benchmarking the precomputed-target path (no in-loop DINOv2)")
     module.to(device).train()
-    module._ensure_metrics()  # builds LPIPS (+ FID unused here, + DINOv2 when REPA is on)
-    # Mirror training's LPIPS exactly: LitAutoEncoder._lpips calls the net directly rather than
-    # the stateful metric (whose forward appends to an unbounded `all_scores` list that would
+    module._ensure_metrics()  # builds LPIPS (+ FID, unused here)
+    # Mirror training's LPIPS exactly: LitTiTok._lpips calls the net directly rather than the
+    # stateful metric (whose forward appends to an unbounded `all_scores` list that would
     # inflate the very per-step timing this benchmark measures). Reusing it keeps the benchmark
     # and the real training step from drifting apart.
     lpips = module._lpips
     opt = torch.optim.AdamW(
-        module.parameters(), lr=args.lr, foreach=True
-    )  # mirrors configure_optimizers (foreach; fused is incompatible with Lightning grad-clip)
+        module.parameters(), lr=args.lr, fused=True
+    )  # mirrors configure_optimizers, fused kernel
     if args.compile != "off":
         compile_model(module, args.compile)
 
@@ -341,7 +304,6 @@ def main() -> None:
         image_size=args.image_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        repa_paths=repa_paths,
     )
     datamodule.drop_last = (
         cuda_graphs  # static shape for CUDA graphs (mirrors run_training)
@@ -355,7 +317,6 @@ def main() -> None:
         opt,
         lpips,
         args.lpips_weight,
-        args.repa_weight,
         device,
         mark_step=cuda_graphs,
     )
@@ -394,7 +355,7 @@ def main() -> None:
     if args.compile == "off":
         stages = measure_per_stage_eager(
             cycle(loader),
-            (module, opt, lpips, args.lpips_weight, args.repa_weight),
+            (module, opt, lpips, args.lpips_weight),
             max(steps // 2, 5),
             device,
         )
@@ -418,22 +379,18 @@ def main() -> None:
 
     # ============================ REPORT =====================================================
     print("\n" + "=" * 78)
-    print("  CelebA-HQ+AFHQ autoencoder — training-step benchmark")
+    print("  CelebA-HQ+AFHQ TiTok autoencoder — training-step benchmark")
     print("=" * 78)
     print(
         f"  image={args.image_size}  batch={bs}  workers={args.num_workers}  "
         f"compile={args.compile}  steps={steps}  warmup={warmup}"
     )
     print(
-        f"  base_channels={args.base_channels}  lpips_net={args.lpips_net}  "
-        f"latent={LATENT_CHANNELS}x{args.image_size // 8}x{args.image_size // 8}"
+        f"  vit: embed={args.embed_dim} depth={args.depth} heads={args.num_heads} "
+        f"patch={args.patch_size}  lpips_net={args.lpips_net}  "
+        f"latent={args.num_latent_tokens}x{args.latent_dim} tokens"
     )
-    repa_desc = (
-        f"{args.repa_model} @ {args.repa_dino_size}px (w={args.repa_weight})"
-        if args.repa_weight > 0
-        else "off"
-    )
-    print(f"  repa: {repa_desc}")
+    print("  repa: off (token-sequence latent has no spatial grid)")
     print("  precision: fp32 input + bf16-mixed autocast (matches train.py)")
 
     print("\n  THROUGHPUT")
@@ -451,14 +408,14 @@ def main() -> None:
         print(
             "\n  PER-STAGE (eager, serialized — sum > end-to-end; shows where work is)"
         )
-        for k in ("dataloader", "forward", "lpips", "repa", "backward", "optimizer"):
+        for k in ("dataloader", "forward", "lpips", "backward", "optimizer"):
             print(f"    {k:<12} {stages[k]:7.2f} ms  ({100 * stages[k] / total:4.1f}%)")
     elif args.compile != "off":
         print(
             "\n  PER-STAGE: skipped (can't sync inside a CUDA graph; run --compile off for it)"
         )
 
-    print("\n  ROOFLINE  (AE conv/matmul FLOPs only; excludes LPIPS + REPA/DINOv2; lower bound)")
+    print("\n  ROOFLINE  (ViT matmul/attention FLOPs only; excludes LPIPS; lower bound)")
     print(
         f"    fwd {fwd_flops / 1e9:.1f} GFLOP  ->  step ~{step_flops / 1e9:.1f} GFLOP (3x)"
     )
@@ -497,16 +454,16 @@ def main() -> None:
             else ""
         )
         fix = (
-            "enable torch.compile (currently off) for kernel fusion"
+            "enable torch.compile (currently off) for kernel/attention fusion"
             if args.compile == "off"
-            else "switch to channels_last memory format and/or grow the batch to raise utilization"
+            else "grow the batch and/or widen the model to raise utilization"
         )
         msg = (
             f"Compute-bound: real ({real_thru:.0f} img/s) ≈ cached-compute "
             f"({cached_thru:.0f} img/s), so the dataloader keeps up.{lp} MFU is "
-            f"{mfu_cached:.1f}% of the {args.peak_tflops:.0f}-TFLOP roofline — a conv "
-            f"autoencoder is GroupNorm/SiLU/pixel-shuffle heavy (memory-bound, few matmuls), "
-            f"so low MFU is expected. Highest-leverage fix: {fix}."
+            f"{mfu_cached:.1f}% of the {args.peak_tflops:.0f}-TFLOP roofline — a ViT "
+            f"tokenizer is matmul/attention dominated, so MFU should climb with batch and "
+            f"width. Highest-leverage fix: {fix}."
         )
     # wrap to ~76 cols
     words, line = msg.split(), "  "

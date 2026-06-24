@@ -128,22 +128,31 @@ class EMA(Callback):
     weights and evaluates with the averaged weights.
 
     Training proceeds on the live (raw) weights; after every optimizer step the shadow is
-    nudged ``ema = decay * ema + (1 - decay) * live``. For validation and test the averaged
-    weights are swapped into ``model`` and the raw weights restored afterward, so logged
-    metrics and reconstruction images reflect the EMA model (which is typically smoother and
-    scores better than the raw SGD iterate) while training continues unperturbed.
+    nudged ``ema = decay * ema + (1 - decay) * live``. The shadow starts at **zero** (not the
+    random init), and eval-time weights are **bias-corrected** Adam-style by ``ema / (1 -
+    decay**t)`` where ``t`` is the number of updates so far. Without this correction a high
+    decay (e.g. 0.999, ~1-epoch half-life) leaves the shadow dominated by the zero start for
+    many epochs, so validation lags training badly early on and only catches up once
+    ``decay**t`` has decayed away; the correction makes the average unbiased from the very
+    first step (at ``t = 1`` the corrected shadow equals the live weights). For validation and
+    test the corrected weights are swapped into ``model`` and the raw weights restored
+    afterward, so logged metrics and reconstruction images reflect the EMA model (typically
+    smoother and better-scoring than the raw SGD iterate) while training continues unperturbed.
 
-    The shadow is saved in the checkpoint as Lightning callback state (see ``state_dict`` /
-    ``load_state_dict``), so a resumed run *continues* the average rather than restarting it.
-    The model's own ``state_dict`` keeps the raw training weights, so resume and the artifact
-    rebuild stay byte-for-byte what they were before EMA — only eval-time weights change.
-    Non-float entries (e.g. ``num_batches_tracked``) are copied, not averaged."""
+    The shadow and update count are saved in the checkpoint as Lightning callback state (see
+    ``state_dict`` / ``load_state_dict``), so a resumed run *continues* the average rather than
+    restarting it. The model's own ``state_dict`` keeps the raw training weights, so resume and
+    the artifact rebuild stay byte-for-byte what they were before EMA — only eval-time weights
+    change. Non-float entries (e.g. ``num_batches_tracked``) are tracked (copied), not averaged
+    or corrected. Before the first optimizer step (``t = 0``, e.g. sanity-check validation) the
+    swap is skipped, since no average exists yet."""
 
     def __init__(self, decay: float = 0.999):
         self.decay = decay
         self.ema: dict | None = (
-            None  # shadow of model.state_dict(); None until fit start
+            None  # zero-init shadow of model.state_dict(); None until fit start
         )
+        self._steps = 0  # optimizer steps folded into the shadow (the ``t`` in 1 - decay**t)
         self._backup: dict | None = None  # raw weights stashed during an eval swap
 
     @staticmethod
@@ -155,13 +164,19 @@ class EMA(Callback):
     def on_fit_start(self, trainer, pl_module) -> None:
         model = self._model(pl_module)
         if self.ema is None:
-            self.ema = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            # Zero-init float accumulators so ``ema / (1 - decay**t)`` is exactly unbiased;
+            # non-float buffers are tracked by copy, so seed them with the live value.
+            self.ema = {
+                k: (torch.zeros_like(v) if v.dtype.is_floating_point else v.detach().clone())
+                for k, v in model.state_dict().items()
+            }
         else:  # resumed: align the restored shadow with the (possibly GPU) model's devices
             reference = model.state_dict()
             self.ema = {k: v.to(reference[k].device) for k, v in self.ema.items()}
 
     @torch.no_grad()
     def on_train_batch_end(self, trainer, pl_module, *args) -> None:
+        self._steps += 1
         for key, value in self._model(pl_module).state_dict().items():
             shadow = self.ema[key]
             if value.dtype.is_floating_point:
@@ -171,12 +186,20 @@ class EMA(Callback):
                     value
                 )  # integer buffers (e.g. BN counts): track, don't average
 
+    def _corrected(self) -> dict:
+        """Bias-corrected eval weights: float entries divided by ``1 - decay**t`` to undo the
+        zero-init start; non-float entries (tracked by copy) passed through unchanged."""
+        bias = 1.0 - self.decay**self._steps
+        return {
+            k: (v / bias if v.dtype.is_floating_point else v) for k, v in self.ema.items()
+        }
+
     def _swap_in(self, pl_module) -> None:
-        if self.ema is None:
-            return
+        if self.ema is None or self._steps == 0:
+            return  # no average yet (e.g. sanity-check val before the first step)
         model = self._model(pl_module)
         self._backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        model.load_state_dict(self.ema)
+        model.load_state_dict(self._corrected())
 
     def _swap_out(self, pl_module) -> None:
         if self._backup is not None:
@@ -196,11 +219,16 @@ class EMA(Callback):
         self._swap_out(pl_module)
 
     def state_dict(self) -> dict:
-        return {"decay": self.decay, "ema": self.ema}
+        return {"decay": self.decay, "ema": self.ema, "steps": self._steps}
 
     def load_state_dict(self, state_dict: dict) -> None:
         self.decay = state_dict["decay"]
-        self.ema = state_dict["ema"]
+        if "steps" in state_dict:
+            self.ema = state_dict["ema"]
+            self._steps = state_dict["steps"]
+        else:  # pre-bias-correction checkpoint stored real averaged weights, not a zero-init
+            self.ema = None  # accumulator semantics changed; restart the average cleanly
+            self._steps = 0
 
 
 def upload_checkpoint_artifact(

@@ -83,6 +83,12 @@ class TiTokEncoder(nn.Module):
         self.latent_pos_embed = nn.Parameter(
             torch.zeros(1, num_latent_tokens, embed_dim)
         )
+        # nn.Module.apply (used by the autoencoder's _init_weights) only visits sub-modules,
+        # never bare Parameters, so these must be initialized here. Zero-init in particular
+        # would make all K latent query tokens identical and permutation-symmetric -> token
+        # collapse; trunc_normal_(std=0.02) is the standard ViT/MAE init that breaks it.
+        for p in (self.patch_pos_embed, self.latent_tokens, self.latent_pos_embed):
+            nn.init.trunc_normal_(p, std=0.02)
 
         self.blocks = nn.ModuleList(
             [TransformerBlock(embed_dim, num_heads, mlp_ratio) for _ in range(depth)]
@@ -125,6 +131,9 @@ class TiTokDecoder(nn.Module):
         self.latent_pos_embed = nn.Parameter(
             torch.zeros(1, num_latent_tokens, embed_dim)
         )
+        # See TiTokEncoder: bare Parameters are skipped by _init_weights' apply(), so init here.
+        for p in (self.mask_token, self.patch_pos_embed, self.latent_pos_embed):
+            nn.init.trunc_normal_(p, std=0.02)
 
         self.blocks = nn.ModuleList(
             [TransformerBlock(embed_dim, num_heads, mlp_ratio) for _ in range(depth)]
@@ -207,8 +216,6 @@ class TiTokAutoEncoder(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.ones_(m.weight)
             nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.Parameter):
-            nn.init.trunc_normal_(m, std=0.02)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         z = self.encoder(x)  # (B, K, embed_dim)
