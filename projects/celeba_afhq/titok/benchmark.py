@@ -304,6 +304,11 @@ def main() -> None:
         image_size=args.image_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        # Keep the plain bf16 collate: the benchmark pulls batches straight from the loader
+        # and casts images.float() itself (it does not run on_after_batch_transfer), so a
+        # gpu_transform would both ship uint8 to that .float() and skip augmentation. The
+        # benchmark measures model compute, not the small data-side augmentation cost.
+        augment=False,
     )
     datamodule.drop_last = (
         cuda_graphs  # static shape for CUDA graphs (mirrors run_training)

@@ -355,16 +355,22 @@ class ConcatImageDataModule(ImageDataModule):
         *,
         batch_size: int = 64,
         num_workers: int = 0,
+        gpu_transform: Callable[[torch.Tensor], object] | None = None,
         pin_memory: bool | None = None,
         in_memory: bool = True,
+        augment_eval: bool = True,
         unify_labels: bool = False,
     ):
-        # No gpu_transform: the loader yields ready-to-use bf16 [0,1] batches via the collate.
+        # With a gpu_transform the loader ships raw uint8 and the transform (e.g. train-only
+        # augmentation) runs batched on-device in on_after_batch_transfer; without one the
+        # collate already yields ready-to-use bf16 [0,1] batches.
         super().__init__(
             batch_size=batch_size,
             num_workers=num_workers,
+            gpu_transform=gpu_transform,
             pin_memory=pin_memory,
             in_memory=in_memory,
+            augment_eval=augment_eval,
         )
         self.datamodules = list(datamodules)
         self.unify_labels = unify_labels

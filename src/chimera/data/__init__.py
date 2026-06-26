@@ -14,6 +14,7 @@ from chimera.data.cifar100 import CIFAR100DataModule
 from chimera.data.afhq import AFHQDataModule
 from chimera.data.celeba_hq import CelebAHQDataModule
 from chimera.data.base import ConcatImageDataModule
+from chimera.data.augment import ReconstructionAugment
 
 __all__ = [
     "MNISTDataModule",
@@ -22,4 +23,5 @@ __all__ = [
     "AFHQDataModule",
     "CelebAHQDataModule",
     "ConcatImageDataModule",
+    "ReconstructionAugment",
 ]

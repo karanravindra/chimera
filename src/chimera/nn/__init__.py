@@ -1,6 +1,7 @@
 from chimera.nn.adaln import AdaLNZero, modulate
 from chimera.nn.conv_norm_act import Conv2dNormAct, ConvTranspose2dNormAct
 from chimera.nn.dit_block import DiTBlock
+from chimera.nn.drop_path import DropPath
 from chimera.nn.glu import GLU
 from chimera.nn.mha import MultiheadAttention
 from chimera.nn.mlp import Mlp
@@ -21,6 +22,7 @@ __all__ = [
     "AdaLNZero",
     "modulate",
     "DiTBlock",
+    "DropPath",
     "PixelUnshuffleChannelAveragingDownSample",
     "ChannelDuplicatingPixelShuffleUpSample",
 ]

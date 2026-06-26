@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from chimera.nn.drop_path import DropPath
 from chimera.nn.mlp import Mlp
 
 
@@ -43,18 +44,22 @@ class Attention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Pre-norm ViT block."""
+    """Pre-norm ViT block with optional stochastic depth on each residual branch."""
 
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0):
+    def __init__(
+        self, dim: int, num_heads: int, mlp_ratio: float = 4.0, drop_path: float = 0.0
+    ):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = Attention(dim, num_heads)
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = Mlp(dim, int(dim * mlp_ratio), act_layer=nn.GELU)
+        # One module reused on both branches; each call samples an independent per-sample gate.
+        self.drop_path = DropPath(drop_path)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 
@@ -72,6 +77,7 @@ class TiTokEncoder(nn.Module):
         num_heads,
         num_latent_tokens,
         mlp_ratio,
+        drop_path_rate=0.0,
     ):
         super().__init__()
         self.num_latent_tokens = num_latent_tokens
@@ -90,8 +96,13 @@ class TiTokEncoder(nn.Module):
         for p in (self.patch_pos_embed, self.latent_tokens, self.latent_pos_embed):
             nn.init.trunc_normal_(p, std=0.02)
 
+        # Stochastic depth rate ramps linearly 0 -> drop_path_rate across the stack.
+        dpr = [drop_path_rate * i / max(depth - 1, 1) for i in range(depth)]
         self.blocks = nn.ModuleList(
-            [TransformerBlock(embed_dim, num_heads, mlp_ratio) for _ in range(depth)]
+            [
+                TransformerBlock(embed_dim, num_heads, mlp_ratio, drop_path=dpr[i])
+                for i in range(depth)
+            ]
         )
         self.norm = nn.LayerNorm(embed_dim)
 
@@ -119,6 +130,7 @@ class TiTokDecoder(nn.Module):
         num_heads,
         num_latent_tokens,
         mlp_ratio,
+        drop_path_rate=0.0,
     ):
         super().__init__()
         self.grid = image_size // patch_size
@@ -135,8 +147,12 @@ class TiTokDecoder(nn.Module):
         for p in (self.mask_token, self.patch_pos_embed, self.latent_pos_embed):
             nn.init.trunc_normal_(p, std=0.02)
 
+        dpr = [drop_path_rate * i / max(depth - 1, 1) for i in range(depth)]
         self.blocks = nn.ModuleList(
-            [TransformerBlock(embed_dim, num_heads, mlp_ratio) for _ in range(depth)]
+            [
+                TransformerBlock(embed_dim, num_heads, mlp_ratio, drop_path=dpr[i])
+                for i in range(depth)
+            ]
         )
         self.norm = nn.LayerNorm(embed_dim)
         self.head = nn.Linear(embed_dim, patch_size * patch_size * out_channels)
@@ -177,6 +193,7 @@ class TiTokAutoEncoder(nn.Module):
         depth: int = 8,
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
+        drop_path_rate: float = 0.0,
     ):
         super().__init__()
         self.num_latent_tokens = num_latent_tokens
@@ -191,6 +208,7 @@ class TiTokAutoEncoder(nn.Module):
             num_heads,
             num_latent_tokens,
             mlp_ratio,
+            drop_path_rate=drop_path_rate,
         )
         # bottleneck on the token sequence: embed_dim <-> latent_dim (per token)
         self.to_latent = nn.Linear(embed_dim, latent_dim)
@@ -204,6 +222,7 @@ class TiTokAutoEncoder(nn.Module):
             num_heads,
             num_latent_tokens,
             mlp_ratio,
+            drop_path_rate=drop_path_rate,
         )
         self.apply(self._init_weights)
 

@@ -1,0 +1,6 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "bash /root/Code/chimera/.claude/statusline-command.sh"
+  }
+}

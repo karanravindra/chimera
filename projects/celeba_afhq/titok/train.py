@@ -49,7 +49,12 @@ from torchmetrics.functional.image import (
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-from chimera.data import AFHQDataModule, CelebAHQDataModule, ConcatImageDataModule
+from chimera.data import (
+    AFHQDataModule,
+    CelebAHQDataModule,
+    ConcatImageDataModule,
+    ReconstructionAugment,
+)
 from chimera.models import TiTokAutoEncoder
 from chimera.optim import MuonWithAuxAdam, muon_adam_param_groups
 from chimera.utils.experiment import (
@@ -67,7 +72,7 @@ DATASET_NAME = "+".join(SOURCE_DATAMODULES)  # "celeba_hq+afhq"
 
 # ViT-Tiny tokenizer bottleneck: K continuous tokens, each latent_dim wide. Shared by main()
 # and benchmark.py so they construct the identical latent geometry.
-NUM_LATENT_TOKENS = 32
+NUM_LATENT_TOKENS = 16
 LATENT_DIM = 16
 
 OUTPUTS = Path(__file__).parent / "outputs"  # checkpoints live under OUTPUTS/<run_id>
@@ -84,7 +89,7 @@ class LitTiTok(LightningModule):
         optimizer: str = "muon",
         muon_lr: float = 0.02,
         adam_lr: float = 8e-4,
-        weight_decay: float = 0.01,
+        weight_decay: float = 0.05,
         min_lr_ratio: float = 0.05,
         lpips_weight: float = 1.0,
         lpips_net: str = "vgg",
@@ -285,11 +290,13 @@ def build_model_config(
     num_heads: int = 3,
     num_latent_tokens: int = NUM_LATENT_TOKENS,
     latent_dim: int = LATENT_DIM,
+    drop_path_rate: float = 0.0,
 ) -> dict:
     """The TiTokAutoEncoder config. Defaults are a canonical **ViT-Tiny** (embed_dim 192,
     depth 12, 3 heads, mlp_ratio 4) for both the encoder and decoder; the bottleneck is
-    ``num_latent_tokens`` continuous tokens of width ``latent_dim``. Shared by main() and
-    benchmark.py so they construct the identical model."""
+    ``num_latent_tokens`` continuous tokens of width ``latent_dim``. ``drop_path_rate`` sets
+    stochastic depth (ramped 0 -> rate across each stack) -- a ViT overfitting regularizer.
+    Shared by main() and benchmark.py so they construct the identical model."""
     return dict(
         input_dim=3,
         image_size=image_size,
@@ -300,6 +307,7 @@ def build_model_config(
         depth=depth,
         num_heads=num_heads,
         mlp_ratio=4.0,
+        drop_path_rate=drop_path_rate,
     )
 
 
@@ -310,16 +318,35 @@ def build_datamodule(
     batch_size: int,
     num_workers: int,
     in_memory: bool = True,
+    augment: bool = True,
+    aug_min_scale: float = 0.4,
+    aug_jitter: float = 0.3,
 ) -> ConcatImageDataModule:
     """Build the merged CelebA-HQ + AFHQ datamodule. Each source materializes + caches its own
     uint8 store at image_size; the merged module concatenates their splits and yields the
-    bf16 [0,1] batches the model trains on. Shared by main() and benchmark.py."""
+    bf16 [0,1] batches the model trains on. Shared by main() and benchmark.py.
+
+    With ``augment=True`` a :class:`ReconstructionAugment` runs batched on-GPU as the
+    ``gpu_transform`` -- per-sample random-resized-crop (area >= ``aug_min_scale``), horizontal
+    flip, and brightness/contrast/saturation jitter (strength ``aug_jitter``) -- and
+    ``augment_eval=False`` keeps it on training batches only, so val/test reconstruct clean images.
+    This is the primary regularizer against the AE overfitting the ~45k-image set."""
     sources = [
         cls(data_dir=data_dir, image_size=image_size, in_memory=in_memory)
         for cls in SOURCE_DATAMODULES.values()
     ]
+    transform = (
+        ReconstructionAugment(min_scale=aug_min_scale, jitter=aug_jitter)
+        if augment
+        else None
+    )
     return ConcatImageDataModule(
-        sources, batch_size=batch_size, num_workers=num_workers, in_memory=in_memory
+        sources,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        in_memory=in_memory,
+        gpu_transform=transform,
+        augment_eval=False,
     )
 
 
@@ -335,7 +362,7 @@ def main() -> None:
         "--embed-dim", type=int, default=192, help="ViT hidden dim (192 = ViT-Tiny)"
     )
     p.add_argument(
-        "--depth", type=int, default=12, help="transformer blocks per enc/dec stack"
+        "--depth", type=int, default=6, help="transformer blocks per enc/dec stack"
     )
     p.add_argument("--num-heads", type=int, default=3)
     p.add_argument(
@@ -348,22 +375,52 @@ def main() -> None:
         "--latent-dim", type=int, default=LATENT_DIM, help="width of each latent token"
     )
     p.add_argument(
+        "--drop-path",
+        type=float,
+        default=0.1,
+        help="stochastic-depth rate (ramped 0->rate across each ViT stack); 0 disables. "
+        "A ViT overfitting regularizer",
+    )
+    p.add_argument(
         "--optimizer",
         choices=["muon", "adamw"],
         default="muon",
         help="muon = Muon on 2D hidden weights + AdamW aux (default); adamw = plain AdamW",
     )
     p.add_argument(
-        "--muon-lr", type=float, default=0.02, help="LR for the Muon (2D weight) group"
+        "--muon-lr", type=float, default=0.01, help="LR for the Muon (2D weight) group"
     )
     p.add_argument(
         "--adam-lr",
         type=float,
-        default=8e-4,
+        default=3e-4,
         help="LR for the AdamW aux group (embeddings/norms/biases)",
     )
     p.add_argument(
-        "--weight-decay", type=float, default=0.01, help="decoupled weight decay"
+        "--weight-decay",
+        type=float,
+        default=0.05,
+        help="decoupled weight decay (0.05 = standard ViT range; helps overfitting)",
+    )
+    p.add_argument(
+        "--augment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="train-only GPU augmentation (per-sample random-resized-crop + hflip); the main "
+        "regularizer against overfitting -- eval stays on clean images. On by default; "
+        "pass --no-augment to disable",
+    )
+    p.add_argument(
+        "--aug-min-scale",
+        type=float,
+        default=0.4,
+        help="min crop area fraction for --augment (lower = more aggressive)",
+    )
+    p.add_argument(
+        "--aug-jitter",
+        type=float,
+        default=0.3,
+        help="brightness/contrast/saturation jitter strength for --augment (0 disables)",
     )
     p.add_argument(
         "--min-lr-ratio",
@@ -372,12 +429,19 @@ def main() -> None:
         help="cosine schedule floors at this fraction of peak LR (0 = decay to zero)",
     )
     p.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=5,
+        help="stop if val/rfid hasn't improved for this many epochs (0 disables); the best "
+        "checkpoint (not the last) is then kept and tested",
+    )
+    p.add_argument(
         "--lpips-weight",
         type=float,
         default=0.5,
         help="weight of the LPIPS term in the loss",
     )
-    p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="vgg")
+    p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="alex")
     p.add_argument(
         "--fid-feature", type=int, default=2048, help="InceptionV3 feature dim for rFID"
     )
@@ -402,6 +466,7 @@ def main() -> None:
         num_heads=args.num_heads,
         num_latent_tokens=args.num_latent_tokens,
         latent_dim=args.latent_dim,
+        drop_path_rate=args.drop_path,
     )
     datamodule = build_datamodule(
         data_dir=args.data_dir,
@@ -409,6 +474,9 @@ def main() -> None:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         in_memory=not args.mmap,
+        augment=args.augment,
+        aug_min_scale=args.aug_min_scale,
+        aug_jitter=args.aug_jitter,
     )
 
     resume_ckpt = find_ckpt(args.resume, args.project, OUTPUTS) if args.resume else None
@@ -447,6 +515,8 @@ def main() -> None:
             "adam_lr": module.adam_lr,
             "weight_decay": module.weight_decay,
             "min_lr_ratio": module.min_lr_ratio,
+            "drop_path": hp["model_config"]["drop_path_rate"],
+            "early_stop_patience": args.early_stop_patience,
             "seed": args.seed,
             "precision": "bf16-mixed",
             "grad_clip": args.grad_clip,
@@ -463,6 +533,9 @@ def main() -> None:
             "data_dir": args.data_dir,
             "num_workers": args.num_workers,
             "in_memory": not args.mmap,
+            "augment": args.augment,
+            "aug_min_scale": args.aug_min_scale if args.augment else None,
+            "aug_jitter": args.aug_jitter if args.augment else None,
         },
     }
 
@@ -478,6 +551,10 @@ def main() -> None:
         resume_ckpt=resume_ckpt,
         artifact_metadata=config,
         test=True,  # report rFID/PSNR/SSIM/LPIPS on the test split after training
+        # Keep + test the best-rFID epoch and stop once it plateaus (val == held-out test set
+        # here), rather than training to the overfit endpoint.
+        monitor="val/rfid",
+        early_stop_patience=args.early_stop_patience,
     )
 
 

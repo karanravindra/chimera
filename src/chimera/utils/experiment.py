@@ -19,7 +19,12 @@ from pathlib import Path
 import torch
 import wandb
 from lightning import Trainer
-from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import (
+    Callback,
+    EarlyStopping,
+    LearningRateMonitor,
+    ModelCheckpoint,
+)
 from lightning.pytorch.loggers import WandbLogger
 from torchvision.utils import make_grid
 
@@ -280,10 +285,20 @@ def run_training(
     resume_ckpt: str | None,
     artifact_metadata: dict,
     test: bool = False,
+    monitor: str | None = None,
+    monitor_mode: str = "min",
+    early_stop_patience: int = 0,
 ) -> None:
     """The training lifecycle shared by every script: set up the per-run checkpoint dir
     and callback, build the Trainer, and fit (resuming from ``resume_ckpt`` if given). When
-    ``test`` is set, ``trainer.test`` runs on the just-trained weights after a clean fit.
+    ``test`` is set, ``trainer.test`` runs after a clean fit.
+
+    ``monitor`` opts into metric-based checkpoint selection: when given, the best-scoring epoch
+    (per ``monitor`` / ``monitor_mode``) is kept *and* is what gets tested and uploaded, instead
+    of the last epoch -- and ``early_stop_patience`` (> 0) stops training once ``monitor`` has not
+    improved for that many epochs. Without ``monitor`` the behavior is unchanged: only ``last.ckpt``
+    is kept and the final weights are tested. ``save_last`` stays on either way so resume always
+    has a ``last.ckpt``.
 
     A ``KeyboardInterrupt`` during ``fit`` falls through to the test phase (when ``test`` is
     set) so an interrupted run is still evaluated on its current weights; a second interrupt
@@ -293,12 +308,28 @@ def run_training(
     ckpt_dir = outputs / run_id
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_cb = ModelCheckpoint(
-        dirpath=str(ckpt_dir), save_last=True, save_top_k=0, every_n_epochs=1
+        dirpath=str(ckpt_dir),
+        save_last=True,
+        # With a monitor, keep the single best-scoring epoch (save_top_k=1) so the overfit
+        # endpoint isn't all we retain; without one, keep the prior periodic-last-only behavior.
+        save_top_k=1 if monitor else 0,
+        monitor=monitor,
+        mode=monitor_mode,
+        every_n_epochs=1,
     )
     # Log the optimizer's learning rate to wandb as training progresses (every step, so the
     # scheduler's curve is visible); needs a logger, which every script passes in.
     lr_cb = LearningRateMonitor(logging_interval="step")
     callbacks = [ckpt_cb, lr_cb]
+    if monitor and early_stop_patience > 0:
+        callbacks.append(
+            EarlyStopping(
+                monitor=monitor, mode=monitor_mode, patience=early_stop_patience
+            )
+        )
+        print(
+            f"[early-stop] monitor={monitor!r} mode={monitor_mode} patience={early_stop_patience}"
+        )
     # Maintain EMA weights and evaluate with them (0 disables). Append last so the eval-time
     # weight swap wraps the validation/test the other callbacks observe.
     ema_decay = getattr(args, "ema_decay", 0.0)
@@ -329,12 +360,21 @@ def run_training(
             )
         if test:
             try:
-                trainer.test(module, datamodule=datamodule)
+                # With metric-based selection, test the BEST epoch (reloaded from its checkpoint)
+                # rather than the final / early-stopping-point weights. Needs a saved best; fall
+                # back to current weights if none exists (e.g. interrupted before any validation).
+                best = ckpt_cb.best_model_path if monitor else ""
+                trainer.test(
+                    module, datamodule=datamodule, ckpt_path="best" if best else None
+                )
             except KeyboardInterrupt:
                 # Interrupting the test just quits; there's nothing left to run.
                 print("test interrupted — exiting")
     finally:
+        # When monitoring, upload the best checkpoint (the kept model); otherwise the periodic
+        # last.ckpt. Falls back to last.ckpt if no best was recorded.
+        best_path = ckpt_cb.best_model_path if monitor else ""
         upload_checkpoint_artifact(
-            logger, run_id, ckpt_dir / "last.ckpt", artifact_metadata
+            logger, run_id, Path(best_path) if best_path else ckpt_dir / "last.ckpt", artifact_metadata
         )
         wandb.finish()
