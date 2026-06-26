@@ -35,6 +35,7 @@ Examples
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 import torch
@@ -50,6 +51,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from chimera.data import AFHQDataModule, CelebAHQDataModule, ConcatImageDataModule
 from chimera.models import TiTokAutoEncoder
+from chimera.optim import MuonWithAuxAdam, muon_adam_param_groups
 from chimera.utils.experiment import (
     add_common_args,
     find_ckpt,
@@ -79,6 +81,11 @@ class LitTiTok(LightningModule):
         model_config: dict,
         image_size: int,
         lr: float = 1e-4,
+        optimizer: str = "muon",
+        muon_lr: float = 0.02,
+        adam_lr: float = 8e-4,
+        weight_decay: float = 0.01,
+        min_lr_ratio: float = 0.05,
         lpips_weight: float = 1.0,
         lpips_net: str = "vgg",
         fid_feature: int = 2048,
@@ -87,6 +94,11 @@ class LitTiTok(LightningModule):
         self.save_hyperparameters()
         self.model = TiTokAutoEncoder(**model_config)
         self.lr = lr
+        self.optimizer = optimizer
+        self.muon_lr = muon_lr
+        self.adam_lr = adam_lr
+        self.weight_decay = weight_decay
+        self.min_lr_ratio = min_lr_ratio
         self.lpips_weight = lpips_weight
         self.lpips_net = lpips_net
         self.fid_feature = fid_feature
@@ -231,10 +243,36 @@ class LitTiTok(LightningModule):
         self._sample = None
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=self.trainer.max_epochs or 1
-        )
+        if self.optimizer == "muon":
+            # Muon on the ViT's 2D hidden matmul weights, AdamW on the embeddings,
+            # norms and biases. MuonWithAuxAdam presents a single torch optimizer so
+            # Lightning's automatic optimization (grad clipping, LR logging) and the
+            # cosine schedule below keep working -- the two LRs ride in separate param
+            # groups and are each scaled by the scheduler. See chimera/optim/muon.py.
+            groups = muon_adam_param_groups(
+                self.model,
+                muon_lr=self.muon_lr,
+                adam_lr=self.adam_lr,
+                weight_decay=self.weight_decay,
+            )
+            optimizer = MuonWithAuxAdam(groups)
+        else:
+            optimizer = torch.optim.AdamW(
+                self.parameters(), lr=self.lr, weight_decay=self.weight_decay
+            )
+        # Cosine decay to a floor of min_lr_ratio * peak (not 0): Southworth et al.
+        # (arXiv:2605.24770) found a 0.05 minimum-LR ratio trains ViTs best. Driven via
+        # LambdaLR so the single cosine factor scales each param group's own initial_lr
+        # -- this floors the Muon and AdamW groups each at 5% of THEIR base LR, which a
+        # scalar CosineAnnealingLR eta_min (one absolute floor for all groups) cannot do.
+        t_max = self.trainer.max_epochs or 1
+        floor = self.min_lr_ratio
+
+        def cosine_with_floor(epoch: int) -> float:
+            t = min(epoch, t_max) / t_max
+            return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * t))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, cosine_with_floor)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
 
@@ -287,7 +325,7 @@ def build_datamodule(
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    add_common_args(p, project="celeba-afhq-titok", epochs=10)
+    add_common_args(p, project="celeba-afhq-titok", epochs=50)
     p.set_defaults(
         batch_size=64, lr=1e-3
     )  # high-res images + a ViT-Tiny tokenizer
@@ -310,12 +348,36 @@ def main() -> None:
         "--latent-dim", type=int, default=LATENT_DIM, help="width of each latent token"
     )
     p.add_argument(
+        "--optimizer",
+        choices=["muon", "adamw"],
+        default="muon",
+        help="muon = Muon on 2D hidden weights + AdamW aux (default); adamw = plain AdamW",
+    )
+    p.add_argument(
+        "--muon-lr", type=float, default=0.02, help="LR for the Muon (2D weight) group"
+    )
+    p.add_argument(
+        "--adam-lr",
+        type=float,
+        default=8e-4,
+        help="LR for the AdamW aux group (embeddings/norms/biases)",
+    )
+    p.add_argument(
+        "--weight-decay", type=float, default=0.01, help="decoupled weight decay"
+    )
+    p.add_argument(
+        "--min-lr-ratio",
+        type=float,
+        default=0.05,
+        help="cosine schedule floors at this fraction of peak LR (0 = decay to zero)",
+    )
+    p.add_argument(
         "--lpips-weight",
         type=float,
-        default=0.1,
+        default=0.5,
         help="weight of the LPIPS term in the loss",
     )
-    p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="squeeze")
+    p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="vgg")
     p.add_argument(
         "--fid-feature", type=int, default=2048, help="InceptionV3 feature dim for rFID"
     )
@@ -360,6 +422,11 @@ def main() -> None:
             model_config,
             image_size=args.image_size,
             lr=args.lr,
+            optimizer=args.optimizer,
+            muon_lr=args.muon_lr,
+            adam_lr=args.adam_lr,
+            weight_decay=args.weight_decay,
+            min_lr_ratio=args.min_lr_ratio,
             lpips_weight=args.lpips_weight,
             lpips_net=args.lpips_net,
             fid_feature=args.fid_feature,
@@ -374,7 +441,12 @@ def main() -> None:
         "training": {
             "epochs": args.epochs,
             "batch_size": args.batch_size,
+            "optimizer": module.optimizer,
             "lr": module.lr,
+            "muon_lr": module.muon_lr,
+            "adam_lr": module.adam_lr,
+            "weight_decay": module.weight_decay,
+            "min_lr_ratio": module.min_lr_ratio,
             "seed": args.seed,
             "precision": "bf16-mixed",
             "grad_clip": args.grad_clip,

@@ -433,7 +433,7 @@ def build_datamodule(
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    add_common_args(p, project="celeba-afhq-autoencoder", epochs=10)
+    add_common_args(p, project="celeba-afhq-autoencoder", epochs=50)
     p.set_defaults(
         batch_size=64, lr=1e-3
     )  # high-res images + a larger model than MNIST
@@ -441,23 +441,23 @@ def main() -> None:
     p.add_argument(
         "--base-channels",
         type=int,
-        default=32,
+        default=64,
         help="stem width; blocks are (1,2,4)x this",
     )
     p.add_argument(
         "--lpips-weight",
         type=float,
-        default=0.05,
+        default=0.5,
         help="weight of the LPIPS term in the loss",
     )
-    p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="squeeze")
+    p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="vgg")
     p.add_argument(
         "--fid-feature", type=int, default=2048, help="InceptionV3 feature dim for rFID"
     )
     p.add_argument(
         "--repa-weight",
         type=float,
-        default=0,
+        default=0.5,
         help="weight of the REPA latent-alignment term; 0 disables REPA entirely",
     )
     p.add_argument(

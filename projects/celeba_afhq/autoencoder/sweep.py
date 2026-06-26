@@ -1,32 +1,42 @@
-"""Sweep the LPIPS perceptual term (net x weight) and the REPA weight for the celeba_afhq autoencoder.
+"""W&B sweep over the LPIPS perceptual term (net x weight) and the REPA weight for the
+celeba_afhq autoencoder.
 
-Runs ``train.py`` once per ``(lpips_net, lpips_weight, repa_weight)`` combo as an isolated
-subprocess and ranks the results. Subprocess isolation is deliberate: each run gets a fresh CUDA-graph /
-``torch.compile`` state, fresh LPIPS/FID metric networks, a fresh in-RAM dataset, and a fresh
-EMA shadow, so combos can't contaminate each other. The on-disk uint8 dataset cache is built
-once by the first run and reused by the rest.
+This is a real Weights & Biases sweep (``wandb.sweep`` + ``wandb.agent``), not a hand-rolled
+loop. Each trial is launched by the agent as a *fresh* ``python train.py ...`` subprocess via the
+sweep's ``program``/``command`` -- W&B's native mechanism. That subprocess isolation is
+deliberate: every trial gets a fresh CUDA-graph / ``torch.compile`` state, fresh LPIPS/FID metric
+networks, a fresh in-RAM dataset and a fresh EMA shadow, so trials can't contaminate each other.
+The on-disk uint8 dataset cache is built once by the first trial and reused by the rest.
 
-The runs are grouped in wandb via env vars (no ``train.py`` change): ``WANDB_RUN_GROUP`` puts
-all combos in one group and ``WANDB_TAGS`` tags each with its net/weight.
+``train.py`` needs no sweep-specific code: the agent passes each sampled hyperparameter as the
+matching CLI flag (``--lpips-net``, ``--lpips-weight``, ``--repa-weight``, ``--epochs``) and the
+``WandbLogger`` inside ``train.py`` auto-joins the sweep from the agent's env vars, so all trials
+land in one sweep on the W&B dashboard.
 
-Ranking uses the *net-independent* metrics only -- ``test/rfid`` (primary), ``test/psnr``,
-``test/ssim``. The logged ``*/lpips`` and ``*/loss`` use the network in the loss, so their
-scale differs per net and weight and they are NOT comparable across runs; rFID/PSNR/SSIM are
-computed independently of the LPIPS net, so they are the fair yardstick.
+The sweep optimizes the *net-independent* metric ``test/rfid`` (lower is better). The logged
+``*/lpips`` and ``*/loss`` use the network in the loss, so their scale differs per net/weight and
+they are NOT comparable across trials; rFID/PSNR/SSIM are computed independently of the LPIPS net,
+so they are the fair yardstick.
 
 Examples
 --------
-    # full 3-net x 4-weight x 1-repa sweep (12 runs, 20 epochs each), then print the ranking
+    # default: bayes search over net x lpips-weight x repa-weight, 25 trials, 10 epochs each
     uv run python projects/celeba_afhq/autoencoder/sweep.py
 
-    # also sweep the REPA weight (3 nets x 4 lpips x 3 repa = 36 runs)
-    uv run python projects/celeba_afhq/autoencoder/sweep.py --repa-weights 0 0.5 1.0
+    # exhaustive grid instead of bayes (3 nets x 3 lpips x 3 repa = 27 trials)
+    uv run python projects/celeba_afhq/autoencoder/sweep.py --method grid
+
+    # pin the LPIPS net and just search the two weight axes
+    uv run python projects/celeba_afhq/autoencoder/sweep.py --nets squeeze
 
     # smoke test: one combo, one epoch
     uv run python projects/celeba_afhq/autoencoder/sweep.py --nets alex --weights 0.1 --repa-weights 0.5 --epochs 1
 
-    # just (re)print the ranking table for an existing group
-    uv run python projects/celeba_afhq/autoencoder/sweep.py --report-only
+    # attach another agent (e.g. a second GPU/machine) to an existing sweep
+    uv run python projects/celeba_afhq/autoencoder/sweep.py --sweep-id entity/celeba-afhq-autoencoder/abc123
+
+    # just (re)print the ranking table for an existing sweep
+    uv run python projects/celeba_afhq/autoencoder/sweep.py --report-only --sweep-id abc123
 
     # pass extra flags straight through to train.py (after a --)
     uv run python projects/celeba_afhq/autoencoder/sweep.py -- --compile-mode off
@@ -35,9 +45,6 @@ Examples
 from __future__ import annotations
 
 import argparse
-import itertools
-import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -46,77 +53,62 @@ import wandb
 TRAIN = Path(__file__).parent / "train.py"
 PROJECT = "celeba-afhq-autoencoder"
 
-# Net-independent quality metrics we rank on (logged on the test split by train.py).
-RANK_METRICS = ("test/rfid", "test/psnr", "test/ssim")
+# Net-independent quality metric the sweep optimizes (logged on the test split by train.py).
+METRIC = "test/rfid"
 
 
-def run_sweep(nets, weights, repa_weights, epochs, group, extra) -> None:
-    """Run ``train.py`` once per (net, lpips_weight, repa_weight) combo as an isolated
-    subprocess, grouped in wandb under ``group``. One crashing combo is reported and the
-    sweep continues."""
-    combos = list(itertools.product(nets, weights, repa_weights))
-    results: list[tuple[str, float, float, int]] = []  # (net, weight, repa_weight, returncode)
-    for i, (net, weight, repa_weight) in enumerate(combos, 1):
-        env = {
-            **os.environ,
-            "WANDB_RUN_GROUP": group,
-            "WANDB_TAGS": f"lpips-sweep,net-{net},w-{weight},repa-{repa_weight}",
-        }
-        cmd = [
-            sys.executable,
-            str(TRAIN),
-            "--epochs",
-            str(epochs),
-            "--lpips-net",
-            net,
-            "--lpips-weight",
-            str(weight),
-            "--repa-weight",
-            str(repa_weight),
-            *extra,
-        ]
-        print(
-            f"\n[sweep {i}/{len(combos)}] net={net} weight={weight} "
-            f"repa_weight={repa_weight} epochs={epochs}"
-        )
-        print(f"[sweep] $ {' '.join(cmd)}")
-        proc = subprocess.run(cmd, env=env, check=False)
-        if proc.returncode != 0:
-            print(
-                f"[sweep] !! net={net} weight={weight} repa_weight={repa_weight} "
-                f"exited with {proc.returncode}"
-            )
-        results.append((net, weight, repa_weight, proc.returncode))
-
-    ok = sum(1 for *_, rc in results if rc == 0)
-    print(f"\n[sweep] finished: {ok}/{len(results)} runs ok")
-    for net, weight, repa_weight, rc in results:
-        status = "ok" if rc == 0 else f"FAILED (rc={rc})"
-        print(f"[sweep]   net={net:<8} weight={weight:<5} repa={repa_weight:<5} {status}")
+def build_sweep_config(nets, weights, repa_weights, epochs, method, extra) -> dict:
+    """Build the W&B sweep config. Parameter keys are the exact ``train.py`` flag names (minus
+    the ``--``) so the ``${args}`` macro expands them straight onto the command line. Each trial
+    runs as a fresh subprocess (``program``/``command``); ``extra`` flags are appended verbatim."""
+    return {
+        "program": str(TRAIN),
+        "method": method,
+        "metric": {"name": METRIC, "goal": "minimize"},
+        "parameters": {
+            # Swept dimensions: the agent picks one value per trial.
+            "lpips-net": {"values": list(nets)},
+            "lpips-weight": {"values": [float(w) for w in weights]},
+            "repa-weight": {"values": [float(w) for w in repa_weights]},
+            # Fixed for every trial.
+            "epochs": {"value": int(epochs)},
+        },
+        # Launch each trial with the SAME interpreter running this sweep (uv venv), not a bare
+        # `python` off PATH (the ${interpreter} default), then expand the sampled params as
+        # `--lpips-net=... --lpips-weight=...` and tack on any passthrough flags.
+        "command": ["${env}", sys.executable, "${program}", "${args}", *extra],
+    }
 
 
-def report(group: str) -> None:
-    """Fetch the group's runs from wandb and print a table sorted by ``test/rfid`` ascending
+def run_sweep(sweep_id: str, count: int | None) -> None:
+    """Run an agent against ``sweep_id``. For ``grid`` the agent stops once the grid is exhausted;
+    ``count`` caps trials (required to bound ``random``/``bayes``). Trials run sequentially in this
+    process's agent, each as its own ``train.py`` subprocess."""
+    print(f"[sweep] starting agent on {sweep_id} (count={count if count is not None else 'all'})")
+    wandb.agent(sweep_id, count=count)
+
+
+def report(sweep_id: str) -> None:
+    """Fetch the sweep's runs from wandb and print a table sorted by ``test/rfid`` ascending
     (lower is better), cross-checked against PSNR/SSIM."""
     api = wandb.Api()
-    runs = list(
-        api.runs(
-            f"{api.default_entity}/{PROJECT}",
-            filters={"group": group},
-        )
-    )
+    # Accept either a bare sweep id or a fully-qualified entity/project/id path.
+    path = sweep_id if sweep_id.count("/") == 2 else f"{api.default_entity}/{PROJECT}/{sweep_id}"
+    sweep = api.sweep(path)
+    runs = list(sweep.runs)
     if not runs:
-        print(f"[report] no runs found in group {group!r} for project {PROJECT}")
+        print(f"[report] no runs found for sweep {path!r}")
         return
 
     rows = []
     for run in runs:
+        training = run.config.get("training", {})
         summary = run.summary
         rows.append(
             {
-                "net": run.config.get("training", {}).get("lpips_net", "?"),
-                "weight": run.config.get("training", {}).get("lpips_weight", "?"),
-                "repa": run.config.get("training", {}).get("repa_weight", "?"),
+                "net": training.get("lpips_net", "?"),
+                "weight": training.get("lpips_weight", "?"),
+                "repa": training.get("repa_weight", "?"),
                 "rfid": summary.get("test/rfid"),
                 "psnr": summary.get("test/psnr"),
                 "ssim": summary.get("test/ssim"),
@@ -131,7 +123,7 @@ def report(group: str) -> None:
     def fmt(value, spec):
         return format(value, spec) if isinstance(value, (int, float)) else "    -"
 
-    print(f"\n[report] group={group!r}  ({len(rows)} runs, ranked by test/rfid asc)")
+    print(f"\n[report] sweep={path!r}  ({len(rows)} runs, ranked by {METRIC} asc)")
     print(
         f"{'rank':>4}  {'net':<8} {'weight':>7} {'repa':>6}  "
         f"{'rFID':>8} {'PSNR':>7} {'SSIM':>7}  {'state':<8} run"
@@ -147,20 +139,40 @@ def report(group: str) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--nets", nargs="+", default=["alex", "vgg", "squeeze"])
-    p.add_argument("--weights", nargs="+", type=float, default=[0.05, 0.1, 0.5, 1.0])
+    # LPIPS weight: geometric spread spanning ViT-VQGAN's ~0.1 to the LDM/SD-autoencoder ~1.0.
+    p.add_argument("--weights", nargs="+", type=float, default=[0.1, 0.5, 1.0])
     p.add_argument(
         "--repa-weights",
         nargs="+",
         type=float,
-        default=[0.0],
+        # 0 = no-REPA baseline control; 0.5 = the REPA-paper anchor; 0.1 = the lower optimum
+        # found by REPA variants. The literature says alignment weight > ~0.5 only hurts.
+        default=[0.0, 0.1, 0.5],
         help="REPA latent-alignment weights to sweep; 0 disables REPA (matches train.py default)",
     )
-    p.add_argument("--epochs", type=int, default=10, help="epochs per sweep run")
-    p.add_argument("--group", default="lpips-sweep", help="wandb run group for the sweep")
+    p.add_argument("--epochs", type=int, default=10, help="epochs per trial")
+    p.add_argument(
+        "--method",
+        choices=["grid", "random", "bayes"],
+        default="bayes",
+        help="W&B search strategy; grid is exhaustive, random/bayes need --count to bound them",
+    )
+    p.add_argument(
+        "--count",
+        type=int,
+        default=25,
+        help="max trials for the agent (default: 25; for grid, the grid still bounds it)",
+    )
+    p.add_argument(
+        "--sweep-id",
+        default=None,
+        help="attach an agent to (and report on) an existing sweep instead of creating a new one; "
+        "bare id or entity/project/id",
+    )
     p.add_argument(
         "--report-only",
         action="store_true",
-        help="skip training; just print the ranking table for --group",
+        help="skip training; just print the ranking table for --sweep-id",
     )
     p.add_argument(
         "extra",
@@ -169,9 +181,30 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    if not args.report_only:
-        run_sweep(args.nets, args.weights, args.repa_weights, args.epochs, args.group, args.extra)
-    report(args.group)
+    if args.report_only:
+        if not args.sweep_id:
+            p.error("--report-only requires --sweep-id")
+        report(args.sweep_id)
+        return
+
+    if args.method != "grid" and args.count is None:
+        p.error(f"--method {args.method} is open-ended; pass --count to bound the number of trials")
+
+    sweep_id = args.sweep_id
+    if sweep_id is None:
+        config = build_sweep_config(
+            args.nets, args.weights, args.repa_weights, args.epochs, args.method, args.extra
+        )
+        sweep_id = wandb.sweep(config, project=PROJECT)
+        n_grid = len(args.nets) * len(args.weights) * len(args.repa_weights)
+        print(f"[sweep] created sweep {sweep_id} (project={PROJECT})")
+        if args.method == "grid":
+            print(f"[sweep] grid has {n_grid} trials")
+    else:
+        print(f"[sweep] attaching agent to existing sweep {sweep_id}")
+
+    run_sweep(sweep_id, args.count)
+    report(sweep_id)
 
 
 if __name__ == "__main__":
