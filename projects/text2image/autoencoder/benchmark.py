@@ -15,9 +15,9 @@ What it reports:
 
 Examples
 --------
-    uv run python projects/celeba_afhq/autoencoder/benchmark.py --image-size 128 --batch-size 16 \
+    uv run python projects/text2image/autoencoder/benchmark.py --image-size 128 --batch-size 16 \
         --num-workers 4 --compile off --steps 30 --warmup 8
-    uv run python projects/celeba_afhq/autoencoder/benchmark.py --compile reduce-overhead --steps 40
+    uv run python projects/text2image/autoencoder/benchmark.py --compile reduce-overhead --steps 40
 """
 
 from __future__ import annotations

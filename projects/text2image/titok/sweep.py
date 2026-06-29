@@ -1,4 +1,4 @@
-"""W&B Bayesian sweep over the two Muon learning rates for the celeba_afhq TiTok autoencoder.
+"""W&B Bayesian sweep over the two Muon learning rates for the text2image TiTok autoencoder.
 
 ``train.py`` defaults to the Muon optimizer (Muon on the ViT's 2D matmul weights, AdamW aux on
 the embeddings/norms/biases -- see :func:`chimera.optim.muon_adam_param_groups`), so the LR sweep
@@ -25,22 +25,22 @@ logged ``*/lpips`` and ``*/loss`` are on the loss's own scale and are NOT what w
 Examples
 --------
     # default: bayes over (muon-lr, adam-lr), 10 trials, 10 epochs each
-    uv run python projects/celeba_afhq/titok/sweep.py
+    uv run python projects/text2image/titok/sweep.py
 
     # widen the Muon LR range and run more epochs per trial
-    uv run python projects/celeba_afhq/titok/sweep.py --muon-lr-range 1e-3 1e-1 --epochs 20
+    uv run python projects/text2image/titok/sweep.py --muon-lr-range 1e-3 1e-1 --epochs 20
 
     # smoke test: one trial, one epoch
-    uv run python projects/celeba_afhq/titok/sweep.py --count 1 --epochs 1
+    uv run python projects/text2image/titok/sweep.py --count 1 --epochs 1
 
     # attach another agent (e.g. a second GPU/machine) to an existing sweep
-    uv run python projects/celeba_afhq/titok/sweep.py --sweep-id entity/celeba-afhq-titok/abc123
+    uv run python projects/text2image/titok/sweep.py --sweep-id entity/text2image-titok/abc123
 
     # just (re)print the ranking table for an existing sweep
-    uv run python projects/celeba_afhq/titok/sweep.py --report-only --sweep-id abc123
+    uv run python projects/text2image/titok/sweep.py --report-only --sweep-id abc123
 
     # pass extra flags straight through to train.py (after a --)
-    uv run python projects/celeba_afhq/titok/sweep.py -- --compile-mode off
+    uv run python projects/text2image/titok/sweep.py -- --compile-mode off
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ from pathlib import Path
 import wandb
 
 TRAIN = Path(__file__).parent / "train.py"
-PROJECT = "celeba-afhq-titok"
+PROJECT = "text2image-titok"
 
 # Net-independent quality metric the sweep optimizes (logged on the test split by train.py).
 METRIC = "test/rfid"

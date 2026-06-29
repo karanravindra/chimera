@@ -1,5 +1,5 @@
 """W&B sweep over the LPIPS perceptual term (net x weight) and the REPA weight for the
-celeba_afhq autoencoder.
+text2image autoencoder.
 
 This is a real Weights & Biases sweep (``wandb.sweep`` + ``wandb.agent``), not a hand-rolled
 loop. Each trial is launched by the agent as a *fresh* ``python train.py ...`` subprocess via the
@@ -21,25 +21,25 @@ so they are the fair yardstick.
 Examples
 --------
     # default: bayes search over net x lpips-weight x repa-weight, 25 trials, 10 epochs each
-    uv run python projects/celeba_afhq/autoencoder/sweep.py
+    uv run python projects/text2image/autoencoder/sweep.py
 
     # exhaustive grid instead of bayes (3 nets x 3 lpips x 3 repa = 27 trials)
-    uv run python projects/celeba_afhq/autoencoder/sweep.py --method grid
+    uv run python projects/text2image/autoencoder/sweep.py --method grid
 
     # pin the LPIPS net and just search the two weight axes
-    uv run python projects/celeba_afhq/autoencoder/sweep.py --nets squeeze
+    uv run python projects/text2image/autoencoder/sweep.py --nets squeeze
 
     # smoke test: one combo, one epoch
-    uv run python projects/celeba_afhq/autoencoder/sweep.py --nets alex --weights 0.1 --repa-weights 0.5 --epochs 1
+    uv run python projects/text2image/autoencoder/sweep.py --nets alex --weights 0.1 --repa-weights 0.5 --epochs 1
 
     # attach another agent (e.g. a second GPU/machine) to an existing sweep
-    uv run python projects/celeba_afhq/autoencoder/sweep.py --sweep-id entity/celeba-afhq-autoencoder/abc123
+    uv run python projects/text2image/autoencoder/sweep.py --sweep-id entity/text2image-autoencoder/abc123
 
     # just (re)print the ranking table for an existing sweep
-    uv run python projects/celeba_afhq/autoencoder/sweep.py --report-only --sweep-id abc123
+    uv run python projects/text2image/autoencoder/sweep.py --report-only --sweep-id abc123
 
     # pass extra flags straight through to train.py (after a --)
-    uv run python projects/celeba_afhq/autoencoder/sweep.py -- --compile-mode off
+    uv run python projects/text2image/autoencoder/sweep.py -- --compile-mode off
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ from pathlib import Path
 import wandb
 
 TRAIN = Path(__file__).parent / "train.py"
-PROJECT = "celeba-afhq-autoencoder"
+PROJECT = "text2image-autoencoder"
 
 # Net-independent quality metric the sweep optimizes (logged on the test split by train.py).
 METRIC = "test/rfid"

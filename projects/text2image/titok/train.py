@@ -26,10 +26,10 @@ module's state_dict (see ``LitTiTok._ensure_metrics``) so they never bloat the c
 Examples
 --------
     # fresh run on the merged CelebA-HQ + AFHQ set
-    uv run python projects/celeba_afhq/titok/train.py --epochs 100
+    uv run python projects/text2image/titok/train.py --epochs 100
 
     # resume run <id> for more epochs (same wandb run, continues from its checkpoint)
-    uv run python projects/celeba_afhq/titok/train.py --resume <run_id> --epochs 200
+    uv run python projects/text2image/titok/train.py --resume <run_id> --epochs 200
 """
 
 from __future__ import annotations
@@ -352,7 +352,7 @@ def build_datamodule(
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    add_common_args(p, project="celeba-afhq-titok", epochs=50)
+    add_common_args(p, project="text2image-titok", epochs=50)
     p.set_defaults(
         batch_size=64, lr=1e-3
     )  # high-res images + a ViT-Tiny tokenizer

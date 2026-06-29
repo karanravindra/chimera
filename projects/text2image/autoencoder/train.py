@@ -25,10 +25,10 @@ the REPA projection head is small and trainable, so it IS checkpointed and optim
 Examples
 --------
     # fresh run on the merged CelebA-HQ + AFHQ set
-    uv run python projects/celeba_afhq/autoencoder/train.py --epochs 100
+    uv run python projects/text2image/autoencoder/train.py --epochs 100
 
     # resume run <id> for more epochs (same wandb run, continues from its checkpoint)
-    uv run python projects/celeba_afhq/autoencoder/train.py --resume <run_id> --epochs 200
+    uv run python projects/text2image/autoencoder/train.py --resume <run_id> --epochs 200
 """
 
 from __future__ import annotations
@@ -433,7 +433,7 @@ def build_datamodule(
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    add_common_args(p, project="celeba-afhq-autoencoder", epochs=50)
+    add_common_args(p, project="text2image-autoencoder", epochs=50)
     p.set_defaults(
         batch_size=64, lr=1e-3
     )  # high-res images + a larger model than MNIST
@@ -537,7 +537,7 @@ def main() -> None:
         elif args.repa_cache == "on":
             raise SystemExit(
                 f"--repa-cache on but no cache at {_repa_paths(**key)['train']}\n"
-                f"  precompute it: uv run python projects/celeba_afhq/autoencoder/repa_cache.py "
+                f"  precompute it: uv run python projects/text2image/autoencoder/repa_cache.py "
                 f"--image-size {key['image_size']} --repa-model {key['repa_model']} "
                 f"--repa-dino-size {key['repa_dino_size']}"
             )

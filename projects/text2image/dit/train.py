@@ -3,7 +3,7 @@
 Two-stage latent generative model, the high-resolution sibling of
 ``projects/mnist/rectified_flow``:
 
-  * a *frozen* pretrained ``ConvAutoEncoder`` (from the ``celeba_afhq/autoencoder`` project)
+  * a *frozen* pretrained ``ConvAutoEncoder`` (from the ``text2image/autoencoder`` project)
     maps a 3xSxS image to a small *spatial* latent ``(C, H, W)`` (8x downsample); latents are
     standardized per-channel before the flow and de-standardized after;
   * a :class:`~chimera.models.ClassVelocityDiT` learns the rectified-flow velocity
@@ -22,11 +22,11 @@ is never flattened -- so it scales to the autoencoder's 8x(S/8)x(S/8) latent.
 
 Examples
 --------
-    # fresh run against a trained autoencoder run (see celeba_afhq/autoencoder/outputs/<id>)
-    uv run python projects/celeba_afhq/dit/train.py --ae-run <ae_run_id> --epochs 100
+    # fresh run against a trained autoencoder run (see text2image/autoencoder/outputs/<id>)
+    uv run python projects/text2image/dit/train.py --ae-run <ae_run_id> --epochs 100
 
     # resume flow run <id> for more epochs (the AE must still be supplied)
-    uv run python projects/celeba_afhq/dit/train.py --ae-run <ae_run_id> \
+    uv run python projects/text2image/dit/train.py --ae-run <ae_run_id> \
         --resume <dit_run_id> --epochs 200
 """
 
@@ -52,8 +52,8 @@ from chimera.utils.experiment import (
     run_training,
 )
 
-PROJECT_DEFAULT = "celeba-afhq-dit"
-AE_PROJECT_DEFAULT = "celeba-afhq-autoencoder"
+PROJECT_DEFAULT = "text2image-dit"
+AE_PROJECT_DEFAULT = "text2image-autoencoder"
 
 # Sources merged (via ConcatImageDataModule with unify_labels=True) into one train/eval set.
 # The order here defines the unified class ids: CelebA-HQ {female=0, male=1}, then AFHQ
