@@ -362,9 +362,11 @@ def run_training(
         )
     trainer = build_trainer(args, logger, callbacks)
     logger.watch(module, log="gradients")
+    fit_completed = False
     try:
         try:
             trainer.fit(module, datamodule=datamodule, ckpt_path=resume_ckpt)
+            fit_completed = True
         except KeyboardInterrupt:
             # Interrupting training falls through to the test phase (below) on the
             # current weights rather than quitting outright.
@@ -378,7 +380,10 @@ def run_training(
                 # With metric-based selection, test the BEST epoch (reloaded from its checkpoint)
                 # rather than the final / early-stopping-point weights. Needs a saved best; fall
                 # back to current weights if none exists (e.g. interrupted before any validation).
-                best = ckpt_cb.best_model_path if monitor else ""
+                # Only reload the best when fit finished cleanly: an interrupted run (even one
+                # past a validation epoch, so best_model_path is set) is tested on its current
+                # in-memory weights, per the docstring.
+                best = ckpt_cb.best_model_path if (monitor and fit_completed) else ""
                 trainer.test(
                     module, datamodule=datamodule, ckpt_path="best" if best else None
                 )
