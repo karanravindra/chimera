@@ -35,7 +35,6 @@ Examples
 from __future__ import annotations
 
 import argparse
-import math
 from pathlib import Path
 
 import torch
@@ -56,7 +55,7 @@ from chimera.data import (
     ReconstructionAugment,
 )
 from chimera.models import TiTokAutoEncoder
-from chimera.optim import MuonWithAuxAdam, muon_adam_param_groups
+from chimera.optim import MuonWithAuxAdam, cosine_with_floor, muon_adam_param_groups
 from chimera.utils.experiment import (
     add_common_args,
     find_ckpt,
@@ -270,14 +269,10 @@ class LitTiTok(LightningModule):
         # LambdaLR so the single cosine factor scales each param group's own initial_lr
         # -- this floors the Muon and AdamW groups each at 5% of THEIR base LR, which a
         # scalar CosineAnnealingLR eta_min (one absolute floor for all groups) cannot do.
-        t_max = self.trainer.max_epochs or 1
-        floor = self.min_lr_ratio
-
-        def cosine_with_floor(epoch: int) -> float:
-            t = min(epoch, t_max) / t_max
-            return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * t))
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, cosine_with_floor)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            cosine_with_floor(self.trainer.max_epochs or 1, self.min_lr_ratio),
+        )
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
 

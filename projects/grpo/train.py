@@ -33,7 +33,6 @@ Examples
 from __future__ import annotations
 
 import argparse
-import math
 import os
 from contextlib import nullcontext
 from pathlib import Path
@@ -56,6 +55,7 @@ from chimera.grpo import (
 )
 from chimera.grpo.data import PromptDataModule
 from chimera.grpo.tasks import get_task
+from chimera.optim import cosine_with_floor
 from chimera.utils.experiment import (
     add_common_args,
     find_ckpt,
@@ -268,15 +268,11 @@ class LitGRPO(LightningModule):
             trainable, lr=self.lr, weight_decay=self.weight_decay
         )
         # Cosine decay to a floor of min_lr_ratio * peak (per-epoch), matching the repo's
-        # ViT schedule convention (see projects/celeba_afhq/titok/train.py).
-        t_max = self.trainer.max_epochs or 1
-        floor = self.min_lr_ratio
-
-        def cosine_with_floor(epoch: int) -> float:
-            t = min(epoch, t_max) / t_max
-            return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * t))
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, cosine_with_floor)
+        # ViT schedule convention (see projects/text2image/titok/train.py).
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            cosine_with_floor(self.trainer.max_epochs or 1, self.min_lr_ratio),
+        )
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
 
