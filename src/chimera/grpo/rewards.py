@@ -119,7 +119,13 @@ def _extract_expression(completion: str) -> str | None:
     for cand in reversed(completion.strip().splitlines()):
         c = cand.split("=", 1)[0]
         runs = re.findall(r"[\d+\-*/().\s]+", c)
-        runs = [r.strip() for r in runs if any(op in r for op in "+-*/") and any(ch.isdigit() for ch in r)]
+        runs = [
+            r.strip()
+            for r in runs
+            if any(op in r for op in "+-*/")
+            and any(ch.isdigit() for ch in r)
+            and _EXPR_OK.match(r.strip())
+        ]
         if runs:
             return max(runs, key=len)
     return None
