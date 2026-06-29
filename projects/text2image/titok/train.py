@@ -72,7 +72,7 @@ DATASET_NAME = "+".join(SOURCE_DATAMODULES)  # "celeba_hq+afhq"
 
 # ViT-Tiny tokenizer bottleneck: K continuous tokens, each latent_dim wide. Shared by main()
 # and benchmark.py so they construct the identical latent geometry.
-NUM_LATENT_TOKENS = 16
+NUM_LATENT_TOKENS = 32
 LATENT_DIM = 16
 
 OUTPUTS = Path(__file__).parent / "outputs"  # checkpoints live under OUTPUTS/<run_id>
@@ -357,14 +357,14 @@ def main() -> None:
         batch_size=64, lr=1e-3
     )  # high-res images + a ViT-Tiny tokenizer
     p.add_argument("--image-size", type=int, default=128)
-    p.add_argument("--patch-size", type=int, default=16)
+    p.add_argument("--patch-size", type=int, default=8)
     p.add_argument(
-        "--embed-dim", type=int, default=192, help="ViT hidden dim (192 = ViT-Tiny)"
+        "--embed-dim", type=int, default=384, help="ViT hidden dim (192 = ViT-Tiny)"
     )
     p.add_argument(
-        "--depth", type=int, default=6, help="transformer blocks per enc/dec stack"
+        "--depth", type=int, default=12, help="transformer blocks per enc/dec stack"
     )
-    p.add_argument("--num-heads", type=int, default=3)
+    p.add_argument("--num-heads", type=int, default=6)
     p.add_argument(
         "--num-latent-tokens",
         type=int,
@@ -377,7 +377,7 @@ def main() -> None:
     p.add_argument(
         "--drop-path",
         type=float,
-        default=0.1,
+        default=0,
         help="stochastic-depth rate (ramped 0->rate across each ViT stack); 0 disables. "
         "A ViT overfitting regularizer",
     )
@@ -413,13 +413,13 @@ def main() -> None:
     p.add_argument(
         "--aug-min-scale",
         type=float,
-        default=0.4,
+        default=0,
         help="min crop area fraction for --augment (lower = more aggressive)",
     )
     p.add_argument(
         "--aug-jitter",
         type=float,
-        default=0.3,
+        default=0,
         help="brightness/contrast/saturation jitter strength for --augment (0 disables)",
     )
     p.add_argument(
@@ -438,7 +438,7 @@ def main() -> None:
     p.add_argument(
         "--lpips-weight",
         type=float,
-        default=0.5,
+        default=0,
         help="weight of the LPIPS term in the loss",
     )
     p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="alex")
