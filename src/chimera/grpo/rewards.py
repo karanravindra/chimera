@@ -80,6 +80,23 @@ _EXPR_OK = re.compile(r"^[\d+\-*/().\s]+$")
 _INT_LITERAL = re.compile(r"\d+")
 
 
+def safe_eval(expr: str) -> float | int | None:
+    """Evaluate a pure-arithmetic expression in a sandbox, or return ``None``.
+
+    The single safe-eval gate shared by :func:`countdown_reward` and the calculator tool:
+    ``expr`` is accepted only if it matches :data:`_EXPR_OK` (integer/decimal literals and
+    ``+ - * / ( )`` -- no names, calls, or builtins), then evaluated with an empty
+    ``__builtins__``. Returns the numeric result, or ``None`` if the gate rejects ``expr`` or
+    evaluation fails (syntax, division by zero, type/name/value errors).
+    """
+    if not _EXPR_OK.match(expr):
+        return None
+    try:
+        return eval(expr, {"__builtins__": {}}, {})  # noqa: S307 - sandboxed: regex-gated, no names
+    except (SyntaxError, ZeroDivisionError, TypeError, NameError, ValueError):
+        return None
+
+
 def _extract_expression(completion: str) -> str | None:
     """Pull the candidate arithmetic expression from a completion.
 
@@ -127,9 +144,8 @@ def countdown_reward(completion: str, gold: str) -> float:
     used = sorted(int(n) for n in _INT_LITERAL.findall(expr))
     if used != nums:  # must use each number exactly once, no extras
         return 0.0
-    try:
-        value = eval(expr, {"__builtins__": {}}, {})  # noqa: S307 - sandboxed: regex-gated, no names
-    except (SyntaxError, ZeroDivisionError, TypeError, NameError):
+    value = safe_eval(expr)
+    if value is None:
         return 0.0
     return 1.0 if abs(float(value) - target) < 1e-6 else 0.0
 

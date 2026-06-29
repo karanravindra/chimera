@@ -25,9 +25,7 @@ import re
 from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
-# An arithmetic expression of integer/decimal literals and + - * / ( ) only -- nothing else is
-# ever passed to eval(). Mirrors the gate used by countdown_reward.
-_CALC_OK = re.compile(r"^[\d+\-*/().\s]+$")
+from chimera.grpo.rewards import _EXPR_OK, safe_eval
 
 
 @runtime_checkable
@@ -51,11 +49,10 @@ class CalculatorTool:
 
     def __call__(self, query: str) -> str:
         expr = query.strip()
-        if not _CALC_OK.match(expr):
+        if not _EXPR_OK.match(expr):
             return "error: only numbers and + - * / ( ) are allowed"
-        try:
-            value = eval(expr, {"__builtins__": {}}, {})  # noqa: S307 - regex-gated, no names
-        except (SyntaxError, ZeroDivisionError, TypeError, NameError, ValueError):
+        value = safe_eval(expr)  # shares the rewards safe-eval gate (regex-gated, no names)
+        if value is None:
             return "error: could not evaluate"
         # present integers without a trailing .0; round long floats for a compact observation
         if isinstance(value, float) and value.is_integer():
