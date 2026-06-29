@@ -52,19 +52,31 @@ def sample_caption(
     tier_probs: dict[str, float] = DEFAULT_TIER_PROBS,
     dropout: float = DEFAULT_DROPOUT,
     tag_words: int = 8,
+    tiers: tuple[str, ...] | None = None,
+    weights: tuple[float, ...] | None = None,
 ) -> str:
-    """Serve a dense prompt at a randomly chosen length tier (or "" on dropout)."""
+    """Serve a dense prompt at a randomly chosen length tier (or "" on dropout).
+
+    ``tiers``/``weights`` may be supplied pre-zipped from ``tier_probs`` to skip the per-call
+    ``zip`` in hot loops; when omitted they're derived from ``tier_probs`` so standalone calls
+    keep working."""
     if rng.random() < dropout or not prompt:
         return ""
-    tiers, weights = zip(*tier_probs.items())
+    if tiers is None or weights is None:
+        tiers, weights = zip(*tier_probs.items())
     tier = rng.choices(tiers, weights=weights, k=1)[0]
+    full = prompt.strip()
     if tier == "long":
-        return prompt.strip()
-    first = _SENT.split(prompt.strip(), 1)[0].strip()
+        return full
+    first = _SENT.split(full, 1)[0].strip()
     if tier == "short":
-        return first
-    # tag: a short head of the first sentence -- a cheap keyword-ish prompt
-    return " ".join(first.split()[:tag_words]).rstrip(",;:")
+        result = first
+    else:
+        # tag: a short head of the first sentence -- a cheap keyword-ish prompt
+        result = " ".join(first.split()[:tag_words]).rstrip(",;:")
+    # Empty tier results (e.g. a prompt with leading punctuation) would inject unintended
+    # unconditional samples outside the dropout path; fall back to the full prompt instead.
+    return result or full
 
 
 def _stream_shard(path: Path):
@@ -111,6 +123,9 @@ class T2I2MIterable(IterableDataset):
         self.seed = seed
         self.dropout = dropout
         self.tier_probs = tier_probs
+        # Pre-zip once: sample_caption is called per sample in the dataloader hot loop, so
+        # re-deriving (tiers, weights) from tier_probs every call is wasted work.
+        self._tiers, self._weights = zip(*tier_probs.items())
         self.epoch = epoch
 
     def _global_worker(self) -> tuple[int, int]:
@@ -138,8 +153,8 @@ class T2I2MIterable(IterableDataset):
                     img = _to_square(Image.open(io.BytesIO(jpg)), self.image_size)
                 except Exception:
                     continue  # skip a rare corrupt jpg rather than crash the epoch
-                item = (img, sample_caption(prompt, cap_rng, tier_probs=self.tier_probs,
-                                            dropout=self.dropout))
+                item = (img, sample_caption(prompt, cap_rng, dropout=self.dropout,
+                                            tiers=self._tiers, weights=self._weights))
                 if self.shuffle_buffer <= 1:
                     yield item
                     continue
