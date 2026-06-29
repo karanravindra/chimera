@@ -29,6 +29,19 @@ import torch
 import torch.nn.functional as F
 
 
+def _grouped(
+    rewards: torch.Tensor, group_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reshape ``rewards`` into ``(n_prompts, group_size)`` and return it with its row mean.
+
+    The shared reshape + group-mean used by both :func:`compute_group_advantages` and
+    :func:`mgpo_difficulty_weights`. ``mean`` keeps its dim (``(n_prompts, 1)``) so it
+    broadcasts back over the group.
+    """
+    g = rewards.view(-1, group_size)
+    return g, g.mean(dim=1, keepdim=True)
+
+
 def compute_group_advantages(
     rewards: torch.Tensor,
     group_size: int,
@@ -52,8 +65,8 @@ def compute_group_advantages(
         raise ValueError(
             f"rewards length {rewards.numel()} is not a multiple of group_size {group_size}"
         )
-    grouped = rewards.view(-1, group_size)
-    advantages = grouped - grouped.mean(dim=1, keepdim=True)
+    grouped, group_mean = _grouped(rewards, group_size)
+    advantages = grouped - group_mean
     if scale_rewards:
         advantages = advantages / (grouped.std(dim=1, keepdim=True) + eps)
     return advantages.reshape(-1)
@@ -83,8 +96,8 @@ def mgpo_difficulty_weights(
     tensor (the group weight broadcast to each of its completions); multiply it into the
     advantages before :func:`grpo_loss`. ``lam=0`` recovers plain GRPO (all weights 1).
     """
-    grouped = rewards.view(-1, group_size)
-    p_c = grouped.mean(dim=1, keepdim=True).clamp(eps, 1.0 - eps)
+    _, group_mean = _grouped(rewards, group_size)
+    p_c = group_mean.clamp(eps, 1.0 - eps)
     kl = p_c * torch.log(p_c / p0) + (1.0 - p_c) * torch.log((1.0 - p_c) / (1.0 - p0))
     w = torch.exp(-lam * kl)
     return w.expand(-1, group_size).reshape(-1)
