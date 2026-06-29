@@ -53,8 +53,13 @@ def find_ckpt(run_id: str, project: str, outputs: Path) -> str:
         directory = Path(artifact.download())
         ckpts = sorted(directory.glob("*.ckpt"))
         if ckpts:
-            print(f"[ckpt] downloaded {ckpts[0]}")
-            return str(ckpts[0])
+            # Prefer the exact-resume ``last.ckpt`` if the artifact carries it (it may also
+            # hold the monitored best, named like ``epoch=NN-step=MMMM.ckpt``, so resuming
+            # from the first ckpt could rewind to an older best epoch); fall back to the
+            # first ckpt for older single-file artifacts.
+            chosen = next((c for c in ckpts if c.name == "last.ckpt"), ckpts[0])
+            print(f"[ckpt] downloaded {chosen}")
+            return str(chosen)
     raise FileNotFoundError(
         f"No checkpoint found locally or as an artifact for run {run_id}"
     )
@@ -237,14 +242,24 @@ class EMA(Callback):
 
 
 def upload_checkpoint_artifact(
-    logger: WandbLogger, run_id: str, ckpt_path: Path, metadata: dict
+    logger: WandbLogger,
+    run_id: str,
+    ckpt_path: Path,
+    metadata: dict,
+    best_path: Path | None = None,
 ) -> None:
-    """Upload the final checkpoint as a wandb model artifact (aliased ``latest``) so any
-    run can be rebuilt later. No-op if the checkpoint doesn't exist."""
+    """Upload the final checkpoint(s) as a wandb model artifact (aliased ``latest``) so any
+    run can be rebuilt or resumed later. ``ckpt_path`` is the primary (exact-resume)
+    checkpoint -- usually ``last.ckpt``; when ``best_path`` is given and exists, the monitored
+    best checkpoint is added to the same artifact alongside it (Lightning names it like
+    ``epoch=NN-step=MMMM.ckpt``, so it won't collide with ``last.ckpt``). No-op if the
+    primary checkpoint doesn't exist."""
     if not ckpt_path.exists():
         return
     artifact = wandb.Artifact(name=run_id, type="model", metadata=metadata)
     artifact.add_file(str(ckpt_path))
+    if best_path is not None and best_path.exists() and best_path != ckpt_path:
+        artifact.add_file(str(best_path))
     logger.experiment.log_artifact(artifact, aliases=["latest"])
     print(f"logged checkpoint artifact for run {run_id}")
 
@@ -371,10 +386,15 @@ def run_training(
                 # Interrupting the test just quits; there's nothing left to run.
                 print("test interrupted — exiting")
     finally:
-        # When monitoring, upload the best checkpoint (the kept model); otherwise the periodic
-        # last.ckpt. Falls back to last.ckpt if no best was recorded.
+        # Always upload ``last.ckpt`` as the primary file so a remote resume rewinds to the
+        # true latest epoch (not the older best); when monitoring, also bundle the best
+        # checkpoint into the same artifact so the kept model is available for rebuilds.
         best_path = ckpt_cb.best_model_path if monitor else ""
         upload_checkpoint_artifact(
-            logger, run_id, Path(best_path) if best_path else ckpt_dir / "last.ckpt", artifact_metadata
+            logger,
+            run_id,
+            ckpt_dir / "last.ckpt",
+            artifact_metadata,
+            best_path=Path(best_path) if best_path else None,
         )
         wandb.finish()
