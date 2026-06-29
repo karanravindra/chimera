@@ -14,10 +14,32 @@ and prompt format.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from lightning import LightningDataModule
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from chimera.grpo.tasks import Task
+
+
+class _RenderedDataset(Dataset):
+    """Lazily render an HF dataset row into a prompt record on ``__getitem__``.
+
+    Rendering (a chat-template application) is cheap, so we defer it instead of
+    materializing the whole rendered corpus into a ``list[dict]`` at ``setup``. The eager
+    list was resident per DataLoader worker (duplicated under ``persistent_workers`` +
+    forked workers); a thin Dataset keeps only the underlying HF dataset in memory.
+    """
+
+    def __init__(self, ds, render: Callable[[dict], dict]):
+        self._ds = ds
+        self._render = render
+
+    def __len__(self) -> int:
+        return len(self._ds)
+
+    def __getitem__(self, index: int) -> dict:
+        return self._render(self._ds[index])
 
 
 class PromptDataModule(LightningDataModule):
@@ -53,8 +75,8 @@ class PromptDataModule(LightningDataModule):
         self.val_size = val_size
         self.train_size = train_size
         self.drop_last = False  # run_training flips this on for CUDA-graph compile modes
-        self._train: list[dict] | None = None
-        self._val: list[dict] | None = None
+        self._train: Dataset | None = None
+        self._val: Dataset | None = None
 
     def _render(self, example: dict) -> dict:
         """Turn one raw dataset row into a ready-to-tokenize prompt record."""
@@ -74,8 +96,9 @@ class PromptDataModule(LightningDataModule):
         train_ds, val_ds = self.task.load_splits(self.data_dir, self.val_size)
         if self.train_size is not None:
             train_ds = train_ds.select(range(min(self.train_size, len(train_ds))))
-        self._train = [self._render(ex) for ex in train_ds]
-        self._val = [self._render(ex) for ex in val_ds]
+        # Wrap (don't materialize): each row is rendered lazily in __getitem__.
+        self._train = _RenderedDataset(train_ds, self._render)
+        self._val = _RenderedDataset(val_ds, self._render)
 
     @staticmethod
     def _collate(batch: list[dict]) -> list[dict]:

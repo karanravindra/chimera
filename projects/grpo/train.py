@@ -190,6 +190,8 @@ class LitGRPO(LightningModule):
         ).to(self.device)
 
         logprobs = self._completion_logprobs(roll)
+        # beta > 0 runs a second full forward pass (the KL reference) over the batch,
+        # roughly doubling per-step forward compute; beta == 0 skips it entirely.
         ref_logprobs = (
             self._completion_logprobs(roll, reference=True) if self.beta > 0 else None
         )
