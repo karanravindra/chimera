@@ -79,19 +79,19 @@ def main() -> None:
     if args.limit is not None:
         test_ds = test_ds.select(range(min(args.limit, len(test_ds))))
 
-    rows = [
-        {
+    def render(ex: dict) -> dict:
+        return {
             "prompt": tokenizer.apply_chat_template(
                 task.build_prompt(ex), tokenize=False, add_generation_prompt=True
             ),
             "gold": task.gold_of(ex),
         }
-        for ex in test_ds
-    ]
 
-    correct = 0
-    for start in tqdm(range(0, len(rows), args.batch_size), desc=f"eval {args.task}"):
-        chunk = rows[start : start + args.batch_size]
+    n_test = len(test_ds)
+    correct = 0.0
+    for start in tqdm(range(0, n_test, args.batch_size), desc=f"eval {args.task}"):
+        # Render this batch's prompts lazily instead of materializing the whole test set.
+        chunk = [render(test_ds[i]) for i in range(start, min(start + args.batch_size, n_test))]
         roll = generate_completions(
             module.model,
             tokenizer,
@@ -105,10 +105,13 @@ def main() -> None:
         for text, row in zip(roll["texts"], chunk):
             correct += task.correctness(text, row["gold"])
 
-    accuracy = correct / max(len(rows), 1)
+    accuracy = correct / max(n_test, 1)
+    # correctness() may award partial credit, so print the count without a lossy int() cast
+    # unless it is a whole number (the common binary-reward case).
+    correct_str = str(int(correct)) if correct == int(correct) else f"{correct:.2f}"
     print(
         f"\n{task.name} pass@1 ({label}): {accuracy:.4f}  "
-        f"({int(correct)}/{len(rows)} on {'first ' + str(args.limit) if args.limit else 'full'} test set)"
+        f"({correct_str}/{n_test} on {'first ' + str(args.limit) if args.limit else 'full'} test set)"
     )
 
 
