@@ -494,6 +494,10 @@ def main() -> None:
         outputs=OUTPUTS,
         resume_ckpt=resume_ckpt,
         artifact_metadata=config,
+        # val/loss is the flow-MSE logged every validation epoch (val/gfid is only scored
+        # periodically, so it can't drive per-epoch selection); lower is better.
+        monitor="val/loss",
+        monitor_mode="min",
     )
 
 

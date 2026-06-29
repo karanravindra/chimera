@@ -607,6 +607,8 @@ def main() -> None:
         resume_ckpt=resume_ckpt,
         artifact_metadata=config,
         test=True,  # report rFID/PSNR/SSIM/LPIPS on the test split after training
+        monitor="val/rfid",  # keep/test/upload the best-rFID epoch (logged in _finalize_eval_epoch)
+        monitor_mode="min",
     )
 
 
