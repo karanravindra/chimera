@@ -6,6 +6,11 @@ from chimera.nn.drop_path import DropPath
 from chimera.nn.mlp import Mlp
 
 
+def _drop_path_rates(depth: int, rate: float) -> list[float]:
+    """Per-block stochastic-depth rates ramping linearly 0 -> ``rate`` across ``depth`` blocks."""
+    return [rate * i / max(depth - 1, 1) for i in range(depth)]
+
+
 # --------------------------------------------------------------------------------------
 # ViT building blocks
 # --------------------------------------------------------------------------------------
@@ -97,7 +102,7 @@ class TiTokEncoder(nn.Module):
             nn.init.trunc_normal_(p, std=0.02)
 
         # Stochastic depth rate ramps linearly 0 -> drop_path_rate across the stack.
-        dpr = [drop_path_rate * i / max(depth - 1, 1) for i in range(depth)]
+        dpr = _drop_path_rates(depth, drop_path_rate)
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(embed_dim, num_heads, mlp_ratio, drop_path=dpr[i])
@@ -147,7 +152,7 @@ class TiTokDecoder(nn.Module):
         for p in (self.mask_token, self.patch_pos_embed, self.latent_pos_embed):
             nn.init.trunc_normal_(p, std=0.02)
 
-        dpr = [drop_path_rate * i / max(depth - 1, 1) for i in range(depth)]
+        dpr = _drop_path_rates(depth, drop_path_rate)
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(embed_dim, num_heads, mlp_ratio, drop_path=dpr[i])
