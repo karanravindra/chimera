@@ -64,7 +64,7 @@ from chimera.utils.experiment import (
 SOURCE_DATAMODULES = {"celeba_hq": CelebAHQDataModule, "afhq": AFHQDataModule}
 DATASET_NAME = "+".join(SOURCE_DATAMODULES)  # "celeba_hq+afhq"
 DOWNSAMPLE = 8  # 4 halving DCDownBlocks: S -> S/2 -> S/4 -> S/8 -> S/16
-LATENT_CHANNELS = 8
+LATENT_CHANNELS = 16
 
 OUTPUTS = Path(__file__).parent / "outputs"  # checkpoints live under OUTPUTS/<run_id>
 
@@ -394,7 +394,7 @@ def build_model_config(base_channels: int) -> dict:
         latent_dim=LATENT_CHANNELS,
         base_channels=c,
         dim_per_block=(c, 2 * c, 4 * c),
-        layers_per_block=(1, 2, 3)
+        layers_per_block=(2, 2, 4)
     )
 
 
@@ -441,7 +441,7 @@ def main() -> None:
     p.add_argument(
         "--base-channels",
         type=int,
-        default=64,
+        default=32,
         help="stem width; blocks are (1,2,4)x this",
     )
     p.add_argument(
@@ -450,14 +450,14 @@ def main() -> None:
         default=0.5,
         help="weight of the LPIPS term in the loss",
     )
-    p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="vgg")
+    p.add_argument("--lpips-net", choices=["vgg", "alex", "squeeze"], default="alex")
     p.add_argument(
         "--fid-feature", type=int, default=2048, help="InceptionV3 feature dim for rFID"
     )
     p.add_argument(
         "--repa-weight",
         type=float,
-        default=0.5,
+        default=0,
         help="weight of the REPA latent-alignment term; 0 disables REPA entirely",
     )
     p.add_argument(
