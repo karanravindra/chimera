@@ -151,7 +151,7 @@ class ImageDataModule(LightningDataModule):
         in_memory: bool = True,
         augment_eval: bool = True,
         image_size: int | None = None,
-        drop_last: bool = False,
+        drop_last: bool = True,
     ):
         super().__init__()
         self.data_dir = data_dir
