@@ -199,10 +199,15 @@ class TiTokAutoEncoder(nn.Module):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         drop_path_rate: float = 0.0,
+        sigmoid_output: bool = True,
     ):
         super().__init__()
         self.num_latent_tokens = num_latent_tokens
         self.latent_dim = latent_dim
+        # Squash the reconstruction into [0,1] for image targets (the default). Set False when
+        # the target is unbounded -- e.g. a stage-2 tokenizer whose reconstruction target is
+        # another autoencoder's continuous latent grid, not pixels.
+        self.sigmoid_output = sigmoid_output
 
         self.encoder = TiTokEncoder(
             image_size,
@@ -247,7 +252,8 @@ class TiTokAutoEncoder(nn.Module):
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         z = self.from_latent(z)  # (B, K, embed_dim)
-        return self.decoder(z).sigmoid()
+        out = self.decoder(z)
+        return out.sigmoid() if self.sigmoid_output else out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decode(self.encode(x))
