@@ -1,4 +1,9 @@
-from chimera.models.autoencoder import ConvAutoEncoder
+from chimera.models.autoencoder import (
+    DCAE,
+    ConvAutoEncoder,
+    EfficientViTBlock,
+    LiteMLA,
+)
 from chimera.models.backbone import Backbone
 from chimera.models.digitnet import DigitNet, DigitNetLPIPS
 from chimera.models.flow import ClassVelocityDiT, TextVelocityDiT, VelocityDiT
@@ -9,6 +14,9 @@ from chimera.models.titok import TiTokAutoEncoder
 
 __all__ = [
     "ConvAutoEncoder",
+    "DCAE",
+    "EfficientViTBlock",
+    "LiteMLA",
     "Backbone",
     "VelocityDiT",
     "TextVelocityDiT",
