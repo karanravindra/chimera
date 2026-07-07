@@ -9,6 +9,7 @@ Mirrors the cache idiom of ``fineweb_edu`` (config-named cache + skip-if-present
 and the split/dataloader shape of ``MNISTDataModule``.
 """
 
+import hashlib
 from pathlib import Path
 from typing import Optional
 
@@ -87,6 +88,20 @@ class MNISTLatentDataModule(pl.LightningDataModule):
         self.val_set: Optional[Dataset] = None
         self.test_set: Optional[Dataset] = None
 
+    @staticmethod
+    def _ae_fingerprint(autoencoder) -> str:
+        """Short hash of the autoencoder weights, to detect a changed AE.
+
+        The cache is a function of the AE that produced it: if the AE is
+        retrained the cached latents no longer match its decoder, so we must
+        re-encode instead of silently reusing stale latents.
+        """
+        h = hashlib.sha1()
+        for name, p in sorted(autoencoder.state_dict().items()):
+            h.update(name.encode())
+            h.update(p.detach().cpu().float().numpy().tobytes())
+        return h.hexdigest()[:12]
+
     @torch.inference_mode()
     def _encode_split(self, train: bool, device) -> tuple[torch.Tensor, torch.Tensor]:
         ds = MNIST(self.data_dir, train=train, transform=self.transform)
@@ -108,8 +123,22 @@ class MNISTLatentDataModule(pl.LightningDataModule):
         MNIST(self.data_dir, train=True, download=True)
         MNIST(self.data_dir, train=False, download=True)
 
-        if load_cached_ids(self.cache_path) is not None:
-            return
+        fingerprint = (
+            self._ae_fingerprint(self.autoencoder)
+            if self.autoencoder is not None
+            else None
+        )
+
+        cached = load_cached_ids(self.cache_path)
+        if cached is not None:
+            # Reuse the cache only if it was built by this same autoencoder. When
+            # no AE is provided (cache-only reload) we trust the cache as-is.
+            if fingerprint is None or cached.get("ae_fingerprint") == fingerprint:
+                return
+            print(
+                "Autoencoder changed since the latent cache was built; re-encoding "
+                f"({self.cache_path.name})."
+            )
 
         if self.autoencoder is None:
             raise ValueError(
@@ -137,6 +166,7 @@ class MNISTLatentDataModule(pl.LightningDataModule):
                 "test_labels": test_y,
                 "mean": mean,
                 "std": std,
+                "ae_fingerprint": fingerprint,
             },
         )
 
