@@ -5,6 +5,7 @@ from .cifar100 import CIFAR100DataModule
 from .fineweb_edu import FineWebEduDataModule
 from .imagenet1k import ImageNet1kDataModule
 from .mnist import MNISTDataModule
+from .mnist_latents import MNISTLatentDataModule
 from .text8 import Text8DataModule
 from .tinyshakespeare import TinyShakespeareDataModule
 
@@ -16,6 +17,7 @@ __all__ = [
     "FineWebEduDataModule",
     "ImageNet1kDataModule",
     "MNISTDataModule",
+    "MNISTLatentDataModule",
     "Text8DataModule",
     "TinyShakespeareDataModule",
 ]

@@ -1,5 +1,9 @@
 from lightning import LightningModule
 from torch import nn
+from torchmetrics.functional.image import (
+    peak_signal_noise_ratio,
+    structural_similarity_index_measure,
+)
 
 
 class AutoencoderModule(LightningModule):
@@ -9,31 +13,35 @@ class AutoencoderModule(LightningModule):
         self.optimizer = optimizer
         self.scheduler = scheduler
 
-        self.criterion = nn.MSELoss()
+        self.criterion = nn.L1Loss()
 
     def forward(self, x):
         return self.model(x)
 
-    def _step(self, batch):
+    def _step(self, batch, stage):
         x, _ = batch
         recon = self.model(x)
         loss = self.criterion(recon, x)
+
+        psnr = peak_signal_noise_ratio(recon, x, data_range=1.0)
+        self.log(f"{stage}/loss", loss, on_step=True, prog_bar=True)
+        self.log(f"{stage}/psnr", psnr, prog_bar=True)
+
+        if stage == "val":
+            ssim = structural_similarity_index_measure(recon, x, data_range=1.0)
+            self.log(f"{stage}/ssim", ssim, prog_bar=True)
+
+        
         return loss
 
     def training_step(self, batch, batch_idx):
-        loss = self._step(batch)
-        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        return loss
+        return self._step(batch, "train")
 
     def validation_step(self, batch, batch_idx):
-        loss = self._step(batch)
-        self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-        return loss
+        return self._step(batch, "val")
 
     def test_step(self, batch, batch_idx):
-        loss = self._step(batch)
-        self.log("test/loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-        return loss
+        return self._step(batch, "test")
 
     def configure_optimizers(self):
         return {

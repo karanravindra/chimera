@@ -26,6 +26,7 @@ class MNISTDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         pin_memory: bool = True,
         seed: int = 42,
+        image_size: Optional[int] = None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -36,8 +37,13 @@ class MNISTDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.seed = seed
+        self.image_size = image_size
 
-        tfms = [transforms.ToTensor()]
+        # Optionally resize the native 28x28 digits (e.g. to 32x32).
+        tfms = []
+        if image_size is not None:
+            tfms.append(transforms.Resize((image_size, image_size)))
+        tfms.append(transforms.ToTensor())
         self.transform = transforms.Compose(tfms)
 
         self.mnist_train: Optional[Dataset] = None
