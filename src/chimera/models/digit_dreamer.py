@@ -280,3 +280,37 @@ class DigitDreamer(nn.Module):
 
         out = self.final(img, c)  # (B, n_patches, p*p*C)
         return self.unpatchify(out)
+
+    @staticmethod
+    def from_variant(
+        variant: str,
+        latent_channels: int = 4,
+        latent_size: int = 7,
+        patch_size: int = 1,
+        n_classes: int = 10,
+        n_cond_tokens: int = 4,
+        class_dropout_prob: float = 0.1,
+        mlp_ratio: float = 4.0,
+    ) -> "DigitDreamer":
+        if variant == "tiny":
+            dim, depth, n_head = 64, 4, 1
+        elif variant == "small":
+            dim, depth, n_head = 96, 4, 2
+        elif variant == "medium":
+            dim, depth, n_head = 128, 6, 4
+        elif variant == "large":
+            dim, depth, n_head = 192, 8, 4
+        else:
+            raise ValueError(f"Unknown model variant: {variant}")
+        return DigitDreamer(
+            latent_channels=latent_channels,
+            latent_size=latent_size,
+            patch_size=patch_size,
+            dim=dim,
+            depth=depth,
+            n_head=n_head,
+            n_classes=n_classes,
+            n_cond_tokens=n_cond_tokens,
+            class_dropout_prob=class_dropout_prob,
+            mlp_ratio=mlp_ratio,
+        )

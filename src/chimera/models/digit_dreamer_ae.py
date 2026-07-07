@@ -225,3 +225,36 @@ class DigitDreamerAE(nn.Module):
         x = self.to_latent(x).permute(0, 2, 3, 1)
         zq = self.fsq(x)
         return self.fsq.codes_to_indices(zq)
+
+    @staticmethod
+    def from_variant(
+        variant: str,
+        in_channels: int = 1,
+        latent_dim: int = 4,
+        fsq_levels=None,
+    ) -> "DigitDreamerAE":
+        if variant == "tiny":
+            base_channels = 16
+        elif variant == "small":
+            base_channels = 24
+        elif variant == "medium":
+            base_channels = 32
+        elif variant == "large":
+            base_channels = 48
+        else:
+            raise ValueError(f"Unknown model variant: {variant}")
+        return DigitDreamerAE(
+            in_channels=in_channels,
+            latent_dim=latent_dim,
+            base_channels=base_channels,
+            fsq_levels=fsq_levels,
+        )
+
+
+if __name__ == "__main__":
+    from torchinfo import summary
+
+    for variant in ["tiny", "small", "medium", "large"]:
+        model = DigitDreamerAE.from_variant(variant)
+        print(f"Model variant: {variant}")
+        summary(model, input_size=(1, 1, 32, 32))
