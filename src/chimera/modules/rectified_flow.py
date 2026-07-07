@@ -23,7 +23,7 @@ class RectifiedFlowModule(LightningModule):
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.logit_normal = logit_normal
-        self.criterion = nn.MSELoss()
+        self.criterion = nn.L1Loss()
 
     def _sample_t(self, batch_size, device):
         if self.logit_normal:
