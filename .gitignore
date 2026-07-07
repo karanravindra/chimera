@@ -10,4 +10,5 @@ wheels/
 .venv
 
 lightning_logs/
+checkpoints/
 /data/
