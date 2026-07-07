@@ -1,7 +1,7 @@
 import torch.nn as nn
 
 
-class Autoencoder(nn.Module):
+class DigitDreamerAE(nn.Module):
     def __init__(self, in_channels: int = 1, latent_dim: int = 32):
         super().__init__()
         # 28x28 -> 14x14 -> 7x7
