@@ -8,9 +8,9 @@ class RectifiedFlowModule(LightningModule):
 
     The model predicts the constant velocity ``v = data - noise`` along the
     straight interpolant ``z_t = (1 - t) * noise + t * data`` (so ``t = 0`` is
-    noise and ``t = 1`` is data). Training minimizes the MSE between the predicted
-    and target velocity; sampling integrates the learned ODE with Euler steps and
-    classifier-free guidance.
+    noise and ``t = 1`` is data). Training minimizes the L1 loss between the
+    predicted and target velocity; sampling integrates the learned ODE with Euler
+    steps and classifier-free guidance.
 
     Follows the ``(model, optimizer, scheduler)`` convention of the other modules
     (see ``AutoencoderModule``). Batches are ``(z, y)``: standardized latents and
