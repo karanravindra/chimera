@@ -1,0 +1,25 @@
+program: projects/cifar10/autoencoder/train.py
+project: cifar10-autoencoder
+method: bayes
+metric:
+  name: val/psnr
+  goal: maximize
+early_terminate:
+  type: hyperband
+  min_iter: 2
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.002
+  batch-size:
+    values: [64, 128, 256]
+  warmup-steps:
+    values: [100, 200, 300]
+  latent-dim:
+    values: [64, 128, 256]
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args}

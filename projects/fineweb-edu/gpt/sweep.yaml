@@ -1,0 +1,32 @@
+# Bayesian sweep over the Muon/AdamW learning rates, warmup, and effective
+# (global) token count per step. seq-len is NOT swept: it sets the model's
+# block_size and RoPE range, so changing it would change the model config.
+#
+# No early_terminate: training is a single epoch capped by --max-steps, so there
+# is effectively one validation point per run and hyperband (which prunes across
+# many logged iterations/epochs) has nothing to prune on. Runs are cheap and
+# fixed-length, so we let every trial finish.
+program: projects/fineweb-edu/gpt/train.py
+project: fineweb-edu-gpt
+method: bayes
+metric:
+  name: val/loss
+  goal: minimize
+parameters:
+  muon-lr:
+    distribution: log_uniform_values
+    min: 0.005
+    max: 0.05
+  adamw-lr:
+    distribution: log_uniform_values
+    min: 0.0002
+    max: 0.002
+  warmup-steps:
+    values: [50, 100, 200]
+  global-token-count:
+    values: [32768, 65536, 131072]
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args}

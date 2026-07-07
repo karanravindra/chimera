@@ -1,0 +1,41 @@
+# AFHQ PetPaletteAE sweep.
+#
+# NOTE: train.py runs a fixed THREE-PHASE curriculum (full -> bottleneck ->
+# output-head) in one process. Each trial therefore trains all three phases and
+# reports ONE coherent wandb run. We only sweep knobs that are safe to vary
+# without breaking the curriculum:
+#
+#   SWEPT     : phase1-lr (log-uniform), lpips-weight, phase1-warmup-steps.
+#               lpips-weight is shared by all phases and is the recipe's top rFID
+#               lever, so it is the one cross-phase knob worth searching.
+#   NOT SWEPT : epochs (fixed by the curriculum + the hard 10-min/run budget),
+#               batch sizes / resolutions (fixed per phase; changing them shifts
+#               throughput and can blow the time budget), phase-2/3 lr and
+#               gan-weight (kept at their notebook values so the sweep stays a
+#               small, phase-1-focused search rather than a combinatorial blowup).
+#
+# Metric: val/rfid (reconstruction-FID, logged every validation epoch; lower is
+# better) -- the key AE quality metric. Hyperband prunes weak configs early.
+program: projects/afhq/autoencoder/train.py
+project: afhq-autoencoder
+method: bayes
+metric:
+  name: val/rfid
+  goal: minimize
+early_terminate:
+  type: hyperband
+  min_iter: 2
+parameters:
+  phase1-lr:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.002
+  lpips-weight:
+    values: [0.5, 1.0, 2.0]
+  phase1-warmup-steps:
+    values: [100, 200, 300]
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args}
