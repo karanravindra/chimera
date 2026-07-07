@@ -22,7 +22,13 @@ import lightning as pl
 
 from chimera.tokenizers import BPETokenizer
 
-from ._text import TokenDataset
+from ._text import (
+    TokenDataset,
+    iter_text_chunks,
+    load_cached_ids,
+    save_cached_ids,
+    tokenize_with_progress,
+)
 
 TINYSHAKESPEARE_URL = (
     "https://raw.githubusercontent.com/karpathy/char-rnn/"
@@ -71,6 +77,12 @@ class TinyShakespeareDataModule(pl.LightningDataModule):
     def _tokenizer_path(self) -> Path:
         return self._dir / f"tokenizer_{self.tokenizer_backend}.json"
 
+    @property
+    def _ids_path(self) -> Path:
+        """Path of the cached flat token stream for this exact configuration."""
+        hp = self.hparams
+        return self._dir / f"ids_{hp.tokenizer_backend}_v{hp.vocab_size}.pt"
+
     def prepare_data(self):
         # download only, called once on a single process
         if self._text_path.exists():
@@ -97,7 +109,17 @@ class TinyShakespeareDataModule(pl.LightningDataModule):
         self.tokenizer = self._load_or_train_tokenizer(text)
         self.vocab_size = self.tokenizer.vocab_size
 
-        data = torch.tensor(self.tokenizer.encode(text), dtype=torch.long)
+        data = load_cached_ids(self._ids_path)
+        if data is None:
+            ids = tokenize_with_progress(
+                self.tokenizer,
+                iter_text_chunks(text),
+                desc="Tokenizing tinyshakespeare",
+                unit="chunk",
+            )
+            data = torch.tensor(ids, dtype=torch.long)
+            save_cached_ids(self._ids_path, data)
+
         n_val = int(len(data) * self.val_split)
         n_train = len(data) - n_val
         self.train_dataset = TokenDataset(data[:n_train], self.seq_len)

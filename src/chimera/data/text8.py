@@ -33,7 +33,13 @@ import lightning as pl
 
 from chimera.tokenizers import BPETokenizer
 
-from ._text import TokenDataset
+from ._text import (
+    TokenDataset,
+    iter_text_chunks,
+    load_cached_ids,
+    save_cached_ids,
+    tokenize_with_progress,
+)
 
 TEXT8_URL = "http://mattmahoney.net/dc/text8.zip"
 
@@ -84,6 +90,16 @@ class Text8DataModule(pl.LightningDataModule):
     def _tokenizer_path(self) -> Path:
         return self.data_dir / f"text8_tokenizer_{self.tokenizer_backend}.json"
 
+    @property
+    def _ids_path(self) -> Path:
+        """Path of the cached BPE token stream for this exact configuration."""
+        hp = self.hparams
+        if hp.tokenizer_backend == "pretrained":
+            tag = "pretrained_" + hp.pretrained_id.replace("/", "_")
+        else:
+            tag = f"{hp.tokenizer_backend}_v{hp.vocab_size}"
+        return self.data_dir / f"text8_ids_{tag}.pt"
+
     def prepare_data(self):
         # download + unzip only, called once on a single process
         if self._text8_path.exists():
@@ -128,7 +144,18 @@ class Text8DataModule(pl.LightningDataModule):
             self.tokenizer.train(text[: self.train_size], vocab_size=self.vocab_size)
             self.tokenizer.save(self._tokenizer_path)
         self.vocab_size = self.tokenizer.vocab_size
-        return torch.tensor(self.tokenizer.encode(text), dtype=torch.long)
+
+        data = load_cached_ids(self._ids_path)
+        if data is None:
+            ids = tokenize_with_progress(
+                self.tokenizer,
+                iter_text_chunks(text),
+                desc="Tokenizing text8",
+                unit="chunk",
+            )
+            data = torch.tensor(ids, dtype=torch.long)
+            save_cached_ids(self._ids_path, data)
+        return data
 
     def setup(self, stage: Optional[str] = None):
         if self.text8_train is not None:

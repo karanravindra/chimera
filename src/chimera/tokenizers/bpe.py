@@ -146,6 +146,22 @@ class BPETokenizer:
             ids = _merge(ids, pair, self.merges[pair])
         return ids
 
+    def encode_batch(self, texts: list[str]) -> list[list[int]]:
+        """Encode many texts at once.
+
+        For the fast backends this dispatches to the Rust tokenizer's parallel
+        batch encoder (multi-threaded, far faster than looping ``encode``). The
+        scratch backend has no parallel path, so it falls back to a Python loop.
+        """
+        if self.backend in _FAST_BACKENDS:
+            # encode_batch_fast (tokenizers >= 0.20) skips offset bookkeeping we
+            # don't need; fall back to encode_batch on older versions.
+            encode_batch = getattr(self._tok, "encode_batch_fast", None)
+            if encode_batch is None:
+                encode_batch = self._tok.encode_batch
+            return [enc.ids for enc in encode_batch(texts)]
+        return [self.encode(t) for t in texts]
+
     def decode(self, ids) -> str:
         ids = [int(i) for i in ids]
         if self.backend in _FAST_BACKENDS:

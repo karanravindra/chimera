@@ -3,9 +3,16 @@ FineWeb-Edu BPE DataModule for PyTorch Lightning.
 
 FineWeb-Edu (``HuggingFaceFW/fineweb-edu``) is a large, high-quality English web
 corpus for language-model pretraining. This module downloads a sample config
-(default ``sample-10BT``, ~28GB) via the Hugging Face ``datasets`` library, trains
-a custom byte-level BPE tokenizer (:class:`chimera.tokenizers.BPETokenizer`), and
+(default ``sample-10BT``, ~28GB) via the Hugging Face ``datasets`` library,
+tokenizes it (a custom byte-level BPE via :class:`chimera.tokenizers.BPETokenizer`,
+or a fixed pretrained tokenizer when ``tokenizer_backend="pretrained"``), and
 serves a bounded token stream as non-overlapping next-token ``(input, target)`` chunks.
+
+Documents are concatenated into a single stream with an end-of-document token
+(``eos_token``, default ``<|endoftext|>``) appended after each one so the model
+learns document boundaries rather than attending across unrelated pages. This
+requires a tokenizer that defines the token — i.e. ``hf`` or ``pretrained``
+backends; the from-scratch byte-level BPE has none, so ``add_eos`` is a no-op there.
 
 Because the full 10BT sample is ~10B tokens, ``max_train_tokens`` caps how many
 tokens are materialised into memory (set ``None`` to use every row — expect very
@@ -26,7 +33,12 @@ import lightning as pl
 
 from chimera.tokenizers import BPETokenizer
 
-from ._text import TokenDataset
+from ._text import (
+    TokenDataset,
+    load_cached_ids,
+    save_cached_ids,
+    tokenize_with_progress,
+)
 
 HF_REPO = "HuggingFaceFW/fineweb-edu"
 
@@ -41,6 +53,9 @@ class FineWebEduDataModule(pl.LightningDataModule):
         val_split: float = 0.01,
         vocab_size: int = 32000,
         tokenizer_backend: str = "scratch",
+        pretrained_id: str = "LiquidAI/LFM2.5-230M",
+        add_eos: bool = True,
+        eos_token: str = "<|endoftext|>",
         max_train_tokens: Optional[int] = 10_000_000,
         tokenizer_train_chars: int = 5_000_000,
         num_workers: int = 4,
@@ -56,12 +71,17 @@ class FineWebEduDataModule(pl.LightningDataModule):
         self.val_split = val_split
         self.vocab_size = vocab_size
         self.tokenizer_backend = tokenizer_backend
+        self.pretrained_id = pretrained_id
+        self.add_eos = add_eos
+        self.eos_token = eos_token
         self.max_train_tokens = max_train_tokens
         self.tokenizer_train_chars = tokenizer_train_chars
         self.num_workers = num_workers
         self.pin_memory = pin_memory
 
         self.tokenizer: Optional[BPETokenizer] = None
+        # id of the document-separator token, resolved in setup()
+        self.eos_id: Optional[int] = None
 
         self.train_dataset: Optional[Dataset] = None
         self.val_dataset: Optional[Dataset] = None
@@ -73,6 +93,18 @@ class FineWebEduDataModule(pl.LightningDataModule):
     @property
     def _tokenizer_path(self) -> Path:
         return self._dir / f"tokenizer_{self.name}_{self.tokenizer_backend}.json"
+
+    @property
+    def _ids_path(self) -> Path:
+        """Path of the cached flat token stream for this exact configuration."""
+        hp = self.hparams
+        if hp.tokenizer_backend == "pretrained":
+            tok_tag = "pretrained_" + hp.pretrained_id.replace("/", "_")
+        else:
+            tok_tag = f"{hp.tokenizer_backend}_v{hp.vocab_size}"
+        eos = "eos" if hp.add_eos else "noeos"
+        cap = "all" if hp.max_train_tokens is None else str(hp.max_train_tokens)
+        return self._dir / f"ids_{hp.name}_{tok_tag}_{eos}_{cap}.pt"
 
     def _load_dataset(self):
         from datasets import load_dataset
@@ -87,15 +119,26 @@ class FineWebEduDataModule(pl.LightningDataModule):
     def prepare_data(self):
         # download + cache only, called once on a single process
         self._dir.mkdir(parents=True, exist_ok=True)
+        # if the tokenized id stream is already cached we never touch the raw
+        # dataset again, so skip the (large) download entirely.
+        if self._ids_path.exists():
+            return
         self._load_dataset()
 
-    def _load_or_train_tokenizer(self, ds) -> BPETokenizer:
+    def _load_or_train_tokenizer(self) -> BPETokenizer:
         if self._tokenizer_path.exists():
             return BPETokenizer.load(
                 self._tokenizer_path, backend=self.tokenizer_backend
             )
 
+        if self.tokenizer_backend == "pretrained":
+            # fixed tokenizer from the Hub (e.g. LiquidAI/LFM2.5-230M); no training
+            tok = BPETokenizer.from_pretrained(self.pretrained_id)
+            tok.save(self._tokenizer_path)
+            return tok
+
         # concatenate rows until we have enough characters to train on
+        ds = self._load_dataset()
         parts: list[str] = []
         total = 0
         for row in ds:
@@ -110,22 +153,61 @@ class FineWebEduDataModule(pl.LightningDataModule):
         tok.save(self._tokenizer_path)
         return tok
 
+    def _resolve_eos_id(self) -> Optional[int]:
+        """Token id used to separate documents, or None if unavailable.
+
+        Only the fast (``hf`` / ``pretrained``) backends carry named special
+        tokens; a from-scratch byte-level BPE has no EOS, so ``add_eos`` is a
+        no-op there.
+        """
+        if not self.add_eos:
+            return None
+        tok = self.tokenizer._tok if self.tokenizer is not None else None
+        if tok is None:
+            return None
+        return tok.token_to_id(self.eos_token)
+
     def setup(self, stage: Optional[str] = None):
         if self.train_dataset is not None:
             return
 
-        ds = self._load_dataset()
-        self.tokenizer = self._load_or_train_tokenizer(ds)
+        self.tokenizer = self._load_or_train_tokenizer()
         self.vocab_size = self.tokenizer.vocab_size
+        self.eos_id = self._resolve_eos_id()
+        if self.add_eos and self.eos_id is None:
+            print(
+                f"add_eos=True but tokenizer has no {self.eos_token!r} token "
+                f"(backend={self.tokenizer_backend!r}); documents will be "
+                "concatenated without a separator."
+            )
 
-        ids: list[int] = []
-        for row in ds:
-            ids.extend(self.tokenizer.encode(row["text"]))
-            if self.max_train_tokens is not None and len(ids) >= self.max_train_tokens:
-                ids = ids[: self.max_train_tokens]
-                break
+        # Concatenate documents into one token stream, appending the EOS token
+        # after each document so the model learns document boundaries instead of
+        # bleeding context across unrelated web pages. The stream is cached to
+        # disk so subsequent runs skip both the download and the tokenization.
+        data = load_cached_ids(self._ids_path)
+        if data is None:
+            ds = self._load_dataset()
 
-        data = torch.tensor(ids, dtype=torch.long)
+            # Batched column reads are faster than per-row access on the Arrow
+            # dataset; tokenize_with_progress then batches these for encode_batch
+            # and stops early once max_train_tokens is reached.
+            def texts():
+                for batch in ds.iter(batch_size=1024):
+                    yield from batch["text"]
+
+            ids = tokenize_with_progress(
+                self.tokenizer,
+                texts(),
+                desc="Tokenizing fineweb-edu",
+                total=len(ds),
+                unit="doc",
+                eos_id=self.eos_id,
+                max_tokens=self.max_train_tokens,
+            )
+            data = torch.tensor(ids, dtype=torch.long)
+            save_cached_ids(self._ids_path, data)
+
         n_val = int(len(data) * self.val_split)
         n_train = len(data) - n_val
         self.train_dataset = TokenDataset(data[:n_train], self.seq_len)
