@@ -48,6 +48,7 @@ class LanguageModelModule(LightningModule):
         loss, bpt = self._step(batch)
         self.log("train/loss", loss, on_step=True, prog_bar=True)
         self.log("train/bpt", bpt, on_step=True, prog_bar=True)
+        self.log("train/lr", self.scheduler.get_last_lr()[0], on_step=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
