@@ -5,12 +5,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class ReLU2(nn.Module):
+    def forward(self, x):
+        return F.relu(x).square()
+
+
 class MLP(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
         self.fc1 = nn.Linear(dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, dim)
-        self.act = nn.GELU()
+        self.act = ReLU2()
 
     def forward(self, x):
         x = self.fc1(x)
@@ -61,8 +66,7 @@ class GroupedQueryAttention(nn.Module):
 
         # Q keeps n_head heads; K and V share only n_kv_head heads (the GQA fix).
         self.q_proj = nn.Linear(dim, n_head * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(dim, n_kv_head * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(dim, n_kv_head * self.head_dim, bias=False)
+        self.kv_proj = nn.Linear(dim, n_kv_head * self.head_dim * 2, bias=False)
         self.proj = nn.Linear(dim, dim)
 
         # QK-norm: per-head RMSNorm over the head dimension before attention.
@@ -73,8 +77,12 @@ class GroupedQueryAttention(nn.Module):
         B, T, _ = x.shape
 
         q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        kv = (
+            self.kv_proj(x)
+            .view(B, T, self.n_kv_head, self.head_dim * 2)
+            .transpose(1, 2)
+        )
+        k, v = kv.chunk(2, dim=-1)
 
         # QK-norm, then rotary embeddings on the fresh q/k for this step.
         q = apply_rotary(self.q_norm(q), cos, sin)
@@ -260,3 +268,21 @@ class GPT(nn.Module):
             # Feed only the new token; RoPE/attention use the cached keys/values.
             hidden, past_kvs = step(nxt, past_kvs=past_kvs)
         return idx
+
+
+if __name__ == "__main__":
+    from torchinfo import summary
+
+    model = GPT(
+        vocab_size=256, block_size=256, n_embd=384, n_head=6, n_kv_head=2, n_layer=6
+    )
+    summary(
+        model, input_size=(1, 256), col_names=["output_size", "num_params", "mult_adds"], dtypes=[torch.int64]
+    )
+
+    # the logits should be roughly uniform, so the loss should be close to ln(vocab_size)
+    with torch.no_grad():
+        x = torch.randint(0, 256, (32, 256), dtype=torch.long, device=next(model.parameters()).device)
+        logits = model(x)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), x.view(-1))
+        print(f"loss: {loss.item():.4f} (should be ~{math.log(256):.4f})")
