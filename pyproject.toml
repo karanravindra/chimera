@@ -7,7 +7,17 @@ authors = [
     { name = "Karan Ravindra", email = "21176108+karanravindra@users.noreply.github.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "ipykernel>=7.3.0",
+    "ipywidgets>=8.1.8",
+    "lightning>=2.6.5",
+    "matplotlib>=3.11.0",
+    "pandas>=3.0.3",
+    "tabulate>=0.10.0",
+    "torch>=2.12.1",
+    "torchinfo>=1.8.0",
+    "torchvision>=0.27.1",
+]
 
 [project.scripts]
 chimera = "chimera:main"
