@@ -12,3 +12,4 @@ wheels/
 lightning_logs/
 checkpoints/
 /data/
+wandb/
