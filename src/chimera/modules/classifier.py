@@ -1,6 +1,7 @@
 from lightning import LightningModule
 from torch import nn
 
+
 class ClassifierModule(LightningModule):
     def __init__(self, model, optimizer, scheduler):
         super().__init__()

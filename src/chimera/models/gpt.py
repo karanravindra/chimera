@@ -86,7 +86,9 @@ class GroupedQueryAttention(nn.Module):
 
         if past_kv is None:
             # Prefill / training: square causal mask.
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+            out = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, enable_gqa=True
+            )
         else:
             # Incremental decode: query positions [past_len, past_len+T) attend to all
             # keys up to and including their own absolute position.
@@ -153,7 +155,7 @@ class GPT(nn.Module):
             ]
         )
         self.ln_f = nn.RMSNorm(n_embd)
-        
+
         if tie_embedding:
             self.head = nn.Linear(n_embd, vocab_size, bias=False)
             self.head.weight = self.tok_emb.weight
@@ -181,7 +183,9 @@ class GPT(nn.Module):
         return logits, presents
 
     def forward(self, idx):
-        assert idx.size(1) <= self.block_size, "Cannot forward, model block size is exhausted."
+        assert idx.size(1) <= self.block_size, (
+            "Cannot forward, model block size is exhausted."
+        )
         logits, _ = self._forward(idx, past_kvs=None)
         return logits
 

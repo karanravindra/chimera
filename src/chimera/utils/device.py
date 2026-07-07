@@ -1,5 +1,6 @@
 import torch
-from typing import  Literal
+from typing import Literal
+
 
 def get_device(device: Literal["auto", "cpu", "cuda", "mps"] = "auto") -> torch.device:
     """Get the device to use for training.
@@ -19,7 +20,8 @@ def get_device(device: Literal["auto", "cpu", "cuda", "mps"] = "auto") -> torch.
             return torch.device("cpu")
     else:
         return torch.device(device)
-    
+
+
 if __name__ == "__main__":
     device = get_device()
     print(f"Using device: {device}")
