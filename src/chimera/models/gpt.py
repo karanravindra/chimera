@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -156,11 +158,29 @@ class GPT(nn.Module):
         )
         self.ln_f = nn.RMSNorm(n_embd)
 
-        if tie_embedding:
+        if not tie_embedding:
             self.head = nn.Linear(n_embd, vocab_size, bias=False)
             self.head.weight = self.tok_emb.weight
-        else:
-            self.head = nn.Linear(n_embd, vocab_size, bias=False)
+
+        # GPT-2 style init: without it nn.Embedding defaults to N(0, 1), and since
+        # the head is tied to it the logits blow up (~10x std), starting the loss
+        # far above ln(vocab) instead of at it.
+        self.apply(self._init_weights)
+        # scale residual-writing projections by 1/sqrt(2 * n_layer) so the residual
+        # stream variance stays bounded with depth (GPT-2).
+        residual_std = 0.02 / math.sqrt(2 * n_layer)
+        for block in self.blocks:
+            nn.init.normal_(block.attn.proj.weight, mean=0.0, std=residual_std)
+            nn.init.normal_(block.mlp.fc2.weight, mean=0.0, std=residual_std)
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def _forward(self, idx, past_kvs=None):
         B, T = idx.shape
@@ -179,28 +199,64 @@ class GPT(nn.Module):
             presents.append(present)
 
         x = self.ln_f(x)
-        logits = self.head(x)
-        return logits, presents
+        return x, presents  # hidden states (pre-projection)
 
-    def forward(self, idx):
+    @property
+    def lm_head_weight(self):
+        """The classifier weight matrix (V, C), whether tied or a separate head."""
+        return self.head.weight if hasattr(self, "head") else self.tok_emb.weight
+
+    def project(self, hidden):
+        """Project hidden states to vocabulary logits."""
+        return hidden @ self.lm_head_weight.t()
+
+    def forward(self, idx, return_hidden: bool = False):
         assert idx.size(1) <= self.block_size, (
             "Cannot forward, model block size is exhausted."
         )
-        logits, _ = self._forward(idx, past_kvs=None)
-        return logits
+        hidden, _ = self._forward(idx, past_kvs=None)
+        # Cut Cross Entropy fuses the head projection with the loss, so it needs
+        # the hidden states and lm_head_weight rather than materialized logits.
+        if return_hidden:
+            return hidden
+        return self.project(hidden)
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens: int, temperature: float = 1.0):
+    def generate(
+        self,
+        idx,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        compile: bool = False,
+    ):
+        """Autoregressively sample ``max_new_tokens`` tokens with a KV cache.
+
+        These tiny models are launch-overhead bound during decode, so ``compile=True``
+        ``torch.compile``s the per-step forward (~2-3x faster steady-state). The first
+        call pays a one-time compile warmup that exceeds the saving on a single short
+        run — it only pays off when generating repeatedly (the compiled step is cached
+        on the module and reused across calls).
+        """
         self.eval()
+
+        step = self._forward
+        if compile:
+            if getattr(self, "_forward_compiled", None) is None:
+                # dynamic=True: one compiled artifact serves both the variable-length
+                # prefill and the length-1 decode step (no per-length recompiles).
+                self._forward_compiled = torch.compile(self._forward, dynamic=True)
+            step = self._forward_compiled
+
         # Prefill the cache with the (cropped) prompt in a single pass.
         idx_cond = idx[:, -self.block_size :]
-        logits, past_kvs = self._forward(idx_cond, past_kvs=None)
+        hidden, past_kvs = step(idx_cond, past_kvs=None)
 
         for _ in range(max_new_tokens):
-            next_logits = logits[:, -1, :] / temperature
+            # Only the last position is needed to sample the next token.
+            next_logits = self.project(hidden[:, -1, :]) / temperature
             probs = torch.softmax(next_logits, dim=-1)
             nxt = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, nxt], dim=1)
             # Feed only the new token; RoPE/attention use the cached keys/values.
-            logits, past_kvs = self._forward(nxt, past_kvs=past_kvs)
+            hidden, past_kvs = step(nxt, past_kvs=past_kvs)
         return idx
