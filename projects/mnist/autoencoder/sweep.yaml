@@ -1,0 +1,27 @@
+program: projects/mnist/autoencoder/train.py
+project: mnist-autoencoder
+method: bayes
+metric:
+  name: val/psnr
+  goal: maximize
+early_terminate:
+  type: hyperband
+  min_iter: 2
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.002
+  batch-size:
+    values: [64, 128, 256]
+  warmup-steps:
+    values: [100, 200, 300]
+  latent-dim:
+    values: [1, 2, 4]
+  model-variant:
+    values: [tiny, small, medium, large]
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args}
