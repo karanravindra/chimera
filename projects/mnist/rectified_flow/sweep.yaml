@@ -1,0 +1,30 @@
+# Assumes projects/mnist/autoencoder/train.py has already produced
+# /mnt/ai/runs/mnist/autoencoder/checkpoints/ae.ckpt (default --ae-ckpt).
+# latent-channels and ae-model-variant are NOT swept here: they must match
+# that checkpoint's latent_dim / --model-variant, so changing them
+# independently would break loading.
+program: projects/mnist/rectified_flow/train.py
+project: mnist-rectified-flow
+method: bayes
+metric:
+  name: val/loss
+  goal: minimize
+early_terminate:
+  type: hyperband
+  min_iter: 2
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 0.0002
+    max: 0.003
+  batch-size:
+    values: [64, 128, 256]
+  warmup-steps:
+    values: [50, 100, 200]
+  model-variant:
+    values: [tiny, small, medium, large]
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args}
