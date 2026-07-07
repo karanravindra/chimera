@@ -1,4 +1,4 @@
-"""MM-DiT: a small SD3-style multimodal diffusion transformer.
+"""DigitDreamer: a small SD3-style MM-DiT (multimodal diffusion transformer).
 
 Two token streams are processed jointly: the *image* stream (patchified spatial
 latents) and a *conditioning* stream (class-label tokens). Each stream keeps its
@@ -98,7 +98,7 @@ class JointAttention(nn.Module):
         return self.proj_img(img_out), self.proj_cond(cond_out)
 
 
-class MMDiTBlock(nn.Module):
+class DigitDreamerBlock(nn.Module):
     """One dual-stream MM-DiT block: joint attention + per-stream MLP, adaLN-Zero."""
 
     def __init__(self, dim: int, n_head: int, mlp_ratio: float = 4.0):
@@ -165,7 +165,7 @@ class FinalLayer(nn.Module):
         return self.linear(x)
 
 
-class MMDiT(nn.Module):
+class DigitDreamer(nn.Module):
     """MM-DiT velocity network over a spatial latent with class conditioning.
 
     Args:
@@ -219,7 +219,7 @@ class MMDiT(nn.Module):
         self.t_embed = TimestepEmbedder(dim)
 
         self.blocks = nn.ModuleList(
-            [MMDiTBlock(dim, n_head, mlp_ratio) for _ in range(depth)]
+            [DigitDreamerBlock(dim, n_head, mlp_ratio) for _ in range(depth)]
         )
         self.final = FinalLayer(dim, patch_size, latent_channels)
 

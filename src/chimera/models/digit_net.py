@@ -1,7 +1,7 @@
 import torch.nn as nn
 
 
-class LeNet5(nn.Module):
+class DigitNet(nn.Module):
     def __init__(self, in_channels: int = 1, num_classes: int = 10):
         super().__init__()
         self.backbone = nn.Sequential(
