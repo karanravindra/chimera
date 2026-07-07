@@ -37,6 +37,7 @@ class AFHQDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         pin_memory: bool = True,
         seed: int = 42,
+        normalize: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -48,14 +49,18 @@ class AFHQDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.seed = seed
+        self.normalize = normalize
 
-        self.transform = transforms.Compose(
-            [
-                transforms.Resize((image_size, image_size)),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-            ]
-        )
+        # normalize=True maps pixels to [-1, 1] (the usual GAN/diffusion range);
+        # normalize=False keeps them in [0, 1] to match a sigmoid-output decoder
+        # and PSNR/SSIM with data_range=1.0 (the autoencoder-project convention).
+        tfms = [
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+        ]
+        if normalize:
+            tfms.append(transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]))
+        self.transform = transforms.Compose(tfms)
         self.classes: list[str] = []
 
         self.afhq_train: Optional[Dataset] = None
