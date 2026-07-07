@@ -31,14 +31,6 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data-dir", default="/mnt/ai/data")
     p.add_argument("--run-dir", default="/mnt/ai/runs/mnist/rectified_flow")
-    p.add_argument(
-        "--ae-ckpt", default="/mnt/ai/runs/mnist/autoencoder/checkpoints/ae.ckpt"
-    )
-    # Must match whatever --model-variant produced --ae-ckpt (not swept -- pinned
-    # to a specific pretrained checkpoint, same reasoning as --latent-channels).
-    p.add_argument("--ae-model-variant", choices=MODEL_VARIANTS, default="tiny")
-    p.add_argument("--model-variant", choices=MODEL_VARIANTS, default="tiny")
-    p.add_argument("--latent-channels", type=int, default=1)
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -46,6 +38,14 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--wandb-project", default="mnist-rectified-flow")
     p.add_argument("--wandb-offline", action="store_true")
+    p.add_argument("--model-variant", choices=MODEL_VARIANTS, default="tiny")
+    p.add_argument(
+        "--ae-ckpt", default="/mnt/ai/runs/mnist/autoencoder/checkpoints/ae.ckpt"
+    )
+    # Must match whatever --model-variant produced --ae-ckpt (not swept -- pinned
+    # to a specific pretrained checkpoint, same reasoning as --latent-channels).
+    p.add_argument("--ae-model-variant", choices=MODEL_VARIANTS, default="tiny")
+    p.add_argument("--latent-channels", type=int, default=1)
     return p.parse_args()
 
 
@@ -111,12 +111,13 @@ def main():
         enable_version_counter=False,
     )
     loggers = build_run_loggers(
-        run_dir, args.wandb_project, "rectified-flow", args.wandb_offline, tags=[args.model_variant]
+        run_dir, args.wandb_project, None, args.wandb_offline, tags=[args.model_variant]
     )
 
     trainer = Trainer(
         max_epochs=args.epochs,
         precision="bf16-mixed",
+        gradient_clip_algorithm="norm",
         gradient_clip_val=1.0,
         deterministic=True,
         logger=loggers,

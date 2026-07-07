@@ -32,8 +32,6 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=8e-4)
     p.add_argument("--warmup-steps", type=int, default=100)
-    p.add_argument("--latent-dim", type=int, default=1)
-    p.add_argument("--model-variant", choices=MODEL_VARIANTS, default="tiny")
     # seed 42 lands this 1-channel-bottleneck AE in a black-image collapse basin
     # (BatchNorm + L1 + an extreme bottleneck makes "predict all-zero" an easy
     # local optimum); seed 0 trains cleanly to psnr ~23dB. Not a data/precision
@@ -41,6 +39,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--wandb-project", default="mnist-autoencoder")
     p.add_argument("--wandb-offline", action="store_true")
+    p.add_argument("--model-variant", choices=MODEL_VARIANTS, default="tiny")
+    p.add_argument("--latent-dim", type=int, default=1)
     return p.parse_args()
 
 
@@ -82,7 +82,7 @@ def main():
         enable_version_counter=False,
     )
     loggers = build_run_loggers(
-        run_dir, args.wandb_project, "autoencoder", args.wandb_offline, tags=[args.model_variant]
+        run_dir, args.wandb_project, None, args.wandb_offline, tags=[args.model_variant]
     )
 
     trainer = Trainer(

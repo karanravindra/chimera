@@ -16,10 +16,10 @@ parameters:
     values: [64, 128, 256]
   warmup-steps:
     values: [100, 200, 300]
-  latent-dim:
-    values: [1, 2, 4]
   model-variant:
     values: [tiny, small, medium, large]
+  latent-dim:
+    values: [1, 2, 4]
 command:
   - ${env}
   - ${interpreter}

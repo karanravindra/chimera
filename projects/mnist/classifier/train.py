@@ -55,7 +55,7 @@ def main():
     args = parse_args()
     seed_everything(args.seed, workers=True)
 
-    dm = MNISTDataModule(data_dir=args.data_dir, batch_size=args.batch_size)
+    dm = MNISTDataModule(data_dir=args.data_dir, batch_size=args.batch_size, num_workers=4)
     dm.prepare_data()
     dm.setup("fit")
     dm.setup("test")
@@ -87,7 +87,9 @@ def main():
         mode="max",
         enable_version_counter=False,
     )
-    loggers = build_run_loggers(run_dir, args.wandb_project, wandb_offline=args.wandb_offline, tags=[args.model_variant])
+    loggers = build_run_loggers(
+        run_dir, args.wandb_project, None, args.wandb_offline, tags=[args.model_variant]
+    )
 
     trainer = Trainer(
         max_epochs=args.epochs,
