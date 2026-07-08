@@ -3,7 +3,7 @@
 FineWeb-Edu ``sample-10BT`` tokenized with the pretrained LiquidAI/LFM2.5-230M
 subword tokenizer; documents are concatenated with an ``<|endoftext|>`` separator
 so the model learns document boundaries. Optimized with Muon (2D hidden weight
-matrices) + AdamW (embedding/head/biases/norms) under one LR schedule, with
+matrices) + AdamW (embedding/head/norms) under one LR schedule, with
 ``torch.compile`` and Cut Cross Entropy (fused lm_head + cross-entropy).
 
     uv run python projects/fineweb-edu/gpt/train.py
@@ -29,6 +29,7 @@ from chimera.models import GPT
 from chimera.modules import LanguageModelModule
 from chimera.optim import LinearWarmupCosineAnnealingLR, Muon, muon_param_groups
 from chimera.utils import build_run_loggers
+from bench import DEFAULT_TASKS, flatten_for_wandb, print_table, run_benchmarks
 
 
 def parse_args():
@@ -55,7 +56,7 @@ def parse_args():
     # the ACTUAL run horizon or it diverges late (constant-LR final 5.37; cosine
     # matched to the run 5.13). Keep the scheduler on and its period = run length.
     p.add_argument("--muon-lr", type=float, default=0.01)
-    p.add_argument("--adamw-lr", type=float, default=8e-3)
+    p.add_argument("--adamw-lr", type=float, default=4e-3)
     p.add_argument("--adamw-weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-steps", type=int, default=100)
     p.add_argument("--eta-min", type=float, default=1e-5)
@@ -67,7 +68,12 @@ def parse_args():
     p.add_argument("--limit-val-batches", type=int, default=250)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--wandb-project", default="fineweb-edu-gpt")
+    # Explicit wandb run name; left unset, wandb assigns a random one. Useful to
+    # tag a run with what makes it different from the rest (an ablation, a fix).
+    p.add_argument("--run-name", default=None)
     p.add_argument("--wandb-offline", action="store_true")
+    # wandb run tags, comma-separated (e.g. "mup,sweep").
+    p.add_argument("--tags", default=None)
     # GPT has no from_variant, so its hyperparameters are exposed directly.
     p.add_argument("--n-embd", type=int, default=384)
     p.add_argument("--n-head", type=int, default=12)
@@ -98,6 +104,11 @@ def parse_args():
     # Skip the final trainer.test() pass (redundant with periodic validation when
     # a sweep only needs to rank runs on val/loss; saves a full val-loader pass).
     p.add_argument("--no-test", dest="run_test", action="store_false")
+    # Zero-shot benchmark suite (bench.py) run after trainer.test() and logged
+    # to wandb under test/<task>/<metric>; a sweep can skip it to save time.
+    p.add_argument("--eval-tasks", default=",".join(DEFAULT_TASKS))
+    p.add_argument("--eval-batch-tokens", type=int, default=32768)
+    p.add_argument("--no-eval", dest="run_eval", action="store_false")
     return p.parse_args()
 
 
@@ -159,7 +170,7 @@ def main():
     print(f"GPT parameters: {n_params / 1e6:.2f}M")
 
     # Muon routes the 2D hidden weight matrices (attention + MLP) to Muon and the
-    # token embedding, output head, biases, and norm gains to AdamW; both groups
+    # token embedding, output head, and norm gains to AdamW; both groups
     # share one LR schedule (each anneals from its own base LR).
     optimizer = Muon(
         muon_param_groups(
@@ -196,9 +207,13 @@ def main():
         monitor="val/loss",
         enable_version_counter=False,
     )
+    tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None
     loggers = build_run_loggers(
-        run_dir, args.wandb_project, None, args.wandb_offline
+        run_dir, args.wandb_project, args.run_name, args.wandb_offline, tags=tags
     )
+    # so main.ipynb can pull model hyperparams (n_embd, seq_len, ...) for ANY past
+    # run straight from wandb config instead of hardcoding them per checkpoint.
+    loggers[1].log_hyperparams(vars(args))
 
     trainer = Trainer(
         max_steps=args.max_steps,
@@ -218,6 +233,33 @@ def main():
     if args.run_test:
         trainer.test(lm_module, dataloaders=val_loader)
     print("best checkpoint:", checkpoint.best_model_path)
+
+    if args.run_eval:
+        eval_tasks = [t.strip() for t in args.eval_tasks.split(",") if t.strip()]
+        if eval_tasks:
+            # Lightning leaves the model on CPU after fit/test (see chimera memory
+            # lightning-cpu-after-test); torch.compile wraps model in _orig_mod, and
+            # eval batch shapes vary per request, so score with the raw eager module.
+            eval_model = getattr(model, "_orig_mod", model)
+            # torch.compile(mode="reduce-overhead") pins several GiB of CUDA-graph
+            # private-pool memory sized for the training step shape; switching to
+            # the eager _orig_mod doesn't release it, so eval's own (larger,
+            # variable-shape) batches OOM against that dead memory. Reset dynamo's
+            # cudagraph trees to reclaim it before eval allocates anything.
+            torch._dynamo.reset()
+            torch.cuda.empty_cache()
+            eval_device = "cuda" if torch.cuda.is_available() else "cpu"
+            eval_model.to(eval_device)
+            results = run_benchmarks(
+                eval_model,
+                dm.tokenizer,
+                eval_tasks,
+                block_size=args.seq_len,
+                batch_tokens=args.eval_batch_tokens,
+                device=eval_device,
+            )
+            print_table(results)
+            loggers[1].log_metrics(flatten_for_wandb(results), step=trainer.global_step)
 
 
 if __name__ == "__main__":

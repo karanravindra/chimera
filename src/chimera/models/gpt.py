@@ -14,8 +14,8 @@ class ReLU2(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
-        self.fc1 = nn.Linear(dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, dim)
+        self.fc1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.fc2 = nn.Linear(hidden_dim, dim, bias=False)
         self.act = ReLU2()
 
     def forward(self, x):
@@ -28,28 +28,30 @@ class MLP(nn.Module):
 class RotaryEmbedding(nn.Module):
     """Rotary position embeddings, computed on the fly so positions are unbounded."""
 
+    inv_freq: torch.Tensor
+
     def __init__(self, head_dim: int, base: float = 10000.0):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
+    @torch.no_grad()
     def forward(self, offset: int, seq_len: int, device):
-        # positions [offset, offset + seq_len); float32 for precision regardless of AMP
         pos = torch.arange(offset, offset + seq_len, device=device, dtype=torch.float32)
-        freqs = torch.outer(pos, self.inv_freq.float())  # (T, head_dim / 2)
+        freqs = torch.outer(pos, self.inv_freq)  # (T, head_dim / 2)
         emb = torch.cat((freqs, freqs), dim=-1)  # (T, head_dim)
         return emb.cos(), emb.sin()
 
 
-def rotate_half(x):
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary(x, cos, sin):
+def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     # x: (B, n_head, T, head_dim); cos/sin: (T, head_dim)
-    cos = cos.to(x.dtype)[None, None, :, :]
-    sin = sin.to(x.dtype)[None, None, :, :]
+    cos = cos.to(x.dtype).unsqueeze(0).unsqueeze(0)
+    sin = sin.to(x.dtype).unsqueeze(0).unsqueeze(0)
     return x * cos + rotate_half(x) * sin
 
 
@@ -68,7 +70,7 @@ class GroupedQueryAttention(nn.Module):
         # Q keeps n_head heads; K and V share only n_kv_head heads (the GQA fix).
         self.q_proj = nn.Linear(dim, n_head * self.head_dim, bias=False)
         self.kv_proj = nn.Linear(dim, n_kv_head * self.head_dim * 2, bias=False)
-        self.proj = nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, dim, bias=False)
 
         # QK-norm: per-head RMSNorm over the head dimension before attention.
         self.q_norm = nn.RMSNorm(self.head_dim)
@@ -170,7 +172,7 @@ class GPT(nn.Module):
         # (m_d == 1) this reduces to the original GPT-2-style parameterization.
         # NB: LRs need no width scaling here — all hidden matrices go to Muon
         # (whose update is spectrally normalized) and all AdamW params
-        # (embedding/head/norms/biases) have Theta(1) muP LR.
+        # (embedding/head/norms) have Theta(1) muP LR.
         self.mup_width_mult = n_embd / mup_base_width
         self.mup_base_std = mup_base_std
         self.mup_input_mult = mup_input_mult
@@ -222,8 +224,6 @@ class GPT(nn.Module):
                 block.mlp.fc2,
             ):
                 nn.init.normal_(lin.weight, mean=0.0, std=hidden_std)
-                if lin.bias is not None:
-                    nn.init.zeros_(lin.bias)
             # Scale residual-writing projections by 1/sqrt(2 * n_layer) so the
             # residual stream variance stays bounded with depth (GPT-2), on top of
             # the muP width scaling already baked into hidden_std.
