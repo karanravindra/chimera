@@ -32,6 +32,9 @@ class LanguageModelModule(LightningModule):
             from cut_cross_entropy import linear_cross_entropy
 
             hidden = self.model(x, return_hidden=True)  # (B, T, C)
+            # CCE fuses hidden @ lm_head_weight and bypasses model.project(), so
+            # apply the muP output multiplier here to match the non-CCE path.
+            hidden = hidden * self.model.output_mult
             loss = linear_cross_entropy(
                 hidden.reshape(-1, hidden.size(-1)),
                 self.model.lm_head_weight,  # (V, C)
@@ -48,7 +51,12 @@ class LanguageModelModule(LightningModule):
         loss, bpt = self._step(batch)
         self.log("train/loss", loss, on_step=True, prog_bar=True)
         self.log("train/bpt", bpt, on_step=True, prog_bar=True)
-        self.log("train/lr", self.scheduler.get_last_lr()[0], on_step=True, prog_bar=True)
+        lr = (
+            self.scheduler.get_last_lr()[0]
+            if self.scheduler is not None
+            else self.optimizer.param_groups[0]["lr"]
+        )
+        self.log("train/lr", lr, on_step=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -64,6 +72,9 @@ class LanguageModelModule(LightningModule):
         return loss
 
     def configure_optimizers(self):
+        # No scheduler -> constant LR (e.g. for clean muP LR sweeps).
+        if self.scheduler is None:
+            return self.optimizer
         return {
             "optimizer": self.optimizer,
             "lr_scheduler": {

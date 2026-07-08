@@ -47,10 +47,24 @@ def parse_args():
     p.add_argument("--max-train-tokens", type=int, default=1_000_000_000)
     # Muon and AdamW each carry their own base LR (see muon_param_groups); both
     # anneal under a single LinearWarmupCosineAnnealingLR.
-    p.add_argument("--muon-lr", type=float, default=0.02)
-    p.add_argument("--adamw-lr", type=float, default=8e-4)
+    # muTransfer optimum from the emb48 muP sweep: these transfer across width
+    # unchanged (Muon spectral-normalized + AdamW on the width-independent
+    # embedding/head). Found via a wide 2D LR map, then confirmed at full length
+    # (5000 steps): adamw=8e-3 reaches val/loss 5.13 vs 5.33 at the old 1e-3.
+    # CAVEAT: adamw=8e-3 is a HOT LR — it needs the cosine schedule to anneal over
+    # the ACTUAL run horizon or it diverges late (constant-LR final 5.37; cosine
+    # matched to the run 5.13). Keep the scheduler on and its period = run length.
+    p.add_argument("--muon-lr", type=float, default=0.01)
+    p.add_argument("--adamw-lr", type=float, default=8e-3)
     p.add_argument("--adamw-weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-steps", type=int, default=100)
+    p.add_argument("--eta-min", type=float, default=1e-5)
+    # Run validation every N optimizer steps (so we get a val/loss curve during
+    # training, not just one point at the end). limit-val-batches caps how many
+    # val batches each validation pass uses, keeping periodic validation cheap on
+    # the large (1% of corpus) val split.
+    p.add_argument("--val-check-interval", type=int, default=500)
+    p.add_argument("--limit-val-batches", type=int, default=250)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--wandb-project", default="fineweb-edu-gpt")
     p.add_argument("--wandb-offline", action="store_true")
@@ -59,14 +73,40 @@ def parse_args():
     p.add_argument("--n-head", type=int, default=12)
     p.add_argument("--n-kv-head", type=int, default=3)
     p.add_argument("--n-layer", type=int, default=6)
+    # Compact override of the four model dims as "n_embd-n_head-n_kv_head-n_layer"
+    # (e.g. "48-2-1-3"). Lets a single wandb sweep vary width by sweeping ONE
+    # coupled parameter (the dims are not independent, so a grid over each would
+    # produce invalid combinations). When set, overrides --n-embd/--n-head/etc.
+    p.add_argument("--arch", default=None)
+    # muP (Maximal Update Parameterization): tune muon-lr/adamw-lr (+ the mults
+    # below) at a small proxy width, then transfer them to a large model by only
+    # changing --n-embd/--n-head (keep head_dim fixed). At n_embd == mup-base-width
+    # this reduces to the original GPT-2-style init.
+    p.add_argument("--mup-base-width", type=int, default=256)
+    p.add_argument("--mup-base-std", type=float, default=0.02)
+    p.add_argument("--mup-input-mult", type=float, default=1.0)
+    p.add_argument("--mup-output-mult", type=float, default=1.0)
+    # Disable the LR scheduler entirely -> constant LR (no warmup/cosine). Cleaner
+    # for muP LR sweeps, where a schedule would confound which LR value matters.
+    p.add_argument("--no-scheduler", dest="use_scheduler", action="store_false")
+    # Recompute block activations in backward instead of storing them: lets wide
+    # models fit on limited VRAM without shrinking tokens/step (~1 extra fwd cost).
+    p.add_argument("--grad-checkpoint", dest="gradient_checkpointing", action="store_true")
     p.add_argument("--no-tie-embedding", dest="tie_embedding", action="store_false")
     p.add_argument("--no-compile", dest="compile", action="store_false")
     p.add_argument("--no-cce", dest="use_cce", action="store_false")
+    # Skip the final trainer.test() pass (redundant with periodic validation when
+    # a sweep only needs to rank runs on val/loss; saves a full val-loader pass).
+    p.add_argument("--no-test", dest="run_test", action="store_false")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.arch:
+        args.n_embd, args.n_head, args.n_kv_head, args.n_layer = (
+            int(x) for x in args.arch.split("-")
+        )
     # datasets + tokenizer caches live on the big volume (as in the notebook)
     os.environ.setdefault("HF_HOME", "/mnt/ai/data/hf")
     # Reproducibility: seed all RNGs (incl. dataloader workers). Paired with
@@ -109,6 +149,11 @@ def main():
         n_kv_head=args.n_kv_head,
         n_layer=args.n_layer,
         tie_embedding=args.tie_embedding,
+        mup_base_width=args.mup_base_width,
+        mup_base_std=args.mup_base_std,
+        mup_input_mult=args.mup_input_mult,
+        mup_output_mult=args.mup_output_mult,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
     n_params = sum(p.numel() for p in model.parameters())
     print(f"GPT parameters: {n_params / 1e6:.2f}M")
@@ -124,12 +169,20 @@ def main():
             adamw_weight_decay=args.adamw_weight_decay,
         )
     )
-    scheduler = LinearWarmupCosineAnnealingLR(
-        optimizer,
-        warmup_steps=args.warmup_steps,
-        n_epochs=args.epochs,
-        train_loader_length=len(train_loader),
-    )
+    if args.use_scheduler:
+        scheduler = LinearWarmupCosineAnnealingLR(
+            optimizer,
+            warmup_steps=args.warmup_steps,
+            n_epochs=args.epochs,
+            train_loader_length=len(train_loader),
+            eta_min=args.eta_min,
+            # Anneal over the actual horizon: when --max-steps caps the run short
+            # of a full epoch, the cosine must cool down by max_steps, not by the
+            # (never-reached) epoch length — else the LR is still hot at the cutoff.
+            max_steps=args.max_steps,
+        )
+    else:
+        scheduler = None  # constant LR
 
     if args.compile:
         model = torch.compile(model, mode="reduce-overhead")
@@ -150,6 +203,8 @@ def main():
     trainer = Trainer(
         max_steps=args.max_steps,
         max_epochs=args.epochs,
+        val_check_interval=args.val_check_interval,
+        limit_val_batches=args.limit_val_batches,
         precision="bf16-true",
         gradient_clip_val=1.0,
         deterministic=True,
@@ -160,7 +215,8 @@ def main():
     # loaders are passed explicitly; validation reuses the val loader as in the
     # notebook (logged under train/*, val/*, and test/* respectively).
     trainer.fit(lm_module, train_dataloaders=train_loader, val_dataloaders=val_loader)
-    trainer.test(lm_module, dataloaders=val_loader)
+    if args.run_test:
+        trainer.test(lm_module, dataloaders=val_loader)
     print("best checkpoint:", checkpoint.best_model_path)
 
 

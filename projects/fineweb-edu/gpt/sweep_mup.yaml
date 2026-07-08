@@ -1,0 +1,38 @@
+# muP LR sweep on the SMALL proxy (emb48), then transfer the winners to the
+# larger widths (see transfer runs) — the canonical muTransfer recipe: tune LR
+# once at small width, reuse everywhere.
+#
+# Design choices from the diagnostic 1BT run:
+#   * emb48 plateaus ~5k steps (81% of the loss-gap-to-floor captured), so 5000
+#     steps is enough to rank LRs cleanly without paying for full 1BT.
+#   * NO LR scheduler (constant LR): a warmup/cosine schedule would confound which
+#     LR *value* the sweep is actually selecting. --no-scheduler is a boolean flag,
+#     so it lives in `command` (argparse can't take it as --no-scheduler=value).
+#   * Validation runs every --val-check-interval steps (default 500) so the sweep
+#     ranks on val/loss, not a single noisy end point.
+#
+#   wandb sweep projects/fineweb-edu/gpt/sweep_mup.yaml
+#   wandb agent <entity>/fineweb-edu-gpt/<sweep_id>
+program: projects/fineweb-edu/gpt/train.py
+project: fineweb-edu-gpt
+method: grid
+metric:
+  name: val/loss
+  goal: minimize
+parameters:
+  arch:
+    value: "48-2-1-3"
+  muon-lr:
+    values: [0.01, 0.02, 0.04]
+  adamw-lr:
+    values: [0.00025, 0.0005, 0.001]
+  max-steps:
+    value: 5000
+  max-train-tokens:
+    value: 1000000000
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --no-scheduler
+  - ${args}

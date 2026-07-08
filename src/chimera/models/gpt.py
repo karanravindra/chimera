@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 
 
 class ReLU2(nn.Module):
@@ -146,9 +147,36 @@ class GPT(nn.Module):
         n_kv_head: int = 2,
         n_layer: int = 6,
         tie_embedding: bool = False,
+        mup_base_width: int = 256,
+        mup_base_std: float = 0.02,
+        mup_input_mult: float = 1.0,
+        mup_output_mult: float = 1.0,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.block_size = block_size
+        self.n_layer = n_layer
+        # Recompute each block's activations in the backward pass instead of
+        # storing them — trades ~1 extra forward of compute for a large drop in
+        # activation memory. Needed to fit wide models (e.g. 124M @ seq 2048) on
+        # 16 GB without shrinking the (comparability-critical) tokens/step.
+        self.gradient_checkpointing = gradient_checkpointing
+
+        # Maximal Update Parameterization (muP). The width multiplier m_d relates
+        # this model's width to a base/proxy width; init variance and the output
+        # logit multiplier are scaled by m_d so per-step feature updates stay
+        # width-invariant, letting muon_lr/adamw_lr found at the base width
+        # transfer to larger widths (muTransfer). At n_embd == mup_base_width
+        # (m_d == 1) this reduces to the original GPT-2-style parameterization.
+        # NB: LRs need no width scaling here — all hidden matrices go to Muon
+        # (whose update is spectrally normalized) and all AdamW params
+        # (embedding/head/norms/biases) have Theta(1) muP LR.
+        self.mup_width_mult = n_embd / mup_base_width
+        self.mup_base_std = mup_base_std
+        self.mup_input_mult = mup_input_mult
+        # 1/m_d output scaling (multiplier form of the muP readout), applied at the
+        # logit projection instead of scaling the (tied) head's learning rate.
+        self.output_mult = mup_output_mult / self.mup_width_mult
 
         self.tok_emb = nn.Embedding(vocab_size, n_embd)
         self.rope = RotaryEmbedding(n_embd // n_head)
@@ -170,25 +198,44 @@ class GPT(nn.Module):
             self.head = nn.Linear(n_embd, vocab_size, bias=False)
             self.head.weight = self.tok_emb.weight
 
-        # GPT-2 style init: without it nn.Embedding defaults to N(0, 1), and since
-        # the head is tied to it the logits blow up (~10x std), starting the loss
-        # far above ln(vocab) instead of at it.
-        self.apply(self._init_weights)
-        # scale residual-writing projections by 1/sqrt(2 * n_layer) so the residual
-        # stream variance stays bounded with depth (GPT-2).
-        residual_std = 0.02 / math.sqrt(2 * n_layer)
+        self._init_weights()
+
+    def _init_weights(self):
+        # muP init: hidden-matrix variance is scaled by 1/m_d so activation
+        # magnitudes stay width-invariant; the embedding (input layer) keeps a
+        # width-independent std. Without embedding init nn.Embedding defaults to
+        # N(0, 1), and since the head is tied to it the logits blow up (~10x std),
+        # starting the loss far above ln(vocab) instead of at it.
+        hidden_std = self.mup_base_std / math.sqrt(self.mup_width_mult)
+
+        # Embedding (input layer): constant std, no width scaling. This tensor is
+        # shared with the tied output head, so it also sets the readout scale —
+        # the muP output behavior comes from self.output_mult (the 1/m_d factor).
+        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.mup_base_std)
+
         for block in self.blocks:
+            for lin in (
+                block.attn.q_proj,
+                block.attn.kv_proj,
+                block.attn.proj,
+                block.mlp.fc1,
+                block.mlp.fc2,
+            ):
+                nn.init.normal_(lin.weight, mean=0.0, std=hidden_std)
+                if lin.bias is not None:
+                    nn.init.zeros_(lin.bias)
+            # Scale residual-writing projections by 1/sqrt(2 * n_layer) so the
+            # residual stream variance stays bounded with depth (GPT-2), on top of
+            # the muP width scaling already baked into hidden_std.
+            residual_std = hidden_std / math.sqrt(2 * self.n_layer)
             nn.init.normal_(block.attn.proj.weight, mean=0.0, std=residual_std)
             nn.init.normal_(block.mlp.fc2.weight, mean=0.0, std=residual_std)
 
-    @staticmethod
-    def _init_weights(module):
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        # If a genuinely untied head ever exists, initialize it at readout scale.
+        # (Currently the head is always tied to tok_emb, so this is a no-op.)
+        head = getattr(self, "head", None)
+        if head is not None and head.weight is not self.tok_emb.weight:
+            nn.init.normal_(head.weight, mean=0.0, std=self.mup_base_std)
 
     def _forward(self, idx, past_kvs=None):
         B, T = idx.shape
@@ -198,12 +245,21 @@ class GPT(nn.Module):
         else:
             past_len = past_kvs[0][0].size(2)
 
-        x = self.tok_emb(idx)
+        x = self.tok_emb(idx) * self.mup_input_mult  # muP embedding multiplier
         cos, sin = self.rope(past_len, T, idx.device)
+
+        # Activation checkpointing only applies to the training/prefill path (no
+        # KV cache); incremental decode runs under no_grad, where it's a no-op.
+        use_ckpt = self.gradient_checkpointing and self.training and past_kvs[0] is None
 
         presents = []
         for block, past in zip(self.blocks, past_kvs):
-            x, present = block(x, cos, sin, past)
+            if use_ckpt:
+                x, present = checkpoint.checkpoint(
+                    block, x, cos, sin, past, use_reentrant=False
+                )
+            else:
+                x, present = block(x, cos, sin, past)
             presents.append(present)
 
         x = self.ln_f(x)
@@ -215,8 +271,8 @@ class GPT(nn.Module):
         return self.head.weight if hasattr(self, "head") else self.tok_emb.weight
 
     def project(self, hidden):
-        """Project hidden states to vocabulary logits."""
-        return hidden @ self.lm_head_weight.t()
+        """Project hidden states to vocabulary logits (with the muP output multiplier)."""
+        return (hidden @ self.lm_head_weight.t()) * self.output_mult
 
     def forward(self, idx, return_hidden: bool = False):
         assert idx.size(1) <= self.block_size, (
