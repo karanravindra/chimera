@@ -1,0 +1,29 @@
+program: projects/clevr/vqa/train.py
+project: clevr-vqa
+method: bayes
+metric:
+  name: val/acc
+  goal: maximize
+early_terminate:
+  type: hyperband
+  min_iter: 5
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.001
+  batch-size:
+    values: [32, 64, 128]
+  hidden-dim:
+    values: [128, 256, 384]
+  dropout:
+    values: [0.1, 0.2, 0.3]
+  weight-decay:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.001
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args}

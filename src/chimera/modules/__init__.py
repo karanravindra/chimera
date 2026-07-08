@@ -3,6 +3,7 @@ from .autoencoder import AutoencoderModule
 from .classifier import ClassifierModule
 from .language_model import LanguageModelModule
 from .rectified_flow import RectifiedFlowModule
+from .vqa import VQAModule
 
 __all__ = [
     "AdversarialAutoencoderModule",
@@ -10,4 +11,5 @@ __all__ = [
     "ClassifierModule",
     "LanguageModelModule",
     "RectifiedFlowModule",
+    "VQAModule",
 ]

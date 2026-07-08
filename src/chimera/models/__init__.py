@@ -2,6 +2,7 @@ from .gpt import GPT
 from .lstm import LSTM
 from .rnn import RNN
 from .cifar_autoencoder import CIFARAutoencoder
+from .clevr_vqa import CLEVRVQAModel
 from .digit_dreamer import DigitDreamer
 from .digit_dreamer_ae import DigitDreamerAE
 from .digit_net import DigitNet
@@ -15,6 +16,7 @@ __all__ = [
     "LSTM",
     "RNN",
     "CIFARAutoencoder",
+    "CLEVRVQAModel",
     "DigitDreamer",
     "DigitDreamerAE",
     "DigitNet",
