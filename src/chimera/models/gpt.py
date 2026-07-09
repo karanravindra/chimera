@@ -4,8 +4,47 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
 from chimera.models.rope import RotaryEmbedding, apply_rotary
+
+# flex_attention is ~75-80x slower than SDPA when run eagerly (it materializes
+# the full score matrix instead of a fused kernel) -- it MUST run compiled.
+# Compiling this one shared callable (instead of relying on the caller's own
+# torch.compile(model, ...)) means attention stays fast even when the outer
+# model is deliberately left uncompiled (e.g. --use-moe, whose data-dependent
+# routing makes whole-model compile unreliable) or under generate()'s default
+# eager decode path. dynamic=True avoids a recompile per new KV-cache length
+# during incremental decode.
+_flex_attention = torch.compile(flex_attention, dynamic=True)
+
+
+def _causal_mask_mod(b, h, q_idx, kv_idx):
+    return kv_idx <= q_idx
+
+
+def _make_offset_causal_mask_mod(past_len: int):
+    def mask_mod(b, h, q_idx, kv_idx):
+        return kv_idx <= q_idx + past_len
+
+    return mask_mod
+
+
+def build_block_mask(B: int, T: int, past_len: int, device) -> BlockMask:
+    """Causal block mask for flex_attention, covering both prefill (past_len=0,
+    Q_LEN==KV_LEN==T) and incremental decode (query positions offset by the
+    cached prefix length).
+
+    Building a fresh BlockMask every call has real cost even under compile
+    (~4x the compiled attention call itself, measured) -- callers should cache
+    the prefill mask across steps (T is constant for a whole training run) and
+    only rebuild for decode, where KV_LEN changes every step anyway.
+    """
+    if past_len == 0:
+        return create_block_mask(_causal_mask_mod, B, None, T, T, device=device)
+    return create_block_mask(
+        _make_offset_causal_mask_mod(past_len), B, None, T, past_len + T, device=device
+    )
 
 
 class ReLU2(nn.Module):
@@ -64,7 +103,7 @@ class GroupedQueryAttention(nn.Module):
     def cached_len(past_kv) -> int:
         return past_kv[0].size(2)
 
-    def forward(self, x, cos, sin, past_kv=None):
+    def forward(self, x, cos, sin, block_mask, past_kv=None):
         B, T, _ = x.shape
 
         q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
@@ -85,22 +124,10 @@ class GroupedQueryAttention(nn.Module):
             v = torch.cat([past_v, v], dim=2)
         present = (k, v)
 
-        if past_kv is None:
-            # Prefill / training: square causal mask.
-            out = F.scaled_dot_product_attention(
-                q, k, v, is_causal=True, enable_gqa=True,
-            )
-        else:
-            # Incremental decode: query positions [past_len, past_len+T) attend to all
-            # keys up to and including their own absolute position.
-            Tk = k.size(2)
-            past_len = Tk - T
-            q_pos = torch.arange(past_len, Tk, device=x.device)
-            k_pos = torch.arange(Tk, device=x.device)
-            attn_mask = k_pos[None, :] <= q_pos[:, None]
-            out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, enable_gqa=True,
-            )
+        # block_mask is built once per GPT._forward call (prefill: cached
+        # across steps since T is constant for a whole run; decode: fresh
+        # each step, since KV_LEN grows) and threaded down alongside cos/sin.
+        out = _flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
 
         out = out.transpose(1, 2).reshape(B, T, self.n_head * self.head_dim)
         return self.proj(out), present
@@ -178,7 +205,7 @@ class MultiHeadLatentAttention(nn.Module):
         # c_kv: (B, T, kv_lora_rank) -- T is dim 1 (no head axis, unlike GQA's k/v).
         return past_kv[0].size(1)
 
-    def forward(self, x, cos, sin, past_kv=None):
+    def forward(self, x, cos, sin, block_mask, past_kv=None):
         B, T, _ = x.shape
 
         if self.w_dq is not None:
@@ -217,14 +244,7 @@ class MultiHeadLatentAttention(nn.Module):
         v = self.w_uv(c_kv_normed).view(B, Tk, self.n_head, self.v_head_dim).transpose(1, 2)
         k = torch.cat([k_nope, k_rope.expand(-1, self.n_head, -1, -1)], dim=-1)
 
-        if past_kv is None:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        else:
-            past_len = Tk - T
-            q_pos = torch.arange(past_len, Tk, device=x.device)
-            k_pos = torch.arange(Tk, device=x.device)
-            attn_mask = k_pos[None, :] <= q_pos[:, None]
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = _flex_attention(q, k, v, block_mask=block_mask)
 
         out = out.transpose(1, 2).reshape(B, T, self.n_head * self.v_head_dim)
         return self.proj(out), present
@@ -494,15 +514,15 @@ class TransformerBlock(nn.Module):
             self.scale1 = nn.Parameter(torch.ones(1, 1, dim))
             self.scale2 = nn.Parameter(torch.ones(1, 1, dim))
 
-    def forward(self, x, cos, sin, past_kv=None):
-        attn_out, present = self.attn(self.ln1(x), cos, sin, past_kv)
+    def forward(self, x, cos, sin, block_mask, past_kv=None):
+        attn_out, present = self.attn(self.ln1(x), cos, sin, block_mask, past_kv)
         x = x + attn_out * self.scale1
 
         mlp_out = self.mlp(self.ln2(x))
         x = x + mlp_out * self.scale2
         return x, present
 
-    def forward_attn_res(self, blocks, partial, cos, sin, past_kv=None):
+    def forward_attn_res(self, blocks, partial, cos, sin, block_mask, past_kv=None):
         """Attention-Residuals forward: threads (blocks, partial) instead of x.
 
         ``blocks`` accumulates immutably (a new tuple each call) so this
@@ -512,7 +532,7 @@ class TransformerBlock(nn.Module):
         if self.layer_number % self.layers_per_block == 0:
             blocks = blocks + (partial,)
             partial = None
-        attn_out, present = self.attn(self.ln1(h), cos, sin, past_kv)
+        attn_out, present = self.attn(self.ln1(h), cos, sin, block_mask, past_kv)
         partial = attn_out if partial is None else partial + attn_out
 
         h2 = block_attn_res(blocks, partial, self.mlp_res_proj, self.mlp_res_norm)
@@ -679,6 +699,33 @@ class GPT(nn.Module):
         if head is not None and head.weight is not self.tok_emb.weight:
             nn.init.normal_(head.weight, mean=0.0, std=self.mup_base_std)
 
+    @torch._dynamo.disable
+    def _get_block_mask(self, B: int, T: int, past_len: int, device) -> BlockMask:
+        """Acquire (building or reusing) the flex_attention block mask.
+
+        Forced to run eager (never traced/cudagraph-captured): under
+        torch.compile(model, mode="reduce-overhead") the whole forward,
+        including this call, would otherwise get captured by cudagraph
+        trees -- but the mask cache holds a plain Python-attribute tensor
+        reference across calls, and cudagraph replay overwrites that
+        buffer on the next step, corrupting the "cached" mask silently.
+        A graph break here makes create_block_mask's output a genuine
+        input to the compiled region instead of captured internal state.
+        """
+        if past_len == 0:
+            # Prefill/training: T is constant for a whole run (== block_size),
+            # so cache the causal mask across calls instead of rebuilding it
+            # every step -- building one costs ~4x the compiled attention
+            # call itself.
+            cache_key = (B, T, str(device))
+            if getattr(self, "_block_mask_cache_key", None) != cache_key:
+                self._block_mask_cache = build_block_mask(B, T, 0, device)
+                self._block_mask_cache_key = cache_key
+            return self._block_mask_cache
+        # Decode: KV_LEN grows every step, so a fresh mask is unavoidable
+        # here -- still cheap, since Q_LEN is 1.
+        return build_block_mask(B, T, past_len, device)
+
     def _forward(self, idx, past_kvs=None):
         B, T = idx.shape
         if past_kvs is None:
@@ -689,6 +736,7 @@ class GPT(nn.Module):
 
         x = self.tok_emb(idx) * self.mup_input_mult  # muP embedding multiplier
         cos, sin = self.rope(past_len, T, idx.device)
+        block_mask = self._get_block_mask(B, T, past_len, idx.device)
 
         # Activation checkpointing only applies to the training/prefill path (no
         # KV cache); incremental decode runs under no_grad, where it's a no-op.
@@ -701,12 +749,12 @@ class GPT(nn.Module):
             for block, past in zip(self.blocks, past_kvs):
                 if use_ckpt:
                     blocks, partial, present = checkpoint.checkpoint(
-                        block.forward_attn_res, blocks, partial, cos, sin, past,
+                        block.forward_attn_res, blocks, partial, cos, sin, block_mask, past,
                         use_reentrant=False,
                     )
                 else:
                     blocks, partial, present = block.forward_attn_res(
-                        blocks, partial, cos, sin, past
+                        blocks, partial, cos, sin, block_mask, past
                     )
                 presents.append(present)
             x = partial
@@ -714,10 +762,10 @@ class GPT(nn.Module):
             for block, past in zip(self.blocks, past_kvs):
                 if use_ckpt:
                     x, present = checkpoint.checkpoint(
-                        block, x, cos, sin, past, use_reentrant=False
+                        block, x, cos, sin, block_mask, past, use_reentrant=False
                     )
                 else:
-                    x, present = block(x, cos, sin, past)
+                    x, present = block(x, cos, sin, block_mask, past)
                 presents.append(present)
 
         x = self.ln_f(x)

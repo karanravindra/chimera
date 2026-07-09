@@ -2,18 +2,30 @@
 Muon optimizer (MomentUm Orthogonalized by Newton-schulz), with an auxiliary
 AdamW for the parameters Muon should not touch.
 
-Muon (Keller Jordan et al., https://kellerjordan.github.io/posts/muon/) updates
-2D hidden weight matrices by orthogonalizing the momentum buffer via a few
-Newton-Schulz iterations before applying it. It is not meant for <2D parameters
-(biases, norm gains) or for the token embedding and output head, which are
-conventionally optimized with AdamW instead.
+:class:`Muon` is a single-object optimizer that internally delegates to
+``torch.optim.Muon`` (ordinary 2D hidden weight matrices) + ``torch.optim.AdamW``
+(everything else — token embedding, output head, norm gains, router/gate
+weights), plus a small hand-rolled batched Newton-Schulz path for any
+Muon-eligible parameter with ``ndim >= 3`` (e.g. DeepSeek MoE's packed
+per-expert weights, shape ``(n_experts, out, in)``) — ``torch.optim.Muon``
+hard-rejects anything but ``ndim == 2``.
 
-:class:`Muon` is the single-device combined optimizer: it takes standard
-``param_groups`` where each group carries a ``use_muon`` flag and dispatches to
-the Muon or AdamW update accordingly. This keeps everything under one optimizer
-(and therefore one LR scheduler), matching how the rest of ``chimera`` wires
-training. Use :func:`muon_param_groups` to build the groups from a model with the
-usual "matrices → Muon, everything else → AdamW" split.
+Benchmarked (see chimera memory / session notes) on this repo's tiny (48-dim)
+GPT proxy width:
+  - ``torch.optim.Muon`` + ``torch.optim.AdamW`` is ~1.44x faster per full
+    training step than a naive per-parameter Python-loop Muon (this class's
+    previous implementation) on ordinary 2D matrices.
+  - For MoE's batched (ndim>=3) expert weights, splitting each expert into a
+    separate 2D leaf so ``torch.optim.Muon`` can take it is ~5.2x SLOWER than
+    keeping the batched tensor and doing Newton-Schulz on it directly:
+    Muon's cost scales with the *number* of distinct parameter tensors, not
+    their total size, and splitting an 8-expert weight multiplies the tensor
+    count 8x.
+
+Everything is wrapped under one ``.step()``/``.zero_grad()``/``.param_groups``
+so :class:`chimera.modules.LanguageModelModule` and every project's
+``train.py`` are unaffected — they still just do
+``Muon(muon_param_groups(model, ...))``.
 
 Usage:
     from chimera.optim import Muon, muon_param_groups
@@ -34,6 +46,10 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     Returns a matrix with roughly the same singular vectors as ``G`` but with all
     singular values pushed toward 1. Runs in bfloat16; the quintic coefficients
     are tuned so the iteration converges from any starting spectral norm <= 1.
+
+    ``G`` may be batched (``ndim >= 3``, e.g. DeepSeek MoE's packed per-expert
+    weights (n_experts, out, in)) — matmuls and ``.mT`` broadcast over leading
+    dims, orthogonalizing each batch slice's last two dims independently.
     """
     assert G.ndim >= 2
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -53,34 +69,17 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     return X
 
 
-def muon_update(
-    grad: Tensor, momentum: Tensor, beta: float, ns_steps: int, nesterov: bool
-) -> Tensor:
-    momentum.lerp_(grad, 1 - beta)
-    update = grad.lerp_(momentum, beta) if nesterov else momentum
-    if update.ndim == 4:  # flatten conv filters to a matrix
-        update = update.view(len(update), -1)
-    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
-    # scale so the RMS of the update matches AdamW's (~1), independent of shape
-    update *= max(1, grad.size(-2) / grad.size(-1)) ** 0.5
-    return update
-
-
-def adam_update(grad, exp_avg, exp_avg_sq, step, betas, eps):
-    exp_avg.lerp_(grad, 1 - betas[0])
-    exp_avg_sq.lerp_(grad.square(), 1 - betas[1])
-    bias_corr1 = 1 - betas[0] ** step
-    bias_corr2 = 1 - betas[1] ** step
-    return (exp_avg / bias_corr1) / ((exp_avg_sq / bias_corr2).sqrt() + eps)
-
-
 class Muon(torch.optim.Optimizer):
-    """Single-device Muon with an auxiliary AdamW.
+    """Single-object optimizer: torch.optim.Muon (2D) + batched Newton-Schulz
+    (ndim>=3) + torch.optim.AdamW (everything else), keyed off ``use_muon``.
 
-    Expects ``param_groups`` (dicts) each carrying ``use_muon: bool``. Muon groups
-    accept ``lr``, ``momentum``, ``weight_decay``, ``ns_steps``, ``nesterov``;
-    AdamW groups accept ``lr``, ``betas``, ``eps``, ``weight_decay``. Missing keys
-    are filled with sensible defaults.
+    Expects ``param_groups`` (dicts) each carrying ``use_muon: bool`` — exactly
+    :func:`muon_param_groups`'s output. Muon groups accept ``lr``, ``momentum``,
+    ``weight_decay``, ``ns_steps``, ``nesterov``; AdamW groups accept ``lr``,
+    ``betas``, ``eps``, ``weight_decay``. Missing keys are filled with sensible
+    defaults. A ``use_muon=True`` group's params are split internally by
+    ``ndim`` — ``==2`` goes to ``torch.optim.Muon``, ``>=3`` goes to the
+    batched Newton-Schulz path — transparent to the caller.
     """
 
     def __init__(self, param_groups: Iterable[dict]):
@@ -101,6 +100,44 @@ class Muon(torch.optim.Optimizer):
                 group.setdefault("weight_decay", 0.0)
         super().__init__(param_groups, dict())
 
+        # Build one delegate per input group, split further by ndim for
+        # use_muon groups. (group_index, kind, delegate) where kind is
+        # "muon2d" (a torch.optim.Muon instance), "muon_batched" (a plain
+        # dict of params + momentum buffers, stepped manually below), or
+        # "adamw" (a torch.optim.AdamW instance).
+        self._delegates = []
+        for i, group in enumerate(self.param_groups):
+            if group["use_muon"]:
+                twoD = [p for p in group["params"] if p.ndim == 2]
+                batched = [p for p in group["params"] if p.ndim != 2]
+                if twoD:
+                    opt = torch.optim.Muon(
+                        twoD,
+                        lr=group["lr"],
+                        weight_decay=group["weight_decay"],
+                        momentum=group["momentum"],
+                        nesterov=group["nesterov"],
+                        ns_steps=group["ns_steps"],
+                    )
+                    self._delegates.append((i, "muon2d", opt))
+                if batched:
+                    # momentum_bufs stay None until first step(): eagerly
+                    # allocating here (at construction time) would fix their
+                    # dtype before Lightning's precision plugin later casts
+                    # the model's params (e.g. bf16-true), causing a dtype
+                    # mismatch against p.grad on the first real step.
+                    state = {"params": batched, "momentum_bufs": [None] * len(batched)}
+                    self._delegates.append((i, "muon_batched", state))
+            else:
+                opt = torch.optim.AdamW(
+                    group["params"],
+                    lr=group["lr"],
+                    betas=group["betas"],
+                    eps=group["eps"],
+                    weight_decay=group["weight_decay"],
+                )
+                self._delegates.append((i, "adamw", opt))
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -108,48 +145,46 @@ class Muon(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        for group in self.param_groups:
-            lr = group["lr"]
-            wd = group["weight_decay"]
-            if group["use_muon"]:
-                for p in group["params"]:
+        for i, kind, delegate in self._delegates:
+            group = self.param_groups[i]
+            if kind == "muon2d":
+                # Sync hyperparams every step: an LR scheduler mutates
+                # self.param_groups[i]["lr"], which must propagate into the
+                # delegate optimizer's own param group before it steps.
+                sub = delegate.param_groups[0]
+                sub["lr"] = group["lr"]
+                sub["weight_decay"] = group["weight_decay"]
+                sub["momentum"] = group["momentum"]
+                sub["nesterov"] = group["nesterov"]
+                sub["ns_steps"] = group["ns_steps"]
+                delegate.step()
+            elif kind == "adamw":
+                sub = delegate.param_groups[0]
+                sub["lr"] = group["lr"]
+                sub["weight_decay"] = group["weight_decay"]
+                sub["betas"] = group["betas"]
+                sub["eps"] = group["eps"]
+                delegate.step()
+            else:  # muon_batched
+                lr = group["lr"]
+                wd = group["weight_decay"]
+                momentum = group["momentum"]
+                nesterov = group["nesterov"]
+                ns_steps = group["ns_steps"]
+                bufs = delegate["momentum_bufs"]
+                for j, (p, buf) in enumerate(zip(delegate["params"], bufs)):
                     if p.grad is None:
                         continue
-                    state = self.state[p]
-                    if not state:
-                        state["momentum_buffer"] = torch.zeros_like(p)
-                    update = muon_update(
-                        p.grad,
-                        state["momentum_buffer"],
-                        beta=group["momentum"],
-                        ns_steps=group["ns_steps"],
-                        nesterov=group["nesterov"],
-                    )
+                    if buf is None:
+                        buf = torch.zeros_like(p)
+                        bufs[j] = buf
+                    buf.lerp_(p.grad, 1 - momentum)
+                    update = p.grad.lerp(buf, momentum) if nesterov else buf
+                    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+                    update = update * (max(1, update.size(-2) / update.size(-1)) ** 0.5)
                     if wd != 0:
                         p.mul_(1 - lr * wd)
                     p.add_(update.reshape(p.shape), alpha=-lr)
-            else:
-                betas, eps = group["betas"], group["eps"]
-                for p in group["params"]:
-                    if p.grad is None:
-                        continue
-                    state = self.state[p]
-                    if not state:
-                        state["exp_avg"] = torch.zeros_like(p)
-                        state["exp_avg_sq"] = torch.zeros_like(p)
-                        state["step"] = 0
-                    state["step"] += 1
-                    update = adam_update(
-                        p.grad,
-                        state["exp_avg"],
-                        state["exp_avg_sq"],
-                        state["step"],
-                        betas,
-                        eps,
-                    )
-                    if wd != 0:
-                        p.mul_(1 - lr * wd)
-                    p.add_(update, alpha=-lr)
         return loss
 
 
@@ -171,6 +206,9 @@ def muon_param_groups(
     token embedding and output head (matched by name via ``adamw_name_keywords``)
     plus all 1D parameters (biases, norm gains) — goes to AdamW. Empty groups are
     dropped so the optimizer never sees an empty param list.
+
+    Note: the Muon group can contain a mix of ndim==2 and ndim>=3 (batched,
+    e.g. MoE expert weights) parameters — :class:`Muon` splits them internally.
     """
     muon_params, adamw_params = [], []
     seen = set()
