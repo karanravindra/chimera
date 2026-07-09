@@ -2,9 +2,16 @@
 
 FineWeb-Edu ``sample-10BT`` tokenized with the pretrained LiquidAI/LFM2.5-230M
 subword tokenizer; documents are concatenated with an ``<|endoftext|>`` separator
-so the model learns document boundaries. Optimized with Muon (2D hidden weight
-matrices) + AdamW (embedding/head/norms) under one LR schedule, with
-``torch.compile`` and Cut Cross Entropy (fused lm_head + cross-entropy).
+so the model learns document boundaries. Optimized with Muon (2D/batched hidden
+weight matrices) + AdamW (embedding/head/norms/router) under one LR schedule,
+with ``torch.compile`` and Cut Cross Entropy (fused lm_head + cross-entropy).
+
+The model can additionally enable DeepSeek-V3 style Multi-head Latent
+Attention (``--use-mla``, low-rank KV/Q compression, smaller KV cache) and
+DeepSeek MoE (``--use-moe``, fine-grained routed experts + shared expert(s),
+aux-loss-free load balancing) in place of the dense GQA/MLP:
+
+    uv run python projects/fineweb-edu/gpt/train.py --use-mla --use-moe
 
     uv run python projects/fineweb-edu/gpt/train.py
 
@@ -48,13 +55,15 @@ def parse_args():
     p.add_argument("--max-train-tokens", type=int, default=1_000_000_000)
     # Muon and AdamW each carry their own base LR (see muon_param_groups); both
     # anneal under a single LinearWarmupCosineAnnealingLR.
-    # muTransfer optimum from the emb48 muP sweep: these transfer across width
+    # muTransfer LRs from the emb48 muP sweep: these transfer across width
     # unchanged (Muon spectral-normalized + AdamW on the width-independent
-    # embedding/head). Found via a wide 2D LR map, then confirmed at full length
-    # (5000 steps): adamw=8e-3 reaches val/loss 5.13 vs 5.33 at the old 1e-3.
-    # CAVEAT: adamw=8e-3 is a HOT LR — it needs the cosine schedule to anneal over
-    # the ACTUAL run horizon or it diverges late (constant-LR final 5.37; cosine
-    # matched to the run 5.13). Keep the scheduler on and its period = run length.
+    # embedding/head). adamw=8e-3 reaches a marginally lower val/loss (5.13 vs
+    # 5.16 here) but is a HOT LR: gpt-no-bias-48emb-long (adamw=8e-3) shows a
+    # real mid-run instability — train/loss climbs from ~5.11 (step ~2k) back
+    # up to ~5.38 (step ~5.5k) while LR is still >=0.007, before the cosine
+    # schedule anneals it back down by the end of the run. gpt-no-bias-48emb-
+    # a0.004 (this default) has no such hump — monotonically decreasing the
+    # whole run. Keep the scheduler on and its period = run length regardless.
     p.add_argument("--muon-lr", type=float, default=0.01)
     p.add_argument("--adamw-lr", type=float, default=4e-3)
     p.add_argument("--adamw-weight-decay", type=float, default=0.01)
@@ -92,6 +101,48 @@ def parse_args():
     p.add_argument("--mup-base-std", type=float, default=0.02)
     p.add_argument("--mup-input-mult", type=float, default=1.0)
     p.add_argument("--mup-output-mult", type=float, default=1.0)
+    # Attention Residuals (MoonshotAI): replace the plain additive residual with
+    # learned softmax attention over depth. --attn-res-n-blocks == --n-layer is
+    # "Full AttnRes" (attends over every layer's output); smaller values are
+    # "Block AttnRes" (attends over block-level summaries, O(N*d) memory).
+    p.add_argument("--use-attn-res", action="store_true",
+        help="Enable (Block) Attention Residuals in place of plain additive "
+             "residual connections (MoonshotAI AttnRes). Default off.")
+    p.add_argument("--attn-res-n-blocks", type=int, default=8,
+        help="Number of blocks to partition the network into for Block AttnRes "
+             "(must evenly divide --n-layer). Set equal to --n-layer for Full "
+             "AttnRes (attention over every individual layer's output).")
+    # DeepSeek-V3 Multi-head Latent Attention: compresses K/V (and optionally Q)
+    # into a low-rank latent, shrinking the KV cache. --n-kv-head is ignored
+    # when this is on.
+    p.add_argument("--use-mla", action="store_true",
+        help="Replace grouped-query attention with Multi-head Latent Attention "
+             "(DeepSeek-V3). Default off.")
+    p.add_argument("--kv-lora-rank", type=int, default=128)
+    p.add_argument("--q-lora-rank", type=int, default=0,
+        help="0 disables Q compression (direct q_proj); only pays off at much "
+             "larger width than this repo trains at.")
+    p.add_argument("--qk-nope-head-dim", type=int, default=64)
+    p.add_argument("--qk-rope-head-dim", type=int, default=32)
+    p.add_argument("--v-head-dim", type=int, default=64)
+    # DeepSeek-V3 MoE: fine-grained routed experts (top-k) + always-on shared
+    # expert(s), aux-loss-free load balancing (bias buffer, no gradient-based
+    # balance loss). Expert FFN compute uses torch.nn.functional.grouped_mm on
+    # CUDA+bf16 (falls back to an eager per-expert loop otherwise).
+    p.add_argument("--use-moe", action="store_true",
+        help="Replace the dense MLP with DeepSeek MoE (aux-loss-free). Default off.")
+    p.add_argument("--n-routed-experts", type=int, default=8)
+    p.add_argument("--n-shared-experts", type=int, default=1)
+    p.add_argument("--n-activated-experts", type=int, default=2)
+    p.add_argument("--moe-inter-dim", type=int, default=None,
+        help="Per-expert FFN hidden dim; defaults to n_embd // 2 (fine-grained: "
+             "much narrower than the dense 4x FFN) when unset.")
+    p.add_argument("--route-scale", type=float, default=1.0)
+    p.add_argument("--bias-update-speed", type=float, default=0.001,
+        help="Step size for the aux-loss-free per-expert routing bias. Note: "
+             "double-applies under --grad-checkpoint (the gate runs twice per "
+             "step under activation-checkpoint recompute) -- halve this or avoid "
+             "combining the two flags until a call-count guard is added.")
     # Disable the LR scheduler entirely -> constant LR (no warmup/cosine). Cleaner
     # for muP LR sweeps, where a schedule would confound which LR value matters.
     p.add_argument("--no-scheduler", dest="use_scheduler", action="store_false")
@@ -112,12 +163,32 @@ def parse_args():
     return p.parse_args()
 
 
+def default_run_name(args) -> str:
+    """Derive a descriptive wandb run name from the swept hyperparameters.
+
+    Used when --run-name isn't passed explicitly (e.g. every run in a wandb
+    sweep grid) so runs stay identifiable in the dashboard instead of falling
+    back to wandb's random auto-generated names (e.g. "eager-sweep-1").
+    """
+    parts = [f"gpt-{args.n_embd}-{args.n_head}-{args.n_kv_head}-{args.n_layer}"]
+    if args.use_attn_res:
+        parts.append(f"attnres{args.attn_res_n_blocks}")
+    if args.use_mla:
+        parts.append(f"mla-kv{args.kv_lora_rank}")
+    if args.use_moe:
+        parts.append(f"moe{args.n_activated_experts}of{args.n_routed_experts}")
+    parts.append(f"muon{args.muon_lr}-adamw{args.adamw_lr}")
+    parts.append(f"steps{args.max_steps}")
+    return "-".join(parts)
+
+
 def main():
     args = parse_args()
     if args.arch:
         args.n_embd, args.n_head, args.n_kv_head, args.n_layer = (
             int(x) for x in args.arch.split("-")
         )
+    args.run_name = args.run_name or default_run_name(args)
     # datasets + tokenizer caches live on the big volume (as in the notebook)
     os.environ.setdefault("HF_HOME", "/mnt/ai/data/hf")
     # Reproducibility: seed all RNGs (incl. dataloader workers). Paired with
@@ -135,6 +206,14 @@ def main():
         f"-> batch_size={batch_size}"
     )
 
+    if args.use_moe and args.compile:
+        print(
+            "[warn] --compile with --use-moe: data-dependent expert routing/offs "
+            "makes this a dynamic-shape computation -- expect graph breaks or "
+            "recompiles; consider --no-compile if you see compile errors or no "
+            "speedup."
+        )
+
     dm = FineWebEduDataModule(
         data_dir=args.data_dir,
         name="sample-10BT",
@@ -143,7 +222,7 @@ def main():
         tokenizer_backend="pretrained",  # LiquidAI/LFM2.5-230M
         add_eos=True,  # append <|endoftext|> after each document
         max_train_tokens=args.max_train_tokens,
-        num_workers=4,
+        num_workers=7,
     )
     dm.prepare_data()
     dm.setup("fit")
@@ -165,19 +244,37 @@ def main():
         mup_input_mult=args.mup_input_mult,
         mup_output_mult=args.mup_output_mult,
         gradient_checkpointing=args.gradient_checkpointing,
+        use_attn_res=args.use_attn_res,
+        attn_res_n_blocks=args.attn_res_n_blocks,
+        use_mla=args.use_mla,
+        kv_lora_rank=args.kv_lora_rank,
+        q_lora_rank=args.q_lora_rank,
+        qk_nope_head_dim=args.qk_nope_head_dim,
+        qk_rope_head_dim=args.qk_rope_head_dim,
+        v_head_dim=args.v_head_dim,
+        use_moe=args.use_moe,
+        n_routed_experts=args.n_routed_experts,
+        n_shared_experts=args.n_shared_experts,
+        n_activated_experts=args.n_activated_experts,
+        moe_inter_dim=args.moe_inter_dim,
+        route_scale=args.route_scale,
+        bias_update_speed=args.bias_update_speed,
     )
     n_params = sum(p.numel() for p in model.parameters())
     print(f"GPT parameters: {n_params / 1e6:.2f}M")
 
-    # Muon routes the 2D hidden weight matrices (attention + MLP) to Muon and the
-    # token embedding, output head, and norm gains to AdamW; both groups
-    # share one LR schedule (each anneals from its own base LR).
+    # Muon routes 2D/batched hidden weight matrices (attention + MLP/experts) to
+    # Muon and the token embedding, output head, norm gains, and MoE router/gate
+    # weights to AdamW; both groups share one LR schedule (each anneals from its
+    # own base LR). "gate" is always included -- harmless (matches nothing) when
+    # --use-moe is off.
     optimizer = Muon(
         muon_param_groups(
             model,
             muon_lr=args.muon_lr,
             adamw_lr=args.adamw_lr,
             adamw_weight_decay=args.adamw_weight_decay,
+            adamw_name_keywords=("emb", "head", "gate"),
         )
     )
     if args.use_scheduler:

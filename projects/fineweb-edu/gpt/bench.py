@@ -59,6 +59,19 @@ def parse_args():
     p.add_argument("--n-head", type=int, default=12)
     p.add_argument("--n-kv-head", type=int, default=3)
     p.add_argument("--n-layer", type=int, default=6)
+    p.add_argument("--use-mla", action="store_true")
+    p.add_argument("--kv-lora-rank", type=int, default=128)
+    p.add_argument("--q-lora-rank", type=int, default=0)
+    p.add_argument("--qk-nope-head-dim", type=int, default=64)
+    p.add_argument("--qk-rope-head-dim", type=int, default=32)
+    p.add_argument("--v-head-dim", type=int, default=64)
+    p.add_argument("--use-moe", action="store_true")
+    p.add_argument("--n-routed-experts", type=int, default=8)
+    p.add_argument("--n-shared-experts", type=int, default=1)
+    p.add_argument("--n-activated-experts", type=int, default=2)
+    p.add_argument("--moe-inter-dim", type=int, default=None)
+    p.add_argument("--route-scale", type=float, default=1.0)
+    p.add_argument("--bias-update-speed", type=float, default=0.001)
     p.add_argument("--batch-tokens", type=int, default=32768)
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -74,6 +87,19 @@ def load_model(args, vocab_size: int) -> GPT:
         n_kv_head=args.n_kv_head,
         n_layer=args.n_layer,
         tie_embedding=True,
+        use_mla=args.use_mla,
+        kv_lora_rank=args.kv_lora_rank,
+        q_lora_rank=args.q_lora_rank,
+        qk_nope_head_dim=args.qk_nope_head_dim,
+        qk_rope_head_dim=args.qk_rope_head_dim,
+        v_head_dim=args.v_head_dim,
+        use_moe=args.use_moe,
+        n_routed_experts=args.n_routed_experts,
+        n_shared_experts=args.n_shared_experts,
+        n_activated_experts=args.n_activated_experts,
+        moe_inter_dim=args.moe_inter_dim,
+        route_scale=args.route_scale,
+        bias_update_speed=args.bias_update_speed,
     )
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     # Lightning + torch.compile prefixes every key with "model._orig_mod.".
