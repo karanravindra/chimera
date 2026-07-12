@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset, random_split
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 
@@ -38,6 +38,7 @@ class AFHQDataModule(pl.LightningDataModule):
         pin_memory: bool = True,
         seed: int = 42,
         normalize: bool = True,
+        augment: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -50,17 +51,37 @@ class AFHQDataModule(pl.LightningDataModule):
         self.pin_memory = pin_memory
         self.seed = seed
         self.normalize = normalize
+        self.augment = augment
 
         # normalize=True maps pixels to [-1, 1] (the usual GAN/diffusion range);
         # normalize=False keeps them in [0, 1] to match a sigmoid-output decoder
         # and PSNR/SSIM with data_range=1.0 (the autoencoder-project convention).
-        tfms = [
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-        ]
-        if normalize:
-            tfms.append(transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]))
-        self.transform = transforms.Compose(tfms)
+        norm = (
+            [transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])]
+            if normalize
+            else []
+        )
+        # ``self.transform`` is the deterministic eval view (val/test/predict).
+        self.transform = transforms.Compose(
+            [transforms.Resize((image_size, image_size)), transforms.ToTensor(), *norm]
+        )
+        # ``train_transform`` adds train-only augmentation, applied ONLY to the
+        # train split (see setup) and never to val/test, so reconstruction
+        # metrics stay comparable. Two ops:
+        #   - RandomResizedCrop: mild scale/aspect jitter (a random crop rescaled
+        #     back to image_size), kept gentle (scale >=0.8, near-square ratio)
+        #     so faces aren't cropped out or distorted. Replaces the plain Resize.
+        #   - RandomHorizontalFlip: near-free same-difficulty extra data.
+        if augment:
+            geom = [
+                transforms.RandomResizedCrop(
+                    (image_size, image_size), scale=(0.8, 1.0), ratio=(0.9, 1.1)
+                ),
+                transforms.RandomHorizontalFlip(p=0.5),
+            ]
+        else:
+            geom = [transforms.Resize((image_size, image_size))]
+        self.train_transform = transforms.Compose([*geom, transforms.ToTensor(), *norm])
         self.classes: list[str] = []
 
         self.afhq_train: Optional[Dataset] = None
@@ -90,15 +111,23 @@ class AFHQDataModule(pl.LightningDataModule):
 
     def setup(self, stage: Optional[str] = None):
         if stage == "fit" or stage is None:
-            full_train = ImageFolder(self._dir / "train", transform=self.transform)
-            self.classes = full_train.classes
-            n_val = int(len(full_train) * self.val_split)
-            n_train = len(full_train) - n_val
-            self.afhq_train, self.afhq_val = random_split(
-                full_train,
+            # Two views of the same folder: the train split gets augmentation,
+            # the val split stays deterministic. random_split gives Subsets that
+            # share their parent's transform, so we split the *indices* (seeded)
+            # and wrap each half in a Subset of the appropriately-transformed
+            # ImageFolder -- otherwise augmentation would leak into validation.
+            train_full = ImageFolder(self._dir / "train", transform=self.train_transform)
+            eval_full = ImageFolder(self._dir / "train", transform=self.transform)
+            self.classes = train_full.classes
+            n_val = int(len(train_full) * self.val_split)
+            n_train = len(train_full) - n_val
+            train_idx, val_idx = random_split(
+                range(len(train_full)),
                 [n_train, n_val],
                 generator=torch.Generator().manual_seed(self.seed),
             )
+            self.afhq_train = Subset(train_full, list(train_idx))
+            self.afhq_val = Subset(eval_full, list(val_idx))
 
         if stage == "test" or stage is None:
             self.afhq_test = ImageFolder(self._dir / "val", transform=self.transform)

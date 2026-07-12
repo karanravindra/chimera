@@ -2,7 +2,8 @@
 
     uv run python projects/afhq/autoencoder/train.py
 
-This is a **three-phase curriculum** (one in-memory model, weights carry over):
+This supports a **three-phase curriculum** (one in-memory model, weights carry
+over). Each phase runs only if its ``--phase{N}-epochs`` is > 0:
 
 1. Phase 1 -- L1 + LPIPS @ 64x64, train the *full* model (``--phase1-epochs``).
 2. Phase 2 -- L1 + LPIPS @ 256x256, train *only* the latent bottleneck
@@ -11,13 +12,17 @@ This is a **three-phase curriculum** (one in-memory model, weights carry over):
 3. Phase 3 -- L1 + LPIPS + PatchGAN @ 64x64, train *only* the output head
    (``out_from_channels``) to sharpen texture (``--phase3-epochs``).
 
+By default only **phase 1** runs (phases 2 & 3 default to 0 epochs); pass
+``--phase2-epochs`` / ``--phase3-epochs`` > 0 to restore the full curriculum.
+
 Validation is always at 256x256 (the model is fully convolutional) and reports
 L1, LPIPS, PSNR, SSIM, and reconstruction-FID (rFID).
 
 Checkpoints + logs go to ``--run-dir`` (default ``/mnt/ai/runs/afhq/autoencoder``).
-Each phase writes a stable, overwritten checkpoint
-(``checkpoints/ae_phase{1,2,3}.ckpt``); ``ae_phase3.ckpt`` is the final AE a
-downstream project loads. ``main.ipynb`` loads that checkpoint for analysis only.
+Each phase that runs writes a stable, overwritten checkpoint
+(``checkpoints/ae_phase{1,2,3}.ckpt``). The last phase that runs is the final AE;
+with the phase-1-only default that is ``ae_phase1.ckpt``. ``main.ipynb`` loads a
+checkpoint for analysis only.
 """
 
 import argparse
@@ -33,10 +38,13 @@ from chimera.modules import AdversarialAutoencoderModule, AutoencoderModule
 from chimera.optim import LinearWarmupCosineAnnealingLR
 from chimera.utils import build_run_loggers
 
-# PetPaletteAE config is fixed (the notebook hardcoded it, not a swept knob).
+# PetPaletteAE config defaults (the original fixed f8 tokenizer). These are now
+# CLI-overridable so we can explore higher-compression / higher-capacity
+# tokenizers (e.g. an f16 ~30M model for a diffusion latent) without editing code.
 AE_LATENT_DIM = 4
 AE_BASE_CHANNELS = 32
 AE_FSQ_LEVELS = [8, 5, 5, 5]
+AE_N_DOWNSAMPLE = 3  # f = 2**n_downsample; 3 -> f8 (original), 4 -> f16
 
 # Phase-2 fine-tunes the latent bottleneck; phase-3 the output head. The rest of
 # the AE (params + BatchNorm running stats) is frozen by AutoencoderModule /
@@ -60,6 +68,27 @@ def parse_args():
     # lever (do not drop it for the AE, unlike the latent-tokenizer runs).
     p.add_argument("--lpips-weight", type=float, default=1.0)
 
+    # Train-only augmentation (horizontal flip). Applied to every phase's TRAIN
+    # loader; the 256px val split stays deterministic so metrics stay comparable.
+    p.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
+
+    # AE architecture (defaults reproduce the original f8 tokenizer exactly).
+    p.add_argument("--base-channels", type=int, default=AE_BASE_CHANNELS)
+    p.add_argument("--latent-dim", type=int, default=AE_LATENT_DIM)
+    p.add_argument("--fsq-levels", type=int, nargs="+", default=AE_FSQ_LEVELS)
+    # --no-fsq drops the FSQ quantizer entirely: the latent stays continuous
+    # (a plain undercomplete AE, VAE-style latent for diffusion) with no tanh
+    # bound and no codebook -- avoids the FSQ saturation/collapse failure mode.
+    p.add_argument("--no-fsq", action="store_true")
+    p.add_argument("--n-downsample", type=int, default=AE_N_DOWNSAMPLE)
+    # Phase-1 train resolution. The original curriculum trains phase 1 @ 64px, but
+    # rFID is measured @ 256px -- matching phase-1 to the eval res is the main
+    # lever for low phase-1 rFID (at the cost of throughput).
+    p.add_argument("--phase1-image-size", type=int, default=64)
+    p.add_argument("--phase1-val-every", type=int, default=2)
+    # Wall-clock cap for phase 1 (best-effort under a time budget). None = uncapped.
+    p.add_argument("--phase1-max-minutes", type=float, default=None)
+
     # Phase 1 -- full model @ 64x64.
     p.add_argument("--phase1-epochs", type=int, default=10)
     p.add_argument("--phase1-lr", type=float, default=1e-3)
@@ -67,13 +96,15 @@ def parse_args():
     p.add_argument("--phase1-warmup-steps", type=int, default=100)
 
     # Phase 2 -- bottleneck only @ 256x256 (also supplies the 256px val set).
-    p.add_argument("--phase2-epochs", type=int, default=15)
+    # Defaults to 0 (skipped): the default pipeline trains phase 1 only.
+    p.add_argument("--phase2-epochs", type=int, default=0)
     p.add_argument("--phase2-lr", type=float, default=1e-3)
     p.add_argument("--phase2-batch-size", type=int, default=32)
     p.add_argument("--phase2-warmup-steps", type=int, default=100)
 
     # Phase 3 -- output head only @ 64x64, adversarial (PatchGAN, hinge + DiffAug).
-    p.add_argument("--phase3-epochs", type=int, default=15)
+    # Defaults to 0 (skipped): the default pipeline trains phase 1 only.
+    p.add_argument("--phase3-epochs", type=int, default=0)
     p.add_argument("--phase3-lr", type=float, default=2e-4)
     p.add_argument("--phase3-batch-size", type=int, default=64)
     p.add_argument("--phase3-warmup-steps", type=int, default=100)
@@ -81,8 +112,12 @@ def parse_args():
     return p.parse_args()
 
 
-def make_dm(data_dir, image_size, batch_size, seed):
-    """AFHQ datamodule in [0, 1] pixels (sigmoid decoder + data_range=1.0 metrics)."""
+def make_dm(data_dir, image_size, batch_size, seed, augment=False):
+    """AFHQ datamodule in [0, 1] pixels (sigmoid decoder + data_range=1.0 metrics).
+
+    ``augment`` adds train-only horizontal flip; the val split it supplies stays
+    deterministic, so 256px validation metrics remain comparable across runs.
+    """
     dm = AFHQDataModule(
         data_dir=data_dir,
         image_size=image_size,
@@ -90,6 +125,7 @@ def make_dm(data_dir, image_size, batch_size, seed):
         num_workers=8,
         normalize=False,
         seed=seed,
+        augment=augment,
     )
     dm.prepare_data()
     dm.setup("fit")
@@ -121,16 +157,28 @@ def main():
     # One model instance threads through all three phases, so trained weights
     # carry over in memory (the freezing schemes only change which params get
     # gradients, never the tensors themselves).
+    fsq_levels = None if args.no_fsq else args.fsq_levels
     model = PetPaletteAE(
         in_channels=3,
-        latent_dim=AE_LATENT_DIM,
-        base_channels=AE_BASE_CHANNELS,
-        fsq_levels=AE_FSQ_LEVELS,
+        latent_dim=args.latent_dim,
+        base_channels=args.base_channels,
+        fsq_levels=fsq_levels,
+        n_downsample=args.n_downsample,
+    )
+    f = 2**args.n_downsample
+    n_params = sum(p.numel() for p in model.parameters())
+    quant = (
+        "no FSQ (continuous latent)"
+        if fsq_levels is None
+        else f"fsq={fsq_levels} (vocab {int(torch.prod(torch.tensor(fsq_levels)))})"
+    )
+    print(
+        f"PetPaletteAE: {n_params:,} params, f{f}, latent_dim={args.latent_dim}, {quant}"
     )
 
     # Validation is always at 256x256; the phase-2 datamodule supplies it (and
     # its own train loader). Sharing the seed keeps the 64px/256px splits aligned.
-    dm256 = make_dm(args.data_dir, 256, args.phase2_batch_size, args.seed)
+    dm256 = make_dm(args.data_dir, 256, args.phase2_batch_size, args.seed, args.augment)
     val_loader = dm256.val_dataloader()
 
     def phase_checkpoint(name):
@@ -143,9 +191,15 @@ def main():
             enable_version_counter=False,
         )
 
-    # ---- Phase 1: L1 + LPIPS @ 64x64, full model ----
-    dm64_p1 = make_dm(args.data_dir, 64, args.phase1_batch_size, args.seed)
-    train_loader = dm64_p1.train_dataloader()
+    # ---- Phase 1: L1 + LPIPS @ phase1-image-size, full model ----
+    dm_p1 = make_dm(
+        args.data_dir,
+        args.phase1_image_size,
+        args.phase1_batch_size,
+        args.seed,
+        args.augment,
+    )
+    train_loader = dm_p1.train_dataloader()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.phase1_lr)
     scheduler = LinearWarmupCosineAnnealingLR(
         optimizer,
@@ -157,96 +211,110 @@ def main():
         model, optimizer, scheduler, lpips_weight=args.lpips_weight, compute_rfid=True
     )
     ckpt1 = phase_checkpoint("ae_phase1")
+    # max_time stops fit gracefully at the wall-clock budget (best-effort runs);
+    # trainer.test still runs afterward on whatever weights we reached.
+    max_time = (
+        {"minutes": args.phase1_max_minutes}
+        if args.phase1_max_minutes is not None
+        else None
+    )
     trainer = Trainer(
         max_epochs=args.phase1_epochs,
         precision="bf16-mixed",
         gradient_clip_algorithm="norm",
         gradient_clip_val=1.0,
         deterministic=True,
-        check_val_every_n_epoch=2,
+        check_val_every_n_epoch=args.phase1_val_every,
+        max_time=max_time,
         logger=loggers,
         callbacks=[ckpt1],
     )
     trainer.fit(p1, train_dataloaders=train_loader, val_dataloaders=val_loader)
-    trainer.test(p1, dataloaders=val_loader)
+    test_results = trainer.test(p1, dataloaders=val_loader)
+    final_ckpt = "ae_phase1"
 
     # ---- Phase 2: L1 + LPIPS @ 256x256, bottleneck only ----
-    train_loader = dm256.train_dataloader()
-    params = AutoencoderModule.trainable_params(model, TRAIN_ONLY_P2)
-    optimizer = torch.optim.AdamW(params, lr=args.phase2_lr)
-    scheduler = LinearWarmupCosineAnnealingLR(
-        optimizer,
-        warmup_steps=args.phase2_warmup_steps,
-        n_epochs=args.phase2_epochs,
-        train_loader_length=len(train_loader),
-    )
-    p2 = AutoencoderModule(
-        model,
-        optimizer,
-        scheduler,
-        lpips_weight=args.lpips_weight,
-        compute_rfid=True,
-        train_only=TRAIN_ONLY_P2,
-    )
-    ckpt2 = phase_checkpoint("ae_phase2")
-    trainer = Trainer(
-        max_epochs=args.phase2_epochs,
-        precision="bf16-mixed",
-        gradient_clip_algorithm="norm",
-        gradient_clip_val=1.0,
-        deterministic=True,
-        logger=loggers,
-        callbacks=[ckpt2],
-    )
-    trainer.fit(p2, train_dataloaders=train_loader, val_dataloaders=val_loader)
-    trainer.test(p2, dataloaders=val_loader)
+    if args.phase2_epochs > 0:
+        train_loader = dm256.train_dataloader()
+        params = AutoencoderModule.trainable_params(model, TRAIN_ONLY_P2)
+        optimizer = torch.optim.AdamW(params, lr=args.phase2_lr)
+        scheduler = LinearWarmupCosineAnnealingLR(
+            optimizer,
+            warmup_steps=args.phase2_warmup_steps,
+            n_epochs=args.phase2_epochs,
+            train_loader_length=len(train_loader),
+        )
+        p2 = AutoencoderModule(
+            model,
+            optimizer,
+            scheduler,
+            lpips_weight=args.lpips_weight,
+            compute_rfid=True,
+            train_only=TRAIN_ONLY_P2,
+        )
+        ckpt2 = phase_checkpoint("ae_phase2")
+        trainer = Trainer(
+            max_epochs=args.phase2_epochs,
+            precision="bf16-mixed",
+            gradient_clip_algorithm="norm",
+            gradient_clip_val=1.0,
+            deterministic=True,
+            logger=loggers,
+            callbacks=[ckpt2],
+        )
+        trainer.fit(p2, train_dataloaders=train_loader, val_dataloaders=val_loader)
+        test_results = trainer.test(p2, dataloaders=val_loader)
+        final_ckpt = "ae_phase2"
 
     # ---- Phase 3: L1 + LPIPS + PatchGAN @ 64x64, output head only ----
-    dm64_p3 = make_dm(args.data_dir, 64, args.phase3_batch_size, args.seed)
-    train_loader = dm64_p3.train_dataloader()
-    discriminator = PatchGANDiscriminator(in_channels=3, base_channels=64, n_layers=3)
-    g_params = AdversarialAutoencoderModule.trainable_params(model, TRAIN_ONLY_P3)
-    opt_g = torch.optim.AdamW(g_params, lr=args.phase3_lr, betas=(0.5, 0.9))
-    opt_d = torch.optim.AdamW(
-        discriminator.parameters(), lr=args.phase3_lr, betas=(0.5, 0.9)
-    )
-    sched_g = LinearWarmupCosineAnnealingLR(
-        opt_g,
-        warmup_steps=args.phase3_warmup_steps,
-        n_epochs=args.phase3_epochs,
-        train_loader_length=len(train_loader),
-    )
-    sched_d = LinearWarmupCosineAnnealingLR(
-        opt_d,
-        warmup_steps=args.phase3_warmup_steps,
-        n_epochs=args.phase3_epochs,
-        train_loader_length=len(train_loader),
-    )
-    p3 = AdversarialAutoencoderModule(
-        model,
-        discriminator,
-        opt_g,
-        opt_d,
-        sched_g=sched_g,
-        sched_d=sched_d,
-        lpips_weight=args.lpips_weight,
-        gan_weight=args.gan_weight,
-        compute_rfid=True,
-        train_only=TRAIN_ONLY_P3,
-    )
-    ckpt3 = phase_checkpoint("ae_phase3")
-    # No Trainer gradient clipping: phase 3 is a manual-optimization GAN.
-    trainer = Trainer(
-        max_epochs=args.phase3_epochs,
-        precision="bf16-mixed",
-        deterministic=True,
-        logger=loggers,
-        callbacks=[ckpt3],
-    )
-    trainer.fit(p3, train_dataloaders=train_loader, val_dataloaders=val_loader)
-    trainer.test(p3, dataloaders=val_loader)
+    if args.phase3_epochs > 0:
+        dm64_p3 = make_dm(args.data_dir, 64, args.phase3_batch_size, args.seed, args.augment)
+        train_loader = dm64_p3.train_dataloader()
+        discriminator = PatchGANDiscriminator(in_channels=3, base_channels=64, n_layers=3)
+        g_params = AdversarialAutoencoderModule.trainable_params(model, TRAIN_ONLY_P3)
+        opt_g = torch.optim.AdamW(g_params, lr=args.phase3_lr, betas=(0.5, 0.9))
+        opt_d = torch.optim.AdamW(
+            discriminator.parameters(), lr=args.phase3_lr, betas=(0.5, 0.9)
+        )
+        sched_g = LinearWarmupCosineAnnealingLR(
+            opt_g,
+            warmup_steps=args.phase3_warmup_steps,
+            n_epochs=args.phase3_epochs,
+            train_loader_length=len(train_loader),
+        )
+        sched_d = LinearWarmupCosineAnnealingLR(
+            opt_d,
+            warmup_steps=args.phase3_warmup_steps,
+            n_epochs=args.phase3_epochs,
+            train_loader_length=len(train_loader),
+        )
+        p3 = AdversarialAutoencoderModule(
+            model,
+            discriminator,
+            opt_g,
+            opt_d,
+            sched_g=sched_g,
+            sched_d=sched_d,
+            lpips_weight=args.lpips_weight,
+            gan_weight=args.gan_weight,
+            compute_rfid=True,
+            train_only=TRAIN_ONLY_P3,
+        )
+        ckpt3 = phase_checkpoint("ae_phase3")
+        # No Trainer gradient clipping: phase 3 is a manual-optimization GAN.
+        trainer = Trainer(
+            max_epochs=args.phase3_epochs,
+            precision="bf16-mixed",
+            deterministic=True,
+            logger=loggers,
+            callbacks=[ckpt3],
+        )
+        trainer.fit(p3, train_dataloaders=train_loader, val_dataloaders=val_loader)
+        test_results = trainer.test(p3, dataloaders=val_loader)
+        final_ckpt = "ae_phase3"
 
-    print("final AE checkpoint:", ckpt_dir / "ae_phase3.ckpt")
+    print("final AE checkpoint:", ckpt_dir / f"{final_ckpt}.ckpt")
+    print("final 256px test metrics:", test_results)
 
 
 if __name__ == "__main__":

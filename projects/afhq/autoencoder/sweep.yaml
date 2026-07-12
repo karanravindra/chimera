@@ -1,18 +1,16 @@
 # AFHQ PetPaletteAE sweep.
 #
-# NOTE: train.py runs a fixed THREE-PHASE curriculum (full -> bottleneck ->
-# output-head) in one process. Each trial therefore trains all three phases and
-# reports ONE coherent wandb run. We only sweep knobs that are safe to vary
-# without breaking the curriculum:
+# NOTE: train.py defaults to PHASE 1 ONLY (phases 2 & 3 are gated behind
+# --phase2-epochs / --phase3-epochs, both default 0). Each trial therefore
+# trains phase 1 (full model, L1+LPIPS @ 64x64) and reports ONE coherent wandb
+# run. This sweep searches only phase-1 knobs, which matches that default:
 #
 #   SWEPT     : phase1-lr (log-uniform), lpips-weight, phase1-warmup-steps.
-#               lpips-weight is shared by all phases and is the recipe's top rFID
-#               lever, so it is the one cross-phase knob worth searching.
-#   NOT SWEPT : epochs (fixed by the curriculum + the hard 10-min/run budget),
-#               batch sizes / resolutions (fixed per phase; changing them shifts
-#               throughput and can blow the time budget), phase-2/3 lr and
-#               gan-weight (kept at their notebook values so the sweep stays a
-#               small, phase-1-focused search rather than a combinatorial blowup).
+#               lpips-weight is the recipe's top rFID lever.
+#   NOT SWEPT : epochs (fixed + the hard 10-min/run budget), batch size /
+#               resolution (fixed; changing them shifts throughput and can blow
+#               the time budget). To sweep the full curriculum instead, add
+#               phase2-epochs / phase3-epochs (> 0) to the grid.
 #
 # Metric: val/rfid (reconstruction-FID, logged every validation epoch; lower is
 # better) -- the key AE quality metric. Hyperband prunes weak configs early.

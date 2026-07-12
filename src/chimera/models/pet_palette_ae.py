@@ -137,14 +137,18 @@ class PetPaletteAE(nn.Module):
 
     Downsampling uses space-to-channel (pixel-unshuffle) DC blocks and
     upsampling uses channel-to-space (pixel-shuffle) DC blocks, each with the
-    residual shortcut from the DC-AE paper. It is fully convolutional, so three
-    downsampling blocks give a ``(latent_dim, H/8, W/8)`` spatial latent that can
-    be patchified into a token sequence for a latent diffusion / rectified-flow
-    transformer, while still working as a plain reconstruction autoencoder via
-    ``forward``. The decoder ends in a sigmoid, so reconstructions are in
-    ``[0, 1]``.
+    residual shortcut from the DC-AE paper. It is fully convolutional, so
+    ``n_downsample`` downsampling blocks give a ``(latent_dim, H/2**n, W/2**n)``
+    spatial latent that can be patchified into a token sequence for a latent
+    diffusion / rectified-flow transformer, while still working as a plain
+    reconstruction autoencoder via ``forward``. The decoder ends in a sigmoid, so
+    reconstructions are in ``[0, 1]``.
 
-    ``latent_dim`` is the number of latent *channels* on the ``H/8 x W/8`` grid.
+    ``n_downsample`` sets the spatial compression factor ``f = 2**n_downsample``
+    (default 3 -> f8). Channels ramp base -> 2*base -> 4*base over the first three
+    blocks and stay capped at 4*base for any additional block, so the extra
+    blocks a higher ``f`` adds are cheap. ``latent_dim`` is the number of latent
+    *channels* on the ``H/f x W/f`` grid.
     """
 
     def __init__(
@@ -153,16 +157,21 @@ class PetPaletteAE(nn.Module):
         latent_dim: int = 4,
         base_channels: int = 32,
         fsq_levels=None,
+        n_downsample: int = 3,
     ):
         super().__init__()
+        assert n_downsample >= 3, "channel ramp needs at least 3 downsample blocks"
         self.in_channels = in_channels
         self.latent_dim = latent_dim
         self.base_channels = base_channels
+        self.n_downsample = n_downsample
 
         c1, c2, c4 = base_channels, base_channels * 2, base_channels * 4
 
         self.in_to_channels = nn.Conv2d(in_channels, c1, kernel_size=3, padding=1)
-        self.encoder = nn.Sequential(
+        # First three blocks (base -> 2x -> 4x) reproduce the original f8 stack
+        # exactly; each additional block is a cheap c4->c4 down at the bottleneck.
+        enc = [
             ResBlock(c1, c1),
             DCDownBlock(c1, c2),  # /2
             ResBlock(c2, c2),
@@ -171,11 +180,18 @@ class PetPaletteAE(nn.Module):
             ResBlock(c4, c4),
             DCDownBlock(c4, c4),  # /2
             ResBlock(c4, c4),
-        )
+        ]
+        for _ in range(n_downsample - 3):
+            enc += [DCDownBlock(c4, c4), ResBlock(c4, c4)]  # /2, capped at c4
+        self.encoder = nn.Sequential(*enc)
         self.to_latent = nn.Conv2d(c4, latent_dim, kernel_size=1)
 
         self.from_latent = nn.Conv2d(latent_dim, c4, kernel_size=1)
-        self.decoder = nn.Sequential(
+        # Mirror: extra c4->c4 upsamples first, then the original f8 decoder tail.
+        dec = []
+        for _ in range(n_downsample - 3):
+            dec += [ResBlock(c4, c4), DCUpBlock(c4, c4)]  # x2, capped at c4
+        dec += [
             ResBlock(c4, c4),
             DCUpBlock(c4, c4),  # x2
             ResBlock(c4, c4),
@@ -184,7 +200,8 @@ class PetPaletteAE(nn.Module):
             ResBlock(c2, c1),
             DCUpBlock(c1, c1),  # x2
             ResBlock(c1, c1),
-        )
+        ]
+        self.decoder = nn.Sequential(*dec)
         self.out_from_channels = nn.Conv2d(c1, in_channels, kernel_size=3, padding=1)
 
         self.fsq = FSQ(fsq_levels) if fsq_levels is not None else None
