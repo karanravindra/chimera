@@ -320,8 +320,19 @@ def main():
 
     if args.compile:
         model = torch.compile(model, mode="reduce-overhead")
+    # bytes-per-token for this (tokenizer, mix): enables tokenizer-independent bpb
+    # logging alongside bpt. Measured+cached once by bpb.py (git-tracked cache).
+    from bpb import bytes_per_token_cached
+
+    bytes_per_token = bytes_per_token_cached(
+        args.tokenizer, args.mix, data_dir=args.data_dir
+    )
+    print(f"bytes/token={bytes_per_token:.4f} (val/*bpb = bpt / bytes_per_token)")
     # use_cce: fuse lm_head + cross-entropy (apple/ml-cross-entropy), no logits materialized
-    lm_module = LanguageModelModule(model, optimizer, scheduler, use_cce=args.use_cce)
+    lm_module = LanguageModelModule(
+        model, optimizer, scheduler, use_cce=args.use_cce,
+        bytes_per_token=bytes_per_token,
+    )
 
     run_dir = Path(args.run_dir)
     # Per-run checkpoint directory: a shared checkpoints/gpt.ckpt let every run
