@@ -1,0 +1,59 @@
+# muP width x depth coordinate check — verify LR transfer across WIDTH and DEPTH.
+#
+# Phase 2 of the muP tuning. Phase 1 (lr_sweep.yaml, sweep 60lc74lr) found the
+# optimum at the 9M proxy (n_embd=128, depth=6): muon-lr=0.013, adamw-lr=0.006.
+# muP's promise: that optimum transfers UNCHANGED to any width (input/output mults
+# + init variance absorb width) and — with Depth-muP now implemented — any depth
+# (persistent 1/sqrt(L) residual-branch multiplier absorbs depth). Here we hold the
+# swept LR FIXED and grid over {64,128,256,384} x depth {6,12}, head_dim pinned at
+# 32 (n_head scales with width, NOT head_dim — muP-required).
+#
+# READING IT: if transfer holds, val/loss should (a) decrease smoothly & monotonically
+# with width at BOTH depths, (b) show no config diverging or underperforming its
+# width neighbours, (c) have depth-12 consistently at/below its depth-6 twin. A width
+# whose val/loss stops improving locates the small-width floor. Divergence at large
+# width/depth at the fixed LR would falsify transfer (=> LR would need re-tuning per
+# scale, defeating muP). Short 65.5M-token horizon (1000 steps) — relative ordering,
+# not absolute floor, is the signal; keeps the largest run well under the 10-min cap.
+#
+# Run:  wandb sweep projects/llm/gpt/coord_check.yaml
+#       wandb agent <entity>/llm-pretrain/<id> --count 8
+#
+# grid runs in listed order -> anchors first (reproduce proxy, then width up, then
+# the depth-transfer anchor) so the key comparisons land early.
+program: projects/llm/gpt/train.py
+project: llm-pretrain
+method: grid
+name: mup-coord-check
+metric:
+  name: val/loss
+  goal: minimize
+parameters:
+  arch:
+    # n_embd-n_head-n_kv-n_layer ; head_dim = n_embd/n_head = 32 for all
+    values:
+      - 128-4-1-6      # proxy anchor — should reproduce the sweep basin (~3.2 @200M; higher here @65M)
+      - 256-8-1-6      # width up (= mup_base_width, m_d=1)
+      - 384-12-1-6     # width up more — width floor?
+      - 64-2-1-6       # width down (m_d=0.25)
+      - 128-4-1-12     # depth-transfer anchor at proxy width
+      - 256-8-1-12
+      - 384-12-1-12    # largest — Depth-muP + width transfer jointly
+      - 64-2-1-12
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --muon-lr=0.013           # FIXED swept optimum — the whole point is it transfers
+  - --adamw-lr=0.006
+  - --seq-len=512
+  - --global-token-count=65536
+  - --max-steps=1000          # ~65.5M tokens; cosine anneals over this horizon
+  - --warmup-steps=100
+  - --mix=mix_1B
+  - --val-check-interval=250
+  - --limit-val-batches=100
+  - --print-every=200
+  - --wandb-project=llm-pretrain
+  - --tags=mup-coord-check,width-depth-transfer,grid
+  - ${args}

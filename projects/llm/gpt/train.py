@@ -69,8 +69,8 @@ def parse_args():
     # schedule anneals it back down by the end of the run. gpt-no-bias-48emb-
     # a0.004 (this default) has no such hump — monotonically decreasing the
     # whole run. Keep the scheduler on and its period = run length regardless.
-    p.add_argument("--muon-lr", type=float, default=0.01)
-    p.add_argument("--adamw-lr", type=float, default=4e-3)
+    p.add_argument("--muon-lr", type=float, default=0.013)   # swept optimum (muP LR sweep 60lc74lr, 9M proxy/200M tok): 0.0133
+    p.add_argument("--adamw-lr", type=float, default=6e-3)    # swept optimum: 0.00603 (broad basin muon 8e-3..1.8e-2 x adamw 3e-3..6e-3)
     p.add_argument("--adamw-weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-steps", type=int, default=100)
     p.add_argument("--eta-min", type=float, default=1e-5)
