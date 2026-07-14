@@ -81,7 +81,7 @@ def parse_args():
     p.add_argument("--val-check-interval", type=int, default=500)
     p.add_argument("--limit-val-batches", type=int, default=250)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--wandb-project", default="llm-gpt")
+    p.add_argument("--wandb-project", default="llm-pretrain")
     # Explicit wandb run name; left unset, wandb assigns a random one. Useful to
     # tag a run with what makes it different from the rest (an ablation, a fix).
     p.add_argument("--run-name", default=None)
@@ -154,6 +154,19 @@ def parse_args():
     # Recompute block activations in backward instead of storing them: lets wide
     # models fit on limited VRAM without shrinking tokens/step (~1 extra fwd cost).
     p.add_argument("--grad-checkpoint", dest="gradient_checkpointing", action="store_true")
+    # Pure-causal attention uses SDPA/FlashAttention by default (faster than
+    # flex_attention at small head_dim); flex is still used for decode and any
+    # custom/sparse mask. This disables the SDPA fast path (always flex).
+    p.add_argument("--no-flash-attn", dest="use_flash_attn", action="store_false")
+    # Sparse attention: causal sliding window + always-visible global prefix
+    # tokens (attention sinks), via flex_attention block masks that prune
+    # fully-masked KV blocks. Unset = dense causal.
+    p.add_argument("--attn-window", type=int, default=None,
+        help="Sliding-window size in tokens (e.g. 256). Unset or 0 = dense "
+             "causal (0 lets a wandb sweep grid include the dense baseline).")
+    p.add_argument("--attn-global-tokens", type=int, default=16,
+        help="Number of prefix tokens every query may attend to regardless of "
+             "the window (only used with --attn-window).")
     p.add_argument("--no-tie-embedding", dest="tie_embedding", action="store_false")
     p.add_argument("--no-compile", dest="compile", action="store_false")
     p.add_argument("--no-cce", dest="use_cce", action="store_false")
@@ -178,6 +191,8 @@ def default_run_name(args) -> str:
     parts = [f"gpt-{args.n_embd}-{args.n_head}-{args.n_kv_head}-{args.n_layer}"]
     if args.use_attn_res:
         parts.append(f"attnres{args.attn_res_n_blocks}")
+    if args.attn_window is not None:
+        parts.append(f"swa{args.attn_window}g{args.attn_global_tokens}")
     if args.use_mla:
         parts.append(f"mla-kv{args.kv_lora_rank}")
     if args.use_moe:
@@ -193,6 +208,8 @@ def main():
         args.n_embd, args.n_head, args.n_kv_head, args.n_layer = (
             int(x) for x in args.arch.split("-")
         )
+    if args.attn_window == 0:
+        args.attn_window = None  # sweep-grid sentinel for the dense baseline
     args.run_name = args.run_name or default_run_name(args)
     # datasets + tokenizer caches live on the big volume (as in the notebook)
     os.environ.setdefault("HF_HOME", "/mnt/ai/data/hf")
@@ -250,6 +267,9 @@ def main():
         mup_input_mult=args.mup_input_mult,
         mup_output_mult=args.mup_output_mult,
         gradient_checkpointing=args.gradient_checkpointing,
+        use_flash_attn=args.use_flash_attn,
+        attn_window=args.attn_window,
+        attn_global_tokens=args.attn_global_tokens,
         use_attn_res=args.use_attn_res,
         attn_res_n_blocks=args.attn_res_n_blocks,
         use_mla=args.use_mla,

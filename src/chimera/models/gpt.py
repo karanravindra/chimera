@@ -30,21 +30,41 @@ def _make_offset_causal_mask_mod(past_len: int):
     return mask_mod
 
 
-def build_block_mask(B: int, T: int, past_len: int, device) -> BlockMask:
-    """Causal block mask for flex_attention, covering both prefill (past_len=0,
+def _make_sparse_mask_mod(past_len: int, window: int, n_global: int):
+    """Causal sliding-window + global-prefix mask (Longformer/attention-sink
+    style): each query attends to the previous ``window`` tokens plus the
+    first ``n_global`` tokens of the sequence. ``past_len`` offsets query
+    positions during incremental decode."""
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        q_abs = q_idx + past_len
+        return (kv_idx <= q_abs) & ((q_abs - kv_idx < window) | (kv_idx < n_global))
+
+    return mask_mod
+
+
+def build_block_mask(
+    B: int, T: int, past_len: int, device, window: int | None = None, n_global: int = 0
+) -> BlockMask:
+    """Block mask for flex_attention, covering both prefill (past_len=0,
     Q_LEN==KV_LEN==T) and incremental decode (query positions offset by the
-    cached prefix length).
+    cached prefix length). Plain causal by default; ``window`` switches to
+    causal sliding-window + ``n_global`` global-prefix tokens, where the
+    BlockMask actually prunes fully-masked KV blocks (real compute savings,
+    not just masking).
 
     Building a fresh BlockMask every call has real cost even under compile
     (~4x the compiled attention call itself, measured) -- callers should cache
     the prefill mask across steps (T is constant for a whole training run) and
     only rebuild for decode, where KV_LEN changes every step anyway.
     """
-    if past_len == 0:
-        return create_block_mask(_causal_mask_mod, B, None, T, T, device=device)
-    return create_block_mask(
-        _make_offset_causal_mask_mod(past_len), B, None, T, past_len + T, device=device
-    )
+    if window is not None:
+        mask_mod = _make_sparse_mask_mod(past_len, window, n_global)
+    elif past_len == 0:
+        mask_mod = _causal_mask_mod
+    else:
+        mask_mod = _make_offset_causal_mask_mod(past_len)
+    return create_block_mask(mask_mod, B, None, T, past_len + T, device=device)
 
 
 class ReLU2(nn.Module):
@@ -127,7 +147,14 @@ class GroupedQueryAttention(nn.Module):
         # block_mask is built once per GPT._forward call (prefill: cached
         # across steps since T is constant for a whole run; decode: fresh
         # each step, since KV_LEN grows) and threaded down alongside cos/sin.
-        out = _flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
+        # block_mask=None signals pure causal (GPT.use_flash_attn): dispatch
+        # to SDPA's fused FlashAttention/cuDNN kernels, which beat flex's
+        # Triton templates at small head_dim. flex handles everything else
+        # (decode's offset mask, future custom/sparse masks).
+        if block_mask is None:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        else:
+            out = _flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
 
         out = out.transpose(1, 2).reshape(B, T, self.n_head * self.head_dim)
         return self.proj(out), present
@@ -244,7 +271,11 @@ class MultiHeadLatentAttention(nn.Module):
         v = self.w_uv(c_kv_normed).view(B, Tk, self.n_head, self.v_head_dim).transpose(1, 2)
         k = torch.cat([k_nope, k_rope.expand(-1, self.n_head, -1, -1)], dim=-1)
 
-        out = _flex_attention(q, k, v, block_mask=block_mask)
+        # See GroupedQueryAttention: block_mask=None means pure causal -> SDPA.
+        if block_mask is None:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            out = _flex_attention(q, k, v, block_mask=block_mask)
 
         out = out.transpose(1, 2).reshape(B, T, self.n_head * self.v_head_dim)
         return self.proj(out), present
@@ -577,6 +608,9 @@ class GPT(nn.Module):
         mup_input_mult: float = 1.0,
         mup_output_mult: float = 1.0,
         gradient_checkpointing: bool = False,
+        use_flash_attn: bool = True,
+        attn_window: int | None = None,
+        attn_global_tokens: int = 16,
         use_attn_res: bool = False,
         attn_res_n_blocks: int = 8,
         use_mla: bool = False,
@@ -601,6 +635,21 @@ class GPT(nn.Module):
         # activation memory. Needed to fit wide models (e.g. 124M @ seq 2048) on
         # 16 GB without shrinking the (comparability-critical) tokens/step.
         self.gradient_checkpointing = gradient_checkpointing
+        # Pure-causal attention (training / prefill) dispatches to SDPA's fused
+        # FlashAttention/cuDNN kernels instead of flex_attention -- measurably
+        # faster at small head_dim, where flex's Triton templates lag. flex is
+        # kept for anything needing a mask_mod: incremental decode (offset
+        # causal) and sparse attention masks.
+        self.use_flash_attn = use_flash_attn
+        # Sparse attention: causal sliding window of ``attn_window`` tokens
+        # plus ``attn_global_tokens`` always-visible prefix tokens (attention
+        # sinks). None = dense causal. When set, attention always runs through
+        # flex_attention with a block mask that prunes fully-masked KV blocks,
+        # so long-context attention cost grows ~linearly instead of
+        # quadratically. use_flash_attn's SDPA fast path only applies to the
+        # dense-causal case and is bypassed when a window is set.
+        self.attn_window = attn_window
+        self.attn_global_tokens = attn_global_tokens
 
         # Maximal Update Parameterization (muP). The width multiplier m_d relates
         # this model's width to a base/proxy width; init variance and the output
@@ -727,17 +776,22 @@ class GPT(nn.Module):
         """
         if past_len == 0:
             # Prefill/training: T is constant for a whole run (== block_size),
-            # so cache the causal mask across calls instead of rebuilding it
+            # so cache the mask across calls instead of rebuilding it
             # every step -- building one costs ~4x the compiled attention
-            # call itself.
+            # call itself. attn_window/attn_global_tokens are fixed per model
+            # instance, so they don't need to be part of the key.
             cache_key = (B, T, str(device))
             if getattr(self, "_block_mask_cache_key", None) != cache_key:
-                self._block_mask_cache = build_block_mask(B, T, 0, device)
+                self._block_mask_cache = build_block_mask(
+                    B, T, 0, device, self.attn_window, self.attn_global_tokens
+                )
                 self._block_mask_cache_key = cache_key
             return self._block_mask_cache
         # Decode: KV_LEN grows every step, so a fresh mask is unavoidable
         # here -- still cheap, since Q_LEN is 1.
-        return build_block_mask(B, T, past_len, device)
+        return build_block_mask(
+            B, T, past_len, device, self.attn_window, self.attn_global_tokens
+        )
 
     def _forward(self, idx, past_kvs=None):
         B, T = idx.shape
@@ -749,7 +803,12 @@ class GPT(nn.Module):
 
         x = self.tok_emb(idx) * self.mup_input_mult  # muP embedding multiplier
         cos, sin = self.rope(past_len, T, idx.device)
-        block_mask = self._get_block_mask(B, T, past_len, idx.device)
+        # block_mask=None -> pure causal via SDPA/flash in the attention
+        # modules; a BlockMask -> flex_attention (decode offset / sparse masks).
+        if self.use_flash_attn and past_len == 0 and self.attn_window is None:
+            block_mask = None
+        else:
+            block_mask = self._get_block_mask(B, T, past_len, idx.device)
 
         # Activation checkpointing only applies to the training/prefill path (no
         # KV cache); incremental decode runs under no_grad, where it's a no-op.

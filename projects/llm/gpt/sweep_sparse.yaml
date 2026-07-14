@@ -1,0 +1,42 @@
+# Sparse-attention window sweep: find the smallest sliding window (+16 global
+# sink tokens) that keeps val/loss at (or near) the dense-causal baseline.
+#
+# Design:
+#   * Speed side is already measured (mfu_bench, seq 2048, fp8-compile):
+#     win256 is 1.09x dense; the win grows to 1.42x at seq 8192. This sweep
+#     supplies the quality side of the tradeoff at the training seq (2048).
+#   * attn-window=0 is the dense baseline (train.py maps 0 -> None), included
+#     in-grid so every run shares the same data/steps/schedule.
+#   * Values are ordered most-promising-first (grid runs in listed order):
+#     256 is the benchmarked default, 512 the likely quality-safe fallback;
+#     dense baseline early for a reference point; 128/1024 bracket the range.
+#   * 500-step smoke runs (the project's standard budget, ~4 min each);
+#     val every 250 steps so ranking uses a curve, not one noisy end point.
+#   * Zero-shot benchmark suite (bench.py) runs after each run and logs under
+#     test/<task>/<metric> -- val/loss ranks the sweep, benchmarks catch
+#     quality effects loss alone might miss. --no-test only skips the
+#     redundant trainer.test() pass over the val loader.
+#
+#   wandb sweep projects/llm/gpt/sweep_sparse.yaml
+#   wandb agent <entity>/llm-pretrain/<sweep_id>
+program: projects/llm/gpt/train.py
+project: llm-pretrain
+method: grid
+metric:
+  name: val/loss
+  goal: minimize
+parameters:
+  attn-window:
+    values: [256, 512, 0, 128, 1024]
+  attn-global-tokens:
+    value: 16
+  val-check-interval:
+    value: 250
+  tags:
+    value: sparse-sweep
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --no-test
+  - ${args}

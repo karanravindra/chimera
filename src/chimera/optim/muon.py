@@ -2,25 +2,23 @@
 Muon optimizer (MomentUm Orthogonalized by Newton-schulz), with an auxiliary
 AdamW for the parameters Muon should not touch.
 
-:class:`Muon` is a single-object optimizer that internally delegates to
-``torch.optim.Muon`` (ordinary 2D hidden weight matrices) + ``torch.optim.AdamW``
-(everything else — token embedding, output head, norm gains, router/gate
-weights), plus a small hand-rolled batched Newton-Schulz path for any
-Muon-eligible parameter with ``ndim >= 3`` (e.g. DeepSeek MoE's packed
-per-expert weights, shape ``(n_experts, out, in)``) — ``torch.optim.Muon``
-hard-rejects anything but ``ndim == 2``.
+:class:`Muon` is a single-object optimizer that internally runs a
+shape-bucketed batched Newton-Schulz Muon for the hidden weight matrices and
+delegates to ``torch.optim.AdamW`` for everything else (token embedding,
+output head, norm gains, router/gate weights).
 
-Benchmarked (see chimera memory / session notes) on this repo's tiny (48-dim)
-GPT proxy width:
-  - ``torch.optim.Muon`` + ``torch.optim.AdamW`` is ~1.44x faster per full
-    training step than a naive per-parameter Python-loop Muon (this class's
-    previous implementation) on ordinary 2D matrices.
-  - For MoE's batched (ndim>=3) expert weights, splitting each expert into a
-    separate 2D leaf so ``torch.optim.Muon`` can take it is ~5.2x SLOWER than
-    keeping the batched tensor and doing Newton-Schulz on it directly:
-    Muon's cost scales with the *number* of distinct parameter tensors, not
-    their total size, and splitting an 8-expert weight multiplies the tensor
-    count 8x.
+2D params sharing a (transpose-normalized) shape are *stacked and stepped as
+one batch*: one momentum ``lerp_`` and one batched NS chain per bucket instead
+of a sequential per-parameter loop. Profiling the 384-wide GPT train step
+showed the previous per-param path (``torch.optim.Muon``) launching ~400 tiny
+cutlass GEMMs with launch gaps costing a third of their compute -- the only
+launch-bound region of the whole step. Bucketing collapses a 6-layer model's
+24 matrices into 3 batched NS chains. Params whose slices differ only by
+orientation (e.g. fc1 ``(1536, 384)`` and fc2 ``(384, 1536)``) share a bucket
+via ``.mT``; the per-matrix ``sqrt(rows/cols)`` scale is applied per slice
+from each param's original orientation, so the math is identical to the
+per-param loop. ndim>=3 params (e.g. DeepSeek MoE's packed per-expert
+weights) are already batched and form their own single-param buckets.
 
 Everything is wrapped under one ``.step()``/``.zero_grad()``/``.param_groups``
 so :class:`chimera.modules.LanguageModelModule` and every project's
@@ -70,16 +68,16 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
 
 
 class Muon(torch.optim.Optimizer):
-    """Single-object optimizer: torch.optim.Muon (2D) + batched Newton-Schulz
-    (ndim>=3) + torch.optim.AdamW (everything else), keyed off ``use_muon``.
+    """Single-object optimizer: shape-bucketed batched Newton-Schulz Muon +
+    torch.optim.AdamW (everything else), keyed off ``use_muon``.
 
     Expects ``param_groups`` (dicts) each carrying ``use_muon: bool`` — exactly
     :func:`muon_param_groups`'s output. Muon groups accept ``lr``, ``momentum``,
     ``weight_decay``, ``ns_steps``, ``nesterov``; AdamW groups accept ``lr``,
     ``betas``, ``eps``, ``weight_decay``. Missing keys are filled with sensible
-    defaults. A ``use_muon=True`` group's params are split internally by
-    ``ndim`` — ``==2`` goes to ``torch.optim.Muon``, ``>=3`` goes to the
-    batched Newton-Schulz path — transparent to the caller.
+    defaults. A ``use_muon=True`` group's 2D params are bucketed by
+    transpose-normalized shape and each bucket is stepped as one stacked batch
+    (see module docstring); ndim>=3 params each form a single-param bucket.
     """
 
     def __init__(self, param_groups: Iterable[dict]):
@@ -100,34 +98,39 @@ class Muon(torch.optim.Optimizer):
                 group.setdefault("weight_decay", 0.0)
         super().__init__(param_groups, dict())
 
-        # Build one delegate per input group, split further by ndim for
-        # use_muon groups. (group_index, kind, delegate) where kind is
-        # "muon2d" (a torch.optim.Muon instance), "muon_batched" (a plain
-        # dict of params + momentum buffers, stepped manually below), or
-        # "adamw" (a torch.optim.AdamW instance).
+        # Build one delegate per input group. (group_index, kind, delegate)
+        # where kind is "muon" (a list of shape buckets, stepped manually
+        # below) or "adamw" (a torch.optim.AdamW instance).
         self._delegates = []
         for i, group in enumerate(self.param_groups):
             if group["use_muon"]:
-                twoD = [p for p in group["params"] if p.ndim == 2]
-                batched = [p for p in group["params"] if p.ndim != 2]
-                if twoD:
-                    opt = torch.optim.Muon(
-                        twoD,
-                        lr=group["lr"],
-                        weight_decay=group["weight_decay"],
-                        momentum=group["momentum"],
-                        nesterov=group["nesterov"],
-                        ns_steps=group["ns_steps"],
-                    )
-                    self._delegates.append((i, "muon2d", opt))
-                if batched:
-                    # momentum_bufs stay None until first step(): eagerly
-                    # allocating here (at construction time) would fix their
-                    # dtype before Lightning's precision plugin later casts
-                    # the model's params (e.g. bf16-true), causing a dtype
-                    # mismatch against p.grad on the first real step.
-                    state = {"params": batched, "momentum_bufs": [None] * len(batched)}
-                    self._delegates.append((i, "muon_batched", state))
+                # Bucket 2D params by transpose-normalized shape (wide
+                # orientation, rows <= cols) so e.g. fc1 (1536, 384) and fc2
+                # (384, 1536) stack into one batch. ndim>=3 params (already
+                # batched, e.g. MoE experts) get a single-param bucket each.
+                buckets: dict = {}
+                for p in group["params"]:
+                    if p.ndim == 2:
+                        trans = p.size(0) > p.size(1)
+                        key = (p.size(1), p.size(0)) if trans else tuple(p.shape)
+                    else:
+                        trans, key = False, (id(p),)
+                    buckets.setdefault(key, {"params": [], "trans": []})
+                    buckets[key]["params"].append(p)
+                    buckets[key]["trans"].append(trans)
+                for b in buckets.values():
+                    # Per-slice sqrt(rows/cols) scale from each param's
+                    # ORIGINAL orientation (transposing must not change it).
+                    # momentum_buf stays None until first step(): allocating
+                    # at construction time would fix its dtype before
+                    # Lightning's precision plugin casts the model (e.g.
+                    # bf16-true), mismatching p.grad on the first real step.
+                    b["scale"] = [
+                        max(1, p.size(-2) / p.size(-1)) ** 0.5 for p in b["params"]
+                    ]
+                    b["scale_t"] = None  # cached device tensor, built lazily
+                    b["momentum_buf"] = None
+                self._delegates.append((i, "muon", list(buckets.values())))
             else:
                 opt = torch.optim.AdamW(
                     group["params"],
@@ -147,44 +150,54 @@ class Muon(torch.optim.Optimizer):
 
         for i, kind, delegate in self._delegates:
             group = self.param_groups[i]
-            if kind == "muon2d":
+            if kind == "adamw":
                 # Sync hyperparams every step: an LR scheduler mutates
                 # self.param_groups[i]["lr"], which must propagate into the
                 # delegate optimizer's own param group before it steps.
                 sub = delegate.param_groups[0]
                 sub["lr"] = group["lr"]
                 sub["weight_decay"] = group["weight_decay"]
-                sub["momentum"] = group["momentum"]
-                sub["nesterov"] = group["nesterov"]
-                sub["ns_steps"] = group["ns_steps"]
-                delegate.step()
-            elif kind == "adamw":
-                sub = delegate.param_groups[0]
-                sub["lr"] = group["lr"]
-                sub["weight_decay"] = group["weight_decay"]
                 sub["betas"] = group["betas"]
                 sub["eps"] = group["eps"]
                 delegate.step()
-            else:  # muon_batched
-                lr = group["lr"]
-                wd = group["weight_decay"]
-                momentum = group["momentum"]
-                nesterov = group["nesterov"]
-                ns_steps = group["ns_steps"]
-                bufs = delegate["momentum_bufs"]
-                for j, (p, buf) in enumerate(zip(delegate["params"], bufs)):
-                    if p.grad is None:
-                        continue
-                    if buf is None:
-                        buf = torch.zeros_like(p)
-                        bufs[j] = buf
-                    buf.lerp_(p.grad, 1 - momentum)
-                    update = p.grad.lerp(buf, momentum) if nesterov else buf
-                    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
-                    update = update * (max(1, update.size(-2) / update.size(-1)) ** 0.5)
+                continue
+
+            lr = group["lr"]
+            wd = group["weight_decay"]
+            momentum = group["momentum"]
+            nesterov = group["nesterov"]
+            ns_steps = group["ns_steps"]
+            for b in delegate:
+                params, trans = b["params"], b["trans"]
+                if any(p.grad is None for p in params):
+                    # all-or-nothing per bucket keeps the stacked momentum
+                    # buffer aligned; partial-grad steps don't occur in
+                    # practice (every hidden matrix gets a grad every step).
+                    continue
+                if len(params) == 1:
+                    g = params[0].grad
+                    grads = (g.mT if trans[0] else g).unsqueeze(0)
+                else:
+                    grads = torch.stack(
+                        [p.grad.mT if t else p.grad for p, t in zip(params, trans)]
+                    )
+                buf = b["momentum_buf"]
+                if buf is None:
+                    buf = b["momentum_buf"] = torch.zeros_like(grads)
+                buf.lerp_(grads, 1 - momentum)
+                update = grads.lerp(buf, momentum) if nesterov else buf
+                update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+                if any(s != 1.0 for s in b["scale"]):
+                    if b["scale_t"] is None:
+                        b["scale_t"] = torch.tensor(
+                            b["scale"], device=update.device, dtype=update.dtype
+                        ).view(-1, *([1] * (update.ndim - 1)))
+                    update = update * b["scale_t"]
+                for j, (p, t) in enumerate(zip(params, trans)):
                     if wd != 0:
                         p.mul_(1 - lr * wd)
-                    p.add_(update.reshape(p.shape), alpha=-lr)
+                    u = update[j].mT if t else update[j]
+                    p.add_(u.reshape(p.shape).to(p.dtype), alpha=-lr)
         return loss
 
 
