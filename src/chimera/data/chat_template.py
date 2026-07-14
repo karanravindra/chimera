@@ -47,7 +47,33 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from typing import Callable, Iterable, Optional
+
+# Contiguous run of \uXXXX escapes -> decode as UTF-16 (so surrogate pairs, e.g.
+# emoji 😀, recombine correctly). Only touches \uXXXX; leaves \n, \t, real text,
+# and everything else untouched.
+_UNICODE_ESCAPE_RUN = re.compile(r"(?:\\u[0-9a-fA-F]{4})+")
+
+
+def decode_unicode_escapes(text: str) -> str:
+    """Undo ``json.dumps(ensure_ascii=True)`` over-escaping in embedded payloads.
+
+    Some tool-call datasets (notably Toucan-1.5M) store tool schemas/results as
+    JSON strings serialized with ``ensure_ascii=True``, so non-ASCII content
+    arrives as literal ``\\uXXXX`` (6 ASCII chars) instead of the real character
+    — the model would otherwise waste capacity modelling escape sequences. No-op
+    when the text has no ``\\u`` escapes.
+    """
+    if "\\u" not in text:
+        return text
+
+    def _dec(m: re.Match) -> str:
+        seq = m.group(0)
+        units = bytes.fromhex("".join(seq[i + 2 : i + 6] for i in range(0, len(seq), 6)))
+        return units.decode("utf-16-be", errors="replace")
+
+    return _UNICODE_ESCAPE_RUN.sub(_dec, text)
 
 # --------------------------------------------------------------------------- #
 # Special tokens (order fixed: structural first -> low, stable ids)
@@ -150,6 +176,8 @@ def normalize_messages(raw: Iterable[dict]) -> list[dict]:
             content = m.get("value") or ""
         if not isinstance(content, str):
             content = json.dumps(content, ensure_ascii=False)
+        else:
+            content = decode_unicode_escapes(content)
 
         turn: dict = {"role": role, "content": content}
         if role == "assistant":
@@ -183,7 +211,7 @@ def _system_text(system: Optional[str], tools) -> Optional[str]:
     if system:
         parts.append(system.strip())
     if tools:
-        tools_json = tools if isinstance(tools, str) else json.dumps(tools, ensure_ascii=False)
+        tools_json = decode_unicode_escapes(tools) if isinstance(tools, str) else json.dumps(tools, ensure_ascii=False)
         parts.append(f"# Tools\n<tools>\n{tools_json}\n</tools>")
     return "\n\n".join(parts) if parts else None
 

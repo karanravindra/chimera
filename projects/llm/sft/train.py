@@ -26,6 +26,14 @@ import argparse
 import os
 from pathlib import Path
 
+# Masked SFT produces batches whose supervised-token count varies (and can be ~0
+# for an all-prompt/tool-result window). Cut Cross Entropy's Triton autotune
+# perf-model derives throughput from that count and divides by it -> a
+# ZeroDivisionError on such a batch (pretrain never hits this: it's unmasked).
+# Disable CCE autotune (fixed heuristic config) BEFORE importing the model, whose
+# import does os.environ.setdefault("CCE_AUTOTUNE", "1").
+os.environ.setdefault("CCE_AUTOTUNE", "0")
+
 import torch
 from lightning import Trainer, seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint
@@ -265,7 +273,21 @@ def main():
 
     if args.compile:
         model = torch.compile(model, mode="reduce-overhead")
-    lm_module = LanguageModelModule(model, optimizer, scheduler, use_cce=args.use_cce)
+    # bytes-per-supervised-token for this SFT mix: enables tokenizer-independent
+    # bpb logging alongside bpt. SFT loss averages over supervised (assistant)
+    # tokens only, so bpb is normalized by supervised bytes/token (mask-aware).
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "gpt"))
+    from bpb import bytes_per_token_cached
+
+    bytes_per_token = bytes_per_token_cached(
+        args.tokenizer, args.mix, data_dir=args.data_dir, sft=True
+    )
+    print(f"bytes/supervised-token={bytes_per_token:.4f} (<stage>/bpb = bpt / this)")
+    lm_module = LanguageModelModule(
+        model, optimizer, scheduler, use_cce=args.use_cce,
+        bytes_per_token=bytes_per_token,
+    )
 
     # Per-run checkpoint directory: the pretrain script's shared
     # checkpoints/gpt.ckpt let every run overwrite the last (which is how the

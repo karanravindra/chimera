@@ -41,6 +41,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, Optional
 
+from chimera.data.chat_template import decode_unicode_escapes as _decode_unicode_escapes
+
 # Datasets/models/caches live on the big volume (see project memory).
 os.environ.setdefault("HF_HOME", "/mnt/ai/data/hf")
 
@@ -195,8 +197,8 @@ class Sample:
 class Source:
     key: str  # cli handle, e.g. "stackv2-python"
     title: str  # human label
-    category: str  # code | web | math | tools
-    weight: float  # fraction of the whole mixture (categories sum to ~1.0)
+    category: str  # code | web | math | tools | chat
+    weight: float  # PRETRAIN fraction of the whole mixture (categories sum to ~1.0)
     hf_repo: str  # backing dataset (or "" when deferred)
     config: Optional[str]  # HF config / subset name
     split: str  # HF split
@@ -209,6 +211,12 @@ class Source:
     # "stackv2" (fetch content from SWH S3). See tokenize_source.py.
     kind: str = "text"
     deferred: bool = False
+    # SFT-stage weight, independent of the pretrain ``weight`` (the SFT mix has a
+    # different composition — chat-led, not code/web-led). When set, the SFT
+    # builder uses this instead of ``weight``; when None it falls back to
+    # ``weight``. A source with ``weight=0.0`` + ``sft_weight>0`` is SFT-only
+    # (excluded from the pretrain mix, included in the SFT mix).
+    sft_weight: Optional[float] = None
     last_shard: Optional["Shard"] = None  # shard read by the most recent sample()
 
     def sample(self, n: int = 5) -> Iterator[Sample]:
@@ -291,10 +299,10 @@ def _render_conversation(conv: list) -> str:
     lines = []
     for m in conv:
         if not isinstance(m, dict):
-            lines.append(str(m))
+            lines.append(_decode_unicode_escapes(str(m)))
             continue
         role = m.get("role") or m.get("from") or "?"
-        content = m.get("content") or m.get("value") or ""
+        content = _decode_unicode_escapes(m.get("content") or m.get("value") or "")
         lines.append(f"<{role}>\n{content}")
     return "\n\n".join(lines)
 
@@ -331,7 +339,7 @@ def _sample_toolcall(src: Source, n: int) -> Iterator[Sample]:
         conv = _coerce_conv(row.get("conversations") or row.get("messages"))
         text = _render_conversation(conv)
         if row.get("tools"):
-            text = f"<tools>\n{row['tools']}\n\n{text}"
+            text = f"<tools>\n{_decode_unicode_escapes(str(row['tools']))}\n\n{text}"
         yield Sample(
             text=text,
             meta={
@@ -444,6 +452,7 @@ SOURCES: list[Source] = [
         avail_tokens=24.9 * _B,  # measured; note: problem→CoT, SFT-like
         notes="Long chain-of-thought solutions to AoPS problems (SFT-like).",
         kind="openmath",
+        sft_weight=0.20,  # math capability in the chat-led SFT mix
         _sampler=_sample_openmath,
     ),
     # ---- tool-call / agentic : 15% ----------------------------------------
@@ -462,6 +471,7 @@ SOURCES: list[Source] = [
         avail_tokens=6.0 * _B,  # measured: ~4016 tok/traj x 1.5M; Apache-2.0
         notes="Largest open tool-agent set (1.5M multi-turn trajectories, real MCP tools); Apache-2.0.",
         kind="chat",
+        sft_weight=0.15,  # tool-agent capability in the chat-led SFT mix
         _sampler=_sample_toolcall,
     ),
     Source(
@@ -476,6 +486,7 @@ SOURCES: list[Source] = [
         avail_tokens=51 * _M,  # measured; single-turn; UNGATED mirror of Salesforce xLAM
         notes="Single-turn FC; ungated ChatML mirror of the gated Salesforce/xlam-60k.",
         kind="chat",
+        sft_weight=0.03,  # format-diversity tool sets in the chat-led SFT mix
         _sampler=_sample_toolcall,
     ),
     Source(
@@ -490,6 +501,7 @@ SOURCES: list[Source] = [
         avail_tokens=49 * _M,  # measured; multi-turn, pythonic call style
         notes="Multi-turn pythonic (code-style) tool calls; complements JSON-style FC.",
         kind="chat",
+        sft_weight=0.03,  # format-diversity tool sets in the chat-led SFT mix
         _sampler=_sample_toolcall,
     ),
     Source(
@@ -504,6 +516,7 @@ SOURCES: list[Source] = [
         avail_tokens=10.4 * _M,  # measured; multi-turn, 26k+ API pool, Apache-2.0
         notes="Multi-turn, high-diversity APIs; Apache-2.0.",
         kind="chat",
+        sft_weight=0.03,  # format-diversity tool sets in the chat-led SFT mix
         _sampler=_sample_toolcall,
     ),
     Source(
@@ -518,6 +531,7 @@ SOURCES: list[Source] = [
         avail_tokens=30 * _M,  # measured; avg 18.5 msgs/conv, function_call→observation loops
         notes="Deepest multi-turn agentic trajectories, BUT license is CC-BY-NC (non-commercial).",
         kind="chat",
+        sft_weight=0.03,  # format-diversity tool sets in the chat-led SFT mix
         _sampler=_sample_toolcall,
     ),
     Source(
@@ -532,6 +546,26 @@ SOURCES: list[Source] = [
         avail_tokens=10.4 * _M,  # measured (all files); Apache-2.0
         notes="ShareGPT multi-turn FC + JSON-mode; Apache-2.0. (repo also has more files)",
         kind="chat",
+        sft_weight=0.03,  # format-diversity tool sets in the chat-led SFT mix
+        _sampler=_sample_toolcall,
+    ),
+    # ---- general chat : SFT-only (weight=0.0 keeps it out of the pretrain mix) --
+    # UltraChat is the general open-domain instruction/chat anchor for SFT. It is
+    # the ONLY SFT source with no pretrain-mix overlap (openmath-cot/toucan/tools
+    # all appear in the pretrain data), so it carries the cleanest chat signal.
+    Source(
+        key="ultrachat",
+        title="UltraChat 200k (general multi-turn chat)",
+        category="chat",
+        weight=0.0,  # SFT-only; excluded from the pretrain mixture
+        hf_repo="HuggingFaceH4/ultrachat_200k",
+        config=None,
+        split="train_sft",
+        file_prefix="data/train_sft-",
+        avail_tokens=0.256 * _B,  # measured: 255.7M tok (207.9k convs), 77.5% supervised
+        notes="General open-domain chat (no tools); anchors the chat-led SFT mix. MIT.",
+        kind="chat",
+        sft_weight=0.50,  # chat-dominant: general chat leads the SFT mix
         _sampler=_sample_toolcall,
     ),
 ]

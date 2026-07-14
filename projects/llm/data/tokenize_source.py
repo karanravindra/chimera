@@ -336,7 +336,9 @@ def main():
     def cap_for(src):
         if args.max_tokens is not None:
             return int(args.max_tokens)
-        return int(math.ceil(src.weight * args.budget))
+        # SFT uses sft_weight (chat-led composition); fall back to pretrain weight.
+        w = src.sft_weight if (args.sft and src.sft_weight is not None) else src.weight
+        return int(math.ceil(w * args.budget))
 
     if args.all:
         targets = [s for s in S.SOURCES if not s.deferred]

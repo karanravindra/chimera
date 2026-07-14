@@ -51,7 +51,10 @@ def available_sources(sft: bool) -> list[tuple[str, float, int]]:
             continue
         meta = json.loads(meta_p.read_text())
         if meta.get("n_tokens", 0) > 0:
-            out.append((src.key, src.weight, meta["n_tokens"]))
+            # SFT uses a distinct composition (chat-led): prefer sft_weight when
+            # set, else fall back to the pretrain weight.
+            w = src.sft_weight if (sft and src.sft_weight is not None) else src.weight
+            out.append((src.key, w, meta["n_tokens"]))
     return out
 
 
