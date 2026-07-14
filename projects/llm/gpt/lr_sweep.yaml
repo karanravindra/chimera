@@ -1,8 +1,8 @@
 # muP LR sweep — Bayesian search over the two LR groups (Muon + AdamW).
 #
 # muP lets us tune LR at a SMALL proxy width and transfer the optimum unchanged
-# to any width/DEPTH (Depth-muP is now implemented). Search on a ~5M-param proxy
-# (n_embd=128, depth=6, head_dim=32, GQA 4:1) over a short ~52M-token horizon.
+# to any width/DEPTH (Depth-muP is now implemented). Search on a ~9M-param proxy
+# (n_embd=128, depth=6, head_dim=32, GQA 4:1) over a ~200M-token horizon.
 #
 # IMPORTANT (hard-won, see the mup-gpt memory): rank with the COSINE schedule
 # annealed over the run horizon, NOT constant LR. A constant-LR short-horizon
@@ -14,12 +14,12 @@
 # Width+depth transfer is verified separately (coord-check grid run afterward).
 #
 # Run:  wandb sweep projects/llm/gpt/lr_sweep.yaml
-#       wandb agent <entity>/llm-lr-sweep/<id> --count 10
+#       wandb agent <entity>/llm-pretrain/<id> --count 10
 #
 # Param names use dashes + `command: ${args}` so they arrive as --muon-lr=… and
 # match argparse (avoids the wandb underscore/dash mismatch).
 program: projects/llm/gpt/train.py
-project: llm-lr-sweep
+project: llm-pretrain
 method: bayes
 name: mup-lr-sweep
 metric:
@@ -41,14 +41,13 @@ command:
   - --arch=128-4-1-6          # ~5M proxy: n_embd128/n_head4/n_kv1/n_layer6, head_dim32
   - --seq-len=512
   - --global-token-count=65536
-  - --max-steps=800           # ~52M tokens; cosine anneals over exactly this horizon
-  - --warmup-steps=80         # ~10% warmup
-  - --no-compile              # 5M proxy: eager is plenty, skips ~1min compile/run
+  - --max-steps=3000          # ~196.6M tokens (~200M); cosine anneals over this horizon
+  - --warmup-steps=200        # ~6.5% warmup
   - --mix=mix_1B
-  - --val-check-interval=400  # val at step 400 and 800 (fully annealed) -> ranking metric
+  - --val-check-interval=500  # last val lands at step 3000 (fully annealed) -> ranking metric
   - --limit-val-batches=100
-  - --print-every=100
-  - --wandb-project=llm-lr-sweep
+  - --print-every=250
+  - --wandb-project=llm-pretrain
   - --no-test
   - --no-eval
   - --tags=mup-lr-sweep,w128,bayes
