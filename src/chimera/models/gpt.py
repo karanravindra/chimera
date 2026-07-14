@@ -619,8 +619,16 @@ class TransformerBlock(nn.Module):
         moe_inter_dim: int | None = None,
         route_scale: float = 1.0,
         bias_update_speed: float = 0.001,
+        residual_mult: float = 1.0,
     ):
         super().__init__()
+        # Depth-muP: a persistent (non-learned) scale on each residual BRANCH,
+        # residual_mult = sqrt(mup_base_depth / n_layer). Unlike the GPT-2
+        # 1/sqrt(2L) *init*, this multiplier stays in the forward pass throughout
+        # training, so residual-stream magnitude stays ~O(1) across depth and the
+        # LR/init optimum transfers across n_layer (not just width). == 1.0 (no-op)
+        # when n_layer == mup_base_depth, so the depth-6 baseline is unchanged.
+        self.residual_mult = float(residual_mult)
         self.ln1 = nn.RMSNorm(dim, eps=1e-6)
         self.ln2 = nn.RMSNorm(dim, eps=1e-6)
 
@@ -686,10 +694,10 @@ class TransformerBlock(nn.Module):
         attn_out, present = self.attn(
             self.ln1(x), cos, sin, block_mask, past_kv, use_cache
         )
-        x = x + attn_out * self.scale1
+        x = x + attn_out * self.scale1 * self.residual_mult
 
         mlp_out = self.mlp(self.ln2(x))
-        x = x + mlp_out * self.scale2
+        x = x + mlp_out * self.scale2 * self.residual_mult
         return x, present
 
     def forward_attn_res(
@@ -714,10 +722,11 @@ class TransformerBlock(nn.Module):
         attn_out, present = self.attn(
             self.ln1(h), cos, sin, block_mask, past_kv, use_cache
         )
+        attn_out = attn_out * self.residual_mult  # Depth-muP branch scale
         partial = attn_out if partial is None else partial + attn_out
 
         h2 = block_attn_res(blocks, partial, self.mlp_res_proj, self.mlp_res_norm)
-        mlp_out = self.mlp(self.ln2(h2))
+        mlp_out = self.mlp(self.ln2(h2)) * self.residual_mult  # Depth-muP branch scale
         partial = partial + mlp_out
         return blocks, partial, present
 
@@ -741,6 +750,7 @@ class GPT(nn.Module):
         n_layer: int = 6,
         tie_embedding: bool = False,
         mup_base_width: int = 256,
+        mup_base_depth: int = 6,
         mup_base_std: float = 0.02,
         mup_input_mult: float = 1.0,
         mup_output_mult: float = 1.0,
@@ -769,6 +779,8 @@ class GPT(nn.Module):
             raise ValueError("vocab_size, block_size, and n_embd must all be >= 1")
         if mup_base_width < 1:
             raise ValueError(f"mup_base_width must be >= 1, got {mup_base_width}")
+        if mup_base_depth < 1:
+            raise ValueError(f"mup_base_depth must be >= 1, got {mup_base_depth}")
         if n_layer < 1:
             raise ValueError(f"n_layer must be >= 1, got {n_layer}")
         if n_head < 1 or n_kv_head < 1:
@@ -828,6 +840,15 @@ class GPT(nn.Module):
         # (whose update is spectrally normalized) and all AdamW params
         # (embedding/head/norms) have Theta(1) muP LR.
         self.mup_width_mult = n_embd / mup_base_width
+        # Depth-muP: persistent residual-branch scale = sqrt(base_depth / n_layer).
+        # Anchored so n_layer == mup_base_depth gives 1.0 (the depth-6 baseline is
+        # byte-for-byte unchanged). Combined with the base-depth-anchored residual
+        # init below, the residual-stream init variance matches the old GPT-2
+        # 1/sqrt(2L) scheme at every depth -- the ONLY change is that the depth
+        # factor now lives in the forward pass (so it persists through training),
+        # which is what makes the LR/init optimum transfer across depth.
+        self.mup_base_depth = mup_base_depth
+        self.residual_mult = math.sqrt(mup_base_depth / n_layer)
         self.mup_base_std = mup_base_std
         self.mup_input_mult = mup_input_mult
         # 1/m_d output scaling (multiplier form of the muP readout), applied at the
@@ -894,6 +915,7 @@ class GPT(nn.Module):
                     moe_inter_dim=moe_inter_dim,
                     route_scale=route_scale,
                     bias_update_speed=bias_update_speed,
+                    residual_mult=self.residual_mult,
                 )
                 for i in range(n_layer)
             ]
@@ -928,10 +950,13 @@ class GPT(nn.Module):
             if isinstance(block.mlp, DeepSeekMoE):
                 # Router logits should retain the same scale as width changes.
                 nn.init.normal_(block.mlp.gate.weight, mean=0.0, std=hidden_std)
-            # Scale residual-writing projections by 1/sqrt(2 * n_layer) so the
-            # residual stream variance stays bounded with depth (GPT-2), on top of
-            # the muP width scaling already baked into hidden_std.
-            residual_std = hidden_std / math.sqrt(2 * self.n_layer)
+            # Depth-muP residual init: anchored at mup_base_depth, not n_layer.
+            # The remaining depth factor sqrt(base_depth/n_layer) lives in the
+            # forward pass (block.residual_mult), so init variance here still
+            # matches the old GPT-2 1/sqrt(2*n_layer) scheme at every depth
+            # (residual_std * residual_mult == hidden_std/sqrt(2*n_layer)), while
+            # the persistent forward factor is what enables depth transfer.
+            residual_std = hidden_std / math.sqrt(2 * self.mup_base_depth)
             for p in block.attn.residual_params() + block.mlp.residual_params():
                 nn.init.normal_(p, mean=0.0, std=residual_std)
 
