@@ -48,7 +48,9 @@ command:
   - --limit-val-batches=100
   - --print-every=250
   - --wandb-project=llm-pretrain
-  - --no-test
-  - --no-eval
+  # test/loss + full lm-eval benchmark suite run at the end of every run (the
+  # built-in pipeline). Bayes still ranks on val/loss (metric above); at the 9M
+  # proxy benchmarks are near-chance, so they're logged for sanity, not ranking.
+  # The pretokenized eval cache is warm, so bench skips the ~18s tokenize step.
   - --tags=mup-lr-sweep,w128,bayes
   - ${args}
