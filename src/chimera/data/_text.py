@@ -3,9 +3,59 @@
 from pathlib import Path
 from typing import Iterable, Optional, Union
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
+
+
+class MemmapTokenDataset(Dataset):
+    """Like :class:`TokenDataset` but backed by an on-disk ``uint16`` memmap.
+
+    Pretraining mixtures are billions of tokens — too large to hold the token
+    stream in RAM as one tensor. This memory-maps a flat ``.bin`` of token ids
+    (written by the mixture builder) and yields the same non-overlapping
+    ``(input, target)`` next-token chunks, casting to ``int64`` per item.
+    """
+
+    def __init__(self, path: Union[str, Path], seq_len: int, dtype=np.uint16):
+        self.data = np.memmap(str(path), dtype=dtype, mode="r")
+        self.seq_len = seq_len
+
+    def __len__(self) -> int:
+        return max(0, (len(self.data) - 1) // self.seq_len)
+
+    def __getitem__(self, idx: int):
+        i = idx * self.seq_len
+        x = torch.from_numpy(self.data[i : i + self.seq_len].astype(np.int64))
+        y = torch.from_numpy(self.data[i + 1 : i + 1 + self.seq_len].astype(np.int64))
+        return x, y
+
+
+class MemmapMaskedTokenDataset(Dataset):
+    """Memmap SFT dataset: ``uint16`` ids + a parallel ``uint8`` supervise mask.
+
+    The mask marks the model's own output tokens (assistant content, tool calls,
+    the closing turn token). Targets where the mask is 0 — headers, user/system/
+    tool-result turns — are set to ``-100`` so the loss ignores them. Same
+    ``(x, y)`` contract as the other datasets, so training is unchanged.
+    """
+
+    def __init__(self, ids_path, mask_path, seq_len: int, dtype=np.uint16):
+        self.ids = np.memmap(str(ids_path), dtype=dtype, mode="r")
+        self.mask = np.memmap(str(mask_path), dtype=np.uint8, mode="r")
+        self.seq_len = seq_len
+
+    def __len__(self) -> int:
+        return max(0, (len(self.ids) - 1) // self.seq_len)
+
+    def __getitem__(self, idx: int):
+        i = idx * self.seq_len
+        x = torch.from_numpy(self.ids[i : i + self.seq_len].astype(np.int64))
+        nxt = self.ids[i + 1 : i + 1 + self.seq_len].astype(np.int64)
+        sup = self.mask[i + 1 : i + 1 + self.seq_len].astype(bool)
+        nxt[~sup] = -100  # ignore_index on non-supervised targets
+        return x, torch.from_numpy(nxt)
 
 
 class TokenDataset(Dataset):
@@ -27,6 +77,33 @@ class TokenDataset(Dataset):
         i = idx * self.seq_len
         x = self.data[i : i + self.seq_len].long()
         y = self.data[i + 1 : i + 1 + self.seq_len].long()
+        return x, y
+
+
+class MaskedTokenDataset(Dataset):
+    """Like :class:`TokenDataset` but with a parallel per-token label stream.
+
+    ``ids`` and ``labels`` are equal-length 1D tensors; ``labels`` carries the
+    supervision target for each position — the token id where the loss applies,
+    or ``-100`` (the CrossEntropy/CCE ``ignore_index``) where it doesn't (e.g.
+    prompt/user tokens during SFT). A chunk's input is ``ids[i : i+L]`` and its
+    target is ``labels`` shifted by one, so masking decisions made once at
+    tokenization time flow straight through the standard ``(x, y)`` batch shape.
+    """
+
+    def __init__(self, ids: torch.Tensor, labels: torch.Tensor, seq_len: int):
+        assert len(ids) == len(labels), "ids and labels must be parallel streams"
+        self.ids = ids
+        self.labels = labels
+        self.seq_len = seq_len
+
+    def __len__(self) -> int:
+        return max(0, (len(self.ids) - 1) // self.seq_len)
+
+    def __getitem__(self, idx: int):
+        i = idx * self.seq_len
+        x = self.ids[i : i + self.seq_len].long()
+        y = self.labels[i + 1 : i + 1 + self.seq_len].long()
         return x, y
 
 

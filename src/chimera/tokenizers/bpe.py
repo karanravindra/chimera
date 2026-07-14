@@ -74,22 +74,50 @@ class BPETokenizer:
 
     @classmethod
     def from_pretrained(cls, identifier: str, revision: str = "main"):
-        """Load a fixed, already-trained tokenizer from the Hugging Face Hub."""
+        """Load a fixed, already-trained tokenizer.
+
+        ``identifier`` may be a Hugging Face Hub id (e.g. ``LiquidAI/LFM2.5-230M``)
+        *or* a local path — either a ``tokenizer.json`` file or a directory
+        containing one (as written by our own :meth:`save` / the tokenizer
+        trainer). Local paths are tried first so a custom tokenizer drops into any
+        caller that already threads a ``pretrained_id`` string through.
+        """
         from tokenizers import Tokenizer
 
         self = cls(backend="pretrained")
-        self._tok = Tokenizer.from_pretrained(identifier, revision=revision)
+        p = Path(identifier)
+        if p.suffix == ".json" and p.is_file():
+            self._tok = Tokenizer.from_file(str(p))
+        elif p.is_dir() and (p / "tokenizer.json").is_file():
+            self._tok = Tokenizer.from_file(str(p / "tokenizer.json"))
+        else:
+            self._tok = Tokenizer.from_pretrained(identifier, revision=revision)
         return self
 
     # -- training ---------------------------------------------------------
 
-    def train(self, text: Union[str, Iterable[str]], vocab_size: int):
+    def train(
+        self,
+        text: Union[str, Iterable[str]],
+        vocab_size: int,
+        special_tokens: Optional[list[str]] = None,
+        min_frequency: int = 2,
+    ):
+        """Train a byte-level BPE.
+
+        ``text`` may be a single string or an iterable of strings (the ``hf``
+        backend streams the iterable, so it never has to materialize the whole
+        corpus). ``special_tokens`` are reserved atomic tokens (e.g. ChatML
+        markers) added to the vocabulary at fixed low ids; they are only honored
+        by the ``hf`` backend. ``min_frequency`` is the minimum pair count for a
+        merge (``hf`` only).
+        """
         if self.backend == "pretrained":
             return self  # a pretrained tokenizer is fixed; nothing to train
         if self.backend == "scratch":
             self._train_scratch(text, vocab_size)
         else:
-            self._train_hf(text, vocab_size)
+            self._train_hf(text, vocab_size, special_tokens, min_frequency)
         return self
 
     def _train_scratch(self, text: Union[str, Iterable[str]], vocab_size: int):
@@ -116,16 +144,26 @@ class BPETokenizer:
         self.merges = merges
         self.vocab = vocab
 
-    def _train_hf(self, text: Union[str, Iterable[str]], vocab_size: int):
+    def _train_hf(
+        self,
+        text: Union[str, Iterable[str]],
+        vocab_size: int,
+        special_tokens: Optional[list[str]] = None,
+        min_frequency: int = 2,
+    ):
         from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
+        specials = list(special_tokens or [])
         tok = Tokenizer(models.BPE(unk_token=None))
         tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
         tok.decoder = decoders.ByteLevel()
         trainer = trainers.BpeTrainer(
             vocab_size=vocab_size,
+            min_frequency=min_frequency,
             initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
-            special_tokens=[],
+            # listed first -> reserved at ids 0..len(specials)-1, before the byte
+            # alphabet and merges, so their ids are stable across retrains.
+            special_tokens=specials,
         )
         iterator = [text] if isinstance(text, str) else text
         tok.train_from_iterator(iterator, trainer=trainer)

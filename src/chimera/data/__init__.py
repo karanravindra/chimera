@@ -5,10 +5,12 @@ from .cifar100 import CIFAR100DataModule
 from .clevr import CLEVRVQADataModule
 from .fineweb_edu import FineWebEduDataModule
 from .imagenet1k import ImageNet1kDataModule
+from .mixture import MixtureDataModule
 from .mnist import MNISTDataModule
 from .mnist_latents import MNISTLatentDataModule
 from .text8 import Text8DataModule
 from .tinyshakespeare import TinyShakespeareDataModule
+from .ultrachat import UltraChatDataModule
 
 __all__ = [
     "AFHQDataModule",
@@ -18,8 +20,10 @@ __all__ = [
     "CelebAHQDataModule",
     "FineWebEduDataModule",
     "ImageNet1kDataModule",
+    "MixtureDataModule",
     "MNISTDataModule",
     "MNISTLatentDataModule",
     "Text8DataModule",
     "TinyShakespeareDataModule",
+    "UltraChatDataModule",
 ]

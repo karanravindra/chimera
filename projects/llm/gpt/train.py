@@ -31,18 +31,23 @@ import torch
 from lightning import Trainer, seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint
 
-from chimera.data import FineWebEduDataModule
+from chimera.data import MixtureDataModule
 from chimera.models import GPT
 from chimera.modules import LanguageModelModule
 from chimera.optim import LinearWarmupCosineAnnealingLR, Muon, muon_param_groups
-from chimera.utils import build_run_loggers
+from chimera.utils import TokenAxisCallback, build_run_loggers
 from bench import DEFAULT_TASKS, flatten_for_wandb, print_table, run_benchmarks
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data-dir", default="/mnt/ai/data")
-    p.add_argument("--run-dir", default="/mnt/ai/runs/fineweb-edu/gpt")
+    p.add_argument("--run-dir", default="/mnt/ai/runs/llm/gpt")
+    # which pre-packed mixture to train on (built by build_mixture.py)
+    p.add_argument("--mix", default="mix_1B", help="mixture name under llm-mix/mix/")
+    p.add_argument("--tokenizer", default="LiquidAI/LFM2.5-230M",
+                   help="tokenizer: HF hub id or local path (train_tokenizer.py output). "
+                        "Must match the one the mix was tokenized with.")
     p.add_argument("--epochs", type=int, default=1)
     # Effective tokens per optimizer step; the micro-batch size is derived as
     # global_token_count // seq_len (must divide evenly). Exposed instead of a
@@ -76,7 +81,7 @@ def parse_args():
     p.add_argument("--val-check-interval", type=int, default=500)
     p.add_argument("--limit-val-batches", type=int, default=250)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--wandb-project", default="fineweb-edu-gpt")
+    p.add_argument("--wandb-project", default="llm-gpt")
     # Explicit wandb run name; left unset, wandb assigns a random one. Useful to
     # tag a run with what makes it different from the rest (an ablation, a fix).
     p.add_argument("--run-name", default=None)
@@ -214,22 +219,23 @@ def main():
             "speedup."
         )
 
-    dm = FineWebEduDataModule(
+    dm = MixtureDataModule(
         data_dir=args.data_dir,
-        name="sample-10BT",
+        mix_name=args.mix,  # pre-packed mixture built by build_mixture.py
         batch_size=batch_size,
         seq_len=args.seq_len,
-        tokenizer_backend="pretrained",  # LiquidAI/LFM2.5-230M
-        add_eos=True,  # append <|endoftext|> after each document
-        max_train_tokens=args.max_train_tokens,
+        pretrained_id=args.tokenizer,
         num_workers=7,
     )
     dm.prepare_data()
     dm.setup("fit")
     train_loader = dm.train_dataloader()
     val_loader = dm.val_dataloader()
-    print(f"tokenizer={dm.pretrained_id}  vocab_size={dm.vocab_size}")
+    print(f"mixture={args.mix}  tokenizer={dm.pretrained_id}  vocab_size={dm.vocab_size}")
     print(f"eos_token={dm.eos_token!r}  eos_id={dm.eos_id}")
+    if dm.manifest:
+        srcs = ", ".join(f"{r['key']}:{r['renorm_weight']:.2f}" for r in dm.manifest["sources"])
+        print(f"mix sources -> {srcs}")
 
     model = GPT(
         vocab_size=dm.vocab_size,
@@ -324,7 +330,7 @@ def main():
         gradient_clip_val=1.0,
         deterministic=True,
         logger=loggers,
-        callbacks=[checkpoint],
+        callbacks=[checkpoint, TokenAxisCallback(args.global_token_count)],
     )
     # FineWebEduDataModule exposes only train/val loaders (no test split), so the
     # loaders are passed explicitly; validation reuses the val loader as in the

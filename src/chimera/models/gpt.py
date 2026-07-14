@@ -511,8 +511,21 @@ class TransformerBlock(nn.Module):
             self.attn_res_norm = nn.RMSNorm(dim)
             self.mlp_res_norm = nn.RMSNorm(dim)
         else:
-            self.scale1 = nn.Parameter(torch.ones(1, 1, dim))
-            self.scale2 = nn.Parameter(torch.ones(1, 1, dim))
+            # Per-channel residual-branch gains; shape (dim,) broadcasts over
+            # (B, T, dim) exactly like the earlier (1, 1, dim), but the
+            # degenerate leading dims made torch.compile's backward return a
+            # squeezed [1, dim] gradient at some widths (invalid-gradient
+            # RuntimeError, seen at n_embd=96). The pre-hook below reshapes
+            # legacy (1, 1, dim) checkpoint entries.
+            self.scale1 = nn.Parameter(torch.ones(dim))
+            self.scale2 = nn.Parameter(torch.ones(dim))
+            self._register_load_state_dict_pre_hook(self._reshape_legacy_scales)
+
+    def _reshape_legacy_scales(self, state_dict, prefix, *args):
+        for name in ("scale1", "scale2"):
+            key = prefix + name
+            if key in state_dict and state_dict[key].ndim == 3:
+                state_dict[key] = state_dict[key].reshape(-1)
 
     def forward(self, x, cos, sin, block_mask, past_kv=None):
         attn_out, present = self.attn(self.ln1(x), cos, sin, block_mask, past_kv)

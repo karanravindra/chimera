@@ -8,6 +8,8 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "accelerate>=1.14.0",
+    "boto3>=1.43.47",
     "cut-cross-entropy>=25.1.1",
     "datasets>=3.0.0",
     "ipykernel>=7.3.0",
@@ -18,7 +20,9 @@ dependencies = [
     "matplotlib>=3.11.0",
     "mup>=1.0.0",
     "ollama>=0.6.2",
+    "openai>=2.45.0",
     "pandas>=3.0.3",
+    "peft>=0.19.1",
     "tabulate>=0.10.0",
     "tokenizers>=0.20.0",
     "torch>=2.12.1",
@@ -27,6 +31,8 @@ dependencies = [
     "torchmetrics[image]>=1.9.0",
     "torchvision>=0.27.1",
     "tqdm>=4.66.0",
+    "transformers>=5.13.1",
+    "trl>=1.8.0",
     "wandb>=0.28.0",
 ]
 
