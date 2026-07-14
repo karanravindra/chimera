@@ -35,7 +35,7 @@ from chimera.data import MixtureDataModule
 from chimera.models import GPT
 from chimera.modules import LanguageModelModule
 from chimera.optim import LinearWarmupCosineAnnealingLR, Muon, muon_param_groups
-from chimera.utils import TokenAxisCallback, build_run_loggers
+from chimera.utils import ProgressPrinter, TokenAxisCallback, build_run_loggers
 from bench import DEFAULT_TASKS, flatten_for_wandb, print_table, run_benchmarks
 
 
@@ -80,6 +80,9 @@ def parse_args():
     # the large (1% of corpus) val split.
     p.add_argument("--val-check-interval", type=int, default=500)
     p.add_argument("--limit-val-batches", type=int, default=250)
+    # stdout progress cadence (throughput + metrics); per-stage timing is always on
+    p.add_argument("--print-every", type=int, default=500,
+                   help="print step/throughput/metrics every N steps (0 disables)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--wandb-project", default="llm-pretrain")
     # Explicit wandb run name; left unset, wandb assigns a random one. Useful to
@@ -361,7 +364,11 @@ def main():
         gradient_clip_val=1.0,
         deterministic=True,
         logger=loggers,
-        callbacks=[checkpoint, TokenAxisCallback(args.global_token_count)],
+        callbacks=[
+            checkpoint,
+            TokenAxisCallback(args.global_token_count),
+            ProgressPrinter(args.print_every, args.global_token_count),
+        ],
     )
     # FineWebEduDataModule exposes only train/val loaders (no test split), so the
     # loaders are passed explicitly; validation reuses the val loader as in the

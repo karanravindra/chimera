@@ -1,4 +1,4 @@
 from .device import get_device
-from .loggers import TokenAxisCallback, build_run_loggers
+from .loggers import ProgressPrinter, TokenAxisCallback, build_run_loggers
 
-__all__ = ["TokenAxisCallback", "build_run_loggers", "get_device"]
+__all__ = ["ProgressPrinter", "TokenAxisCallback", "build_run_loggers", "get_device"]
