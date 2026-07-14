@@ -1,0 +1,55 @@
+# muP LR sweep — Bayesian search over the two LR groups (Muon + AdamW).
+#
+# muP lets us tune LR at a SMALL proxy width and transfer the optimum unchanged
+# to any width/DEPTH (Depth-muP is now implemented). Search on a ~5M-param proxy
+# (n_embd=128, depth=6, head_dim=32, GQA 4:1) over a short ~52M-token horizon.
+#
+# IMPORTANT (hard-won, see the mup-gpt memory): rank with the COSINE schedule
+# annealed over the run horizon, NOT constant LR. A constant-LR short-horizon
+# sweep systematically OVER-picks hot LRs (they haven't diverged yet), because
+# the scheduler now anneals over min(epoch_len, max_steps) the final-step val/loss
+# is a faithful ranking signal. LR ranges are centered on the known basin
+# (prior optimum ~muon 0.01 / adamw 8e-3, basin muon 5e-3-2e-2 / adamw 8e-3-1.6e-2);
+# we re-tune because the mix, seq_len, and Depth-muP parametrization all changed.
+# Width+depth transfer is verified separately (coord-check grid run afterward).
+#
+# Run:  wandb sweep projects/llm/gpt/lr_sweep.yaml
+#       wandb agent <entity>/llm-lr-sweep/<id> --count 10
+#
+# Param names use dashes + `command: ${args}` so they arrive as --muon-lr=… and
+# match argparse (avoids the wandb underscore/dash mismatch).
+program: projects/llm/gpt/train.py
+project: llm-lr-sweep
+method: bayes
+name: mup-lr-sweep
+metric:
+  name: val/loss
+  goal: minimize
+parameters:
+  muon-lr:
+    distribution: log_uniform_values
+    min: 0.003          # brackets the known basin (5e-3-2e-2), 3x below to 3x above
+    max: 0.03
+  adamw-lr:
+    distribution: log_uniform_values
+    min: 0.002          # brackets 8e-3-1.6e-2 basin (and the baseline's 4e-3)
+    max: 0.02
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --arch=128-4-1-6          # ~5M proxy: n_embd128/n_head4/n_kv1/n_layer6, head_dim32
+  - --seq-len=512
+  - --global-token-count=65536
+  - --max-steps=800           # ~52M tokens; cosine anneals over exactly this horizon
+  - --warmup-steps=80         # ~10% warmup
+  - --no-compile              # 5M proxy: eager is plenty, skips ~1min compile/run
+  - --mix=mix_1B
+  - --val-check-interval=400  # val at step 400 and 800 (fully annealed) -> ranking metric
+  - --limit-val-batches=100
+  - --print-every=100
+  - --wandb-project=llm-lr-sweep
+  - --no-test
+  - --no-eval
+  - --tags=mup-lr-sweep,w128,bayes
+  - ${args}
