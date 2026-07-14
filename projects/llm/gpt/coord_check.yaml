@@ -42,7 +42,7 @@ parameters:
       - 64-2-1-12
 command:
   - ${env}
-  - python
+  - /root/Code/chimera/.venv/bin/python   # absolute — agent subprocess PATH lacks the venv
   - ${program}
   - --muon-lr=0.013           # FIXED swept optimum — the whole point is it transfers
   - --adamw-lr=0.006
