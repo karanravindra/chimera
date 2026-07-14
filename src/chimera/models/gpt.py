@@ -1,12 +1,24 @@
 import math
+import os
+from contextlib import contextmanager, nullcontext
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
 from chimera.models.rope import RotaryEmbedding, apply_rotary
+
+# Cut Cross Entropy (the training loss for this model, used lazily by
+# LanguageModelModule) ships hardcoded Triton block configs tuned on Apple's
+# dev hardware; letting Triton autotune instead is ~15% faster on both CCE
+# kernels (~8% whole train step, measured in projects/llm/gpt/mfu_bench.py).
+# The flag is read when cut_cross_entropy is first imported, so defaulting it
+# here -- at model import, which always precedes the loss -- covers every
+# consumer of this model without each script having to remember it.
+os.environ.setdefault("CCE_AUTOTUNE", "1")
 
 # flex_attention is ~75-80x slower than SDPA when run eagerly (it materializes
 # the full score matrix instead of a fused kernel) -- it MUST run compiled.
@@ -58,6 +70,11 @@ def build_block_mask(
     the prefill mask across steps (T is constant for a whole training run) and
     only rebuild for decode, where KV_LEN changes every step anyway.
     """
+    if window is not None and window < 1:
+        raise ValueError(f"window must be >= 1, got {window}")
+    if n_global < 0:
+        raise ValueError(f"n_global must be >= 0, got {n_global}")
+
     if window is not None:
         mask_mod = _make_sparse_mask_mod(past_len, window, n_global)
     elif past_len == 0:
@@ -95,7 +112,13 @@ class MLP(nn.Module):
 class GroupedQueryAttention(nn.Module):
     """Causal attention with grouped-query heads, RoPE, QK-norm, and an optional KV cache."""
 
-    def __init__(self, dim: int, n_head: int, n_kv_head: int):
+    def __init__(
+        self,
+        dim: int,
+        n_head: int,
+        n_kv_head: int,
+        attn_scale: float | None = None,
+    ):
         super().__init__()
         assert dim % n_head == 0, "dim must be divisible by n_head"
         assert n_head % n_kv_head == 0, "n_head must be divisible by n_kv_head"
@@ -103,6 +126,7 @@ class GroupedQueryAttention(nn.Module):
         self.n_head = n_head
         self.n_kv_head = n_kv_head
         self.head_dim = dim // n_head
+        self.attn_scale = attn_scale
 
         # Q keeps n_head heads; K and V share only n_kv_head heads (the GQA fix).
         self.q_proj = nn.Linear(dim, n_head * self.head_dim, bias=False)
@@ -110,8 +134,8 @@ class GroupedQueryAttention(nn.Module):
         self.proj = nn.Linear(dim, dim, bias=False)
 
         # QK-norm: per-head RMSNorm over the head dimension before attention.
-        self.q_norm = nn.RMSNorm(self.head_dim)
-        self.k_norm = nn.RMSNorm(self.head_dim)
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
 
     def hidden_params(self):
         return [self.q_proj.weight, self.kv_proj.weight, self.proj.weight]
@@ -123,7 +147,7 @@ class GroupedQueryAttention(nn.Module):
     def cached_len(past_kv) -> int:
         return past_kv[0].size(2)
 
-    def forward(self, x, cos, sin, block_mask, past_kv=None):
+    def forward(self, x, cos, sin, block_mask, past_kv=None, use_cache: bool = True):
         B, T, _ = x.shape
 
         q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
@@ -139,10 +163,15 @@ class GroupedQueryAttention(nn.Module):
         k = apply_rotary(self.k_norm(k), cos, sin)
 
         if past_kv is not None:
+            if block_mask is None:
+                raise ValueError(
+                    "Cached attention requires an offset-aware block_mask; "
+                    "SDPA is_causal=True uses the wrong alignment for Q_LEN < KV_LEN."
+                )
             past_k, past_v = past_kv
             k = torch.cat([past_k, k], dim=2)
             v = torch.cat([past_v, v], dim=2)
-        present = (k, v)
+        present = (k, v) if use_cache else None
 
         # block_mask is built once per GPT._forward call (prefill: cached
         # across steps since T is constant for a whole run; decode: fresh
@@ -151,17 +180,40 @@ class GroupedQueryAttention(nn.Module):
         # to SDPA's fused FlashAttention/cuDNN kernels, which beat flex's
         # Triton templates at small head_dim. flex handles everything else
         # (decode's offset mask, future custom/sparse masks).
+        # SDPA's native GQA support is backend-limited. Expanding K/V on
+        # non-CUDA devices provides a portable math-kernel fallback.
+        enable_gqa = self.n_head != self.n_kv_head
+        if enable_gqa and q.device.type != "cuda":
+            groups = self.n_head // self.n_kv_head
+            k = k.repeat_interleave(groups, dim=1)
+            v = v.repeat_interleave(groups, dim=1)
+            enable_gqa = False
+
         if block_mask is None:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=True,
+                enable_gqa=enable_gqa,
+                scale=self.attn_scale,
+            )
         else:
-            out = _flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
+            out = _flex_attention(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                enable_gqa=enable_gqa,
+                scale=self.attn_scale,
+            )
 
         out = out.transpose(1, 2).reshape(B, T, self.n_head * self.head_dim)
         return self.proj(out), present
 
 
 class MultiHeadLatentAttention(nn.Module):
-    """DeepSeek-V3 Multi-head Latent Attention.
+    """DeepSeek-style Multi-head Latent Attention.
 
     Compresses K/V (and optionally Q) into a low-rank latent per token instead
     of full per-head projections, shrinking the KV cache to
@@ -198,13 +250,13 @@ class MultiHeadLatentAttention(nn.Module):
 
         # Packed: c_kv (the compressed KV latent) + the single shared rope-key.
         self.w_dkv = nn.Linear(dim, kv_lora_rank + qk_rope_head_dim, bias=False)
-        self.ckv_norm = nn.RMSNorm(kv_lora_rank)
+        self.ckv_norm = nn.RMSNorm(kv_lora_rank, eps=1e-6)
         self.w_uk = nn.Linear(kv_lora_rank, n_head * qk_nope_head_dim, bias=False)
         self.w_uv = nn.Linear(kv_lora_rank, n_head * v_head_dim, bias=False)
 
         if q_lora_rank > 0:
             self.w_dq = nn.Linear(dim, q_lora_rank, bias=False)
-            self.cq_norm = nn.RMSNorm(q_lora_rank)
+            self.cq_norm = nn.RMSNorm(q_lora_rank, eps=1e-6)
             self.w_uq = nn.Linear(q_lora_rank, n_head * self.qk_head_dim, bias=False)
             self.q_proj = None
         else:
@@ -232,7 +284,7 @@ class MultiHeadLatentAttention(nn.Module):
         # c_kv: (B, T, kv_lora_rank) -- T is dim 1 (no head axis, unlike GQA's k/v).
         return past_kv[0].size(1)
 
-    def forward(self, x, cos, sin, block_mask, past_kv=None):
+    def forward(self, x, cos, sin, block_mask, past_kv=None, use_cache: bool = True):
         B, T, _ = x.shape
 
         if self.w_dq is not None:
@@ -250,25 +302,32 @@ class MultiHeadLatentAttention(nn.Module):
         c_kv, k_rope = ckv_krope.split(
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
+        # Cache the normalized latent. RMSNorm is token-local, so this is
+        # exactly equivalent to normalizing the concatenated cache every step
+        # and avoids repeatedly normalizing the entire prefix during decode.
+        c_kv = self.ckv_norm(c_kv)
         k_rope = k_rope.unsqueeze(1)  # (B, 1, T, qk_rope_head_dim): shared across heads
         k_rope = apply_rotary(k_rope, cos, sin)
 
         if past_kv is not None:
+            if block_mask is None:
+                raise ValueError(
+                    "Cached attention requires an offset-aware block_mask; "
+                    "SDPA is_causal=True uses the wrong alignment for Q_LEN < KV_LEN."
+                )
             past_c_kv, past_k_rope = past_kv
             c_kv = torch.cat([past_c_kv, c_kv], dim=1)
             k_rope = torch.cat([past_k_rope, k_rope], dim=2)
-        present = (c_kv, k_rope)
+        present = (c_kv, k_rope) if use_cache else None
 
-        # RMSNorm normalizes per-token (over the feature dim), so re-running it
-        # on the full cached sequence each step is equivalent to normalizing
-        # and caching each token once -- simpler, at the cost of some redundant
-        # compute during decode.
-        c_kv_normed = self.ckv_norm(c_kv)
-        Tk = c_kv_normed.size(1)
+        # This is the straightforward MLA path: compressed cache storage is
+        # retained, but K/V up-projections are not algebraically absorbed as in
+        # DeepSeek's optimized inference kernel.
+        Tk = c_kv.size(1)
         k_nope = (
-            self.w_uk(c_kv_normed).view(B, Tk, self.n_head, self.qk_nope_head_dim).transpose(1, 2)
+            self.w_uk(c_kv).view(B, Tk, self.n_head, self.qk_nope_head_dim).transpose(1, 2)
         )
-        v = self.w_uv(c_kv_normed).view(B, Tk, self.n_head, self.v_head_dim).transpose(1, 2)
+        v = self.w_uv(c_kv).view(B, Tk, self.n_head, self.v_head_dim).transpose(1, 2)
         k = torch.cat([k_nope, k_rope.expand(-1, self.n_head, -1, -1)], dim=-1)
 
         # See GroupedQueryAttention: block_mask=None means pure causal -> SDPA.
@@ -295,19 +354,19 @@ class SwiGLUExpert(nn.Module):
 
 
 class Gate(nn.Module):
-    """DeepSeek-V3 aux-loss-free router.
+    """DeepSeek-V3-style aux-loss-free router.
 
     Sigmoid affinity scores (not softmax) against learnable per-expert
     centroids. A per-expert bias is added to the scores for top-k *selection*
     only; the combining weight is the raw (bias-free) score of the selected
     experts, renormalized among the top-k. The bias is a plain buffer nudged
-    by a fixed step each training forward based on observed load -- this
-    entirely replaces a gradient-based load-balancing auxiliary loss.
+    by a fixed step after each optimizer step based on accumulated load.
 
-    Note: under ``gradient_checkpointing=True`` a block's forward (hence this
-    gate) runs twice per optimizer step (recompute in backward), which would
-    double-apply the bias update. Not guarded against here -- halve
-    ``bias_update_speed`` or avoid combining the two flags until fixed.
+    Forward accumulates expert-load statistics but does not mutate the routing
+    bias. Call ``GPT.update_moe_bias()`` exactly once after each optimizer step;
+    this correctly combines gradient-accumulation microbatches and optionally
+    synchronizes counts across distributed ranks. Checkpoint recomputation is
+    explicitly prevented from collecting the same assignments twice.
     """
 
     def __init__(
@@ -325,6 +384,49 @@ class Gate(nn.Module):
         self.bias_update_speed = bias_update_speed
         self.weight = nn.Parameter(torch.empty(n_routed_experts, dim))
         self.register_buffer("bias", torch.zeros(n_routed_experts))
+        # Keep transient statistics out of registered buffers: DDP broadcasts
+        # buffers from rank 0 before each forward by default, which would
+        # corrupt rank-local counts before the explicit all-reduce at update.
+        self.pending_counts = torch.zeros(n_routed_experts)
+        self._collect_stats = True
+
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse=recurse)
+        moved_counts = fn(self.pending_counts)
+        # These are transient statistics, so reset them on device/dtype
+        # materialization and always retain FP32 count precision. Keep the
+        # routing bias FP32 as in the DeepSeek reference as well.
+        self.pending_counts = torch.zeros_like(moved_counts, dtype=torch.float32)
+        self.bias = self.bias.float()
+        return self
+
+    @contextmanager
+    def disable_stats(self):
+        """Temporarily suppress load-stat collection during checkpoint replay."""
+        previous = self._collect_stats
+        self._collect_stats = False
+        try:
+            yield
+        finally:
+            self._collect_stats = previous
+
+    @torch.no_grad()
+    def update_bias(self, sync_distributed: bool = True) -> bool:
+        """Apply one load-balancing update from all accumulated microbatches."""
+        counts = self.pending_counts.clone()
+        self.pending_counts.zero_()
+        if sync_distributed and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        if counts.sum().item() == 0:
+            return False
+        self.bias.add_(
+            self.bias_update_speed * torch.sign(counts.mean() - counts)
+        )
+        return True
+
+    @torch.no_grad()
+    def reset_pending_counts(self):
+        self.pending_counts.zero_()
 
     def forward(self, x):
         # x: (N, dim) flattened tokens
@@ -334,12 +436,12 @@ class Gate(nn.Module):
         weights = topk_scores / topk_scores.sum(dim=-1, keepdim=True)
         weights = (weights * self.route_scale).to(x.dtype)
 
-        if self.training:
+        if self.training and self._collect_stats:
             with torch.no_grad():
                 counts = torch.bincount(
                     topk_idx.flatten(), minlength=self.n_routed_experts
                 ).float()
-                self.bias += self.bias_update_speed * torch.sign(counts.mean() - counts)
+                self.pending_counts.add_(counts)
 
         return weights, topk_idx
 
@@ -350,10 +452,10 @@ class DeepSeekMoE(nn.Module):
     ``y = shared(x) + sum_{i in topk} weight_i * expert_i(x)``.
 
     Routed-expert compute uses ``torch.nn.functional.grouped_mm`` (batched GEMM
-    over jagged per-expert token counts) when running on CUDA with bf16
-    activations; otherwise falls back to an eager masked loop over experts
-    (used for CPU smoke tests and as a numerical reference for the grouped_mm
-    path).
+    over jagged per-expert token counts) on supported CUDA devices, preserving
+    explicit FP32 execution or using the active autocast dtype. Other devices
+    fall back to an eager masked loop over experts, which also serves as a
+    numerical reference path.
     """
 
     def __init__(
@@ -380,21 +482,38 @@ class DeepSeekMoE(nn.Module):
         # Packed gate+up projection per expert, and down projection per expert.
         self.experts_w1 = nn.Parameter(torch.empty(n_routed_experts, 2 * moe_inter_dim, dim))
         self.experts_w2 = nn.Parameter(torch.empty(n_routed_experts, dim, moe_inter_dim))
+        # Keep standalone DeepSeekMoE construction safe. GPT._init_weights will
+        # reinitialize these using its configured muP/depth-aware scales.
+        nn.init.normal_(self.experts_w1, mean=0.0, std=0.02)
+        nn.init.normal_(self.experts_w2, mean=0.0, std=0.02)
 
         self.shared_experts = SwiGLUExpert(dim, n_shared_experts * moe_inter_dim)
 
     def hidden_params(self):
-        return [self.experts_w1, self.experts_w2, self.shared_experts.w1.weight, self.shared_experts.w2.weight]
+        return [
+            self.experts_w1,
+            self.experts_w2,
+            self.shared_experts.w1.weight,
+            self.shared_experts.w2.weight,
+        ]
 
     def residual_params(self):
         return [self.experts_w2, self.shared_experts.w2.weight]
 
     def _grouped_mm_available(self, x) -> bool:
-        # grouped_mm needs CUDA + bf16 operands. Check device only, not x's
-        # incoming dtype, since under torch.autocast(dtype=bf16) tensors
-        # crossing op boundaries are often still fp32-typed even though
-        # compute happens in bf16 -- explicitly cast to bf16 below instead.
-        return x.is_cuda
+        if not x.is_cuda or not hasattr(F, "grouped_mm"):
+            return False
+        compute_dtype = self._grouped_mm_dtype(x)
+        if compute_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            return False
+        major, _ = torch.cuda.get_device_capability(x.device)
+        return major >= 8
+
+    @staticmethod
+    def _grouped_mm_dtype(x):
+        if torch.is_autocast_enabled():
+            return torch.get_autocast_gpu_dtype()
+        return x.dtype
 
     def forward(self, x):
         B, T, D = x.shape
@@ -416,15 +535,15 @@ class DeepSeekMoE(nn.Module):
         x_sorted = x_flat[sorted_token_idx]
 
         if self._grouped_mm_available(x):
-            # grouped_mm requires bf16 operands; cast explicitly rather than
-            # storing bf16 Parameters, since muP init/Muon updates want
-            # full-precision master weights.
-            x_sorted_bf16 = x_sorted.to(torch.bfloat16)
-            w1 = self.experts_w1.transpose(-2, -1).to(torch.bfloat16)
-            w2 = self.experts_w2.transpose(-2, -1).to(torch.bfloat16)
+            # Keep full-precision master parameters, but respect explicit FP32
+            # execution and the active autocast dtype instead of forcing BF16.
+            compute_dtype = self._grouped_mm_dtype(x)
+            x_grouped = x_sorted.to(compute_dtype)
+            w1 = self.experts_w1.transpose(-2, -1).to(compute_dtype)
+            w2 = self.experts_w2.transpose(-2, -1).to(compute_dtype)
             counts = torch.bincount(sorted_expert_ids, minlength=self.n_routed_experts)
             offs = counts.cumsum(0).to(torch.int32)
-            gu = F.grouped_mm(x_sorted_bf16, w1, offs=offs)
+            gu = F.grouped_mm(x_grouped, w1, offs=offs)
             gate_h, up_h = gu.chunk(2, dim=-1)
             h = F.silu(gate_h) * up_h
             out_sorted = F.grouped_mm(h, w2, offs=offs).to(x.dtype)
@@ -483,6 +602,7 @@ class TransformerBlock(nn.Module):
         n_head: int,
         n_kv_head: int,
         mlp_hidden_dim: int,
+        attn_scale: float | None = None,
         use_attn_res: bool = False,
         layer_number: int | None = None,
         layers_per_block: int | None = None,
@@ -501,8 +621,8 @@ class TransformerBlock(nn.Module):
         bias_update_speed: float = 0.001,
     ):
         super().__init__()
-        self.ln1 = nn.RMSNorm(dim)
-        self.ln2 = nn.RMSNorm(dim)
+        self.ln1 = nn.RMSNorm(dim, eps=1e-6)
+        self.ln2 = nn.RMSNorm(dim, eps=1e-6)
 
         if use_mla:
             self.attn = MultiHeadLatentAttention(
@@ -515,7 +635,9 @@ class TransformerBlock(nn.Module):
                 v_head_dim=v_head_dim,
             )
         else:
-            self.attn = GroupedQueryAttention(dim, n_head, n_kv_head)
+            self.attn = GroupedQueryAttention(
+                dim, n_head, n_kv_head, attn_scale=attn_scale
+            )
 
         if use_moe:
             self.mlp = DeepSeekMoE(
@@ -539,8 +661,8 @@ class TransformerBlock(nn.Module):
             # gate; zero-init -> uniform softmax at init (== plain averaging).
             self.attn_res_proj = nn.Parameter(torch.zeros(dim))
             self.mlp_res_proj = nn.Parameter(torch.zeros(dim))
-            self.attn_res_norm = nn.RMSNorm(dim)
-            self.mlp_res_norm = nn.RMSNorm(dim)
+            self.attn_res_norm = nn.RMSNorm(dim, eps=1e-6)
+            self.mlp_res_norm = nn.RMSNorm(dim, eps=1e-6)
         else:
             # Per-channel residual-branch gains; shape (dim,) broadcasts over
             # (B, T, dim) exactly like the earlier (1, 1, dim), but the
@@ -558,15 +680,28 @@ class TransformerBlock(nn.Module):
             if key in state_dict and state_dict[key].ndim == 3:
                 state_dict[key] = state_dict[key].reshape(-1)
 
-    def forward(self, x, cos, sin, block_mask, past_kv=None):
-        attn_out, present = self.attn(self.ln1(x), cos, sin, block_mask, past_kv)
+    def forward(
+        self, x, cos, sin, block_mask, past_kv=None, use_cache: bool = True
+    ):
+        attn_out, present = self.attn(
+            self.ln1(x), cos, sin, block_mask, past_kv, use_cache
+        )
         x = x + attn_out * self.scale1
 
         mlp_out = self.mlp(self.ln2(x))
         x = x + mlp_out * self.scale2
         return x, present
 
-    def forward_attn_res(self, blocks, partial, cos, sin, block_mask, past_kv=None):
+    def forward_attn_res(
+        self,
+        blocks,
+        partial,
+        cos,
+        sin,
+        block_mask,
+        past_kv=None,
+        use_cache: bool = True,
+    ):
         """Attention-Residuals forward: threads (blocks, partial) instead of x.
 
         ``blocks`` accumulates immutably (a new tuple each call) so this
@@ -576,7 +711,9 @@ class TransformerBlock(nn.Module):
         if self.layer_number % self.layers_per_block == 0:
             blocks = blocks + (partial,)
             partial = None
-        attn_out, present = self.attn(self.ln1(h), cos, sin, block_mask, past_kv)
+        attn_out, present = self.attn(
+            self.ln1(h), cos, sin, block_mask, past_kv, use_cache
+        )
         partial = attn_out if partial is None else partial + attn_out
 
         h2 = block_attn_res(blocks, partial, self.mlp_res_proj, self.mlp_res_norm)
@@ -588,9 +725,9 @@ class TransformerBlock(nn.Module):
 class GPT(nn.Module):
     """A decoder-only Transformer (GPT-style) for character-level language modeling.
 
-    Uses grouped-query attention (or, with ``use_mla``, DeepSeek-V3 Multi-head
+    Uses grouped-query attention (or, with ``use_mla``, DeepSeek-style Multi-head
     Latent Attention) and rotary position embeddings, plus a KV cache during
-    generation. The FFN is a dense MLP by default, or DeepSeek MoE (aux-loss-
+    generation. The FFN is a dense MLP by default, or DeepSeek-style MoE (aux-loss-
     free, fine-grained routed experts + shared expert(s)) with ``use_moe``.
     """
 
@@ -628,6 +765,36 @@ class GPT(nn.Module):
         bias_update_speed: float = 0.001,
     ):
         super().__init__()
+        if vocab_size < 1 or block_size < 1 or n_embd < 1:
+            raise ValueError("vocab_size, block_size, and n_embd must all be >= 1")
+        if mup_base_width < 1:
+            raise ValueError(f"mup_base_width must be >= 1, got {mup_base_width}")
+        if n_layer < 1:
+            raise ValueError(f"n_layer must be >= 1, got {n_layer}")
+        if n_head < 1 or n_kv_head < 1:
+            raise ValueError("n_head and n_kv_head must both be >= 1")
+        if n_embd % n_head != 0:
+            raise ValueError(
+                f"n_embd ({n_embd}) must be divisible by n_head ({n_head})"
+            )
+        if n_head % n_kv_head != 0:
+            raise ValueError(
+                f"n_head ({n_head}) must be divisible by n_kv_head ({n_kv_head})"
+            )
+        if attn_window is not None and attn_window < 1:
+            raise ValueError(f"attn_window must be >= 1, got {attn_window}")
+        if attn_global_tokens < 0:
+            raise ValueError(
+                f"attn_global_tokens must be >= 0, got {attn_global_tokens}"
+            )
+        if use_attn_res and attn_res_n_blocks < 1:
+            raise ValueError(
+                f"attn_res_n_blocks must be >= 1, got {attn_res_n_blocks}"
+            )
+        if use_moe and not (1 <= n_activated_experts <= n_routed_experts):
+            raise ValueError(
+                "n_activated_experts must be between 1 and n_routed_experts"
+            )
         self.block_size = block_size
         self.n_layer = n_layer
         # Recompute each block's activations in the backward pass instead of
@@ -667,6 +834,17 @@ class GPT(nn.Module):
         # logit projection instead of scaling the (tied) head's learning rate.
         self.output_mult = mup_output_mult / self.mup_width_mult
 
+        # Canonical muP attention scaling, backward-compatible with standard
+        # 1/sqrt(head_dim) scaling at the configured base width:
+        # sqrt(base_head_dim) / head_dim. MLA's QK width is configured
+        # independently of model width, so its standard scaling is unchanged.
+        if use_mla:
+            attn_scale = None
+        else:
+            head_dim = n_embd // n_head
+            base_head_dim = mup_base_width / n_head
+            attn_scale = math.sqrt(base_head_dim) / head_dim
+
         self.tok_emb = nn.Embedding(vocab_size, n_embd)
         # MLA's RoPE only covers the small decoupled qk_rope_head_dim slice,
         # not the full per-head dim GQA uses.
@@ -685,6 +863,10 @@ class GPT(nn.Module):
                     f"Full AttnRes."
                 )
             layers_per_block = n_layer // attn_res_n_blocks
+            # The paper requires the output layer to aggregate all completed
+            # blocks plus the final partial block with its own pseudo-query.
+            self.attn_res_output_proj = nn.Parameter(torch.zeros(n_embd))
+            self.attn_res_output_norm = nn.RMSNorm(n_embd, eps=1e-6)
         else:
             layers_per_block = None
 
@@ -695,6 +877,7 @@ class GPT(nn.Module):
                     n_head=n_head,
                     n_kv_head=n_kv_head,
                     mlp_hidden_dim=4 * n_embd,
+                    attn_scale=attn_scale,
                     use_attn_res=use_attn_res,
                     layer_number=i if use_attn_res else None,
                     layers_per_block=layers_per_block,
@@ -715,11 +898,10 @@ class GPT(nn.Module):
                 for i in range(n_layer)
             ]
         )
-        self.ln_f = nn.RMSNorm(n_embd)
+        self.ln_f = nn.RMSNorm(n_embd, eps=1e-6)
 
         if not tie_embedding:
             self.head = nn.Linear(n_embd, vocab_size, bias=False)
-            self.head.weight = self.tok_emb.weight
 
         self._init_weights()
 
@@ -731,9 +913,9 @@ class GPT(nn.Module):
         # starting the loss far above ln(vocab) instead of at it.
         hidden_std = self.mup_base_std / math.sqrt(self.mup_width_mult)
 
-        # Embedding (input layer): constant std, no width scaling. This tensor is
-        # shared with the tied output head, so it also sets the readout scale —
-        # the muP output behavior comes from self.output_mult (the 1/m_d factor).
+        # Embedding (input layer): constant std, no width scaling. When the
+        # readout is tied, the muP output behavior comes from self.output_mult
+        # (the 1/m_d factor).
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.mup_base_std)
 
         # Architecture-agnostic: GQA/MLA and dense-MLP/DeepSeekMoE each expose
@@ -743,6 +925,9 @@ class GPT(nn.Module):
         for block in self.blocks:
             for p in block.attn.hidden_params() + block.mlp.hidden_params():
                 nn.init.normal_(p, mean=0.0, std=hidden_std)
+            if isinstance(block.mlp, DeepSeekMoE):
+                # Router logits should retain the same scale as width changes.
+                nn.init.normal_(block.mlp.gate.weight, mean=0.0, std=hidden_std)
             # Scale residual-writing projections by 1/sqrt(2 * n_layer) so the
             # residual stream variance stays bounded with depth (GPT-2), on top of
             # the muP width scaling already baked into hidden_std.
@@ -753,13 +938,42 @@ class GPT(nn.Module):
             if block.use_attn_res:
                 nn.init.zeros_(block.attn_res_proj)
                 nn.init.zeros_(block.mlp_res_proj)
-                # attn_res_norm / mlp_res_norm keep RMSNorm's default ones-init gain.
+                # AttnRes RMSNorm gains keep their default ones initialization.
 
-        # If a genuinely untied head ever exists, initialize it at readout scale.
-        # (Currently the head is always tied to tok_emb, so this is a no-op.)
+        # Initialize a genuinely untied head at readout scale.
         head = getattr(self, "head", None)
         if head is not None and head.weight is not self.tok_emb.weight:
             nn.init.normal_(head.weight, mean=0.0, std=self.mup_base_std)
+
+    def _checkpoint_kwargs(self, block: TransformerBlock) -> dict:
+        kwargs = {"use_reentrant": False}
+        if isinstance(block.mlp, DeepSeekMoE):
+            gate = block.mlp.gate
+            kwargs["context_fn"] = lambda: (nullcontext(), gate.disable_stats())
+        return kwargs
+
+    @torch.no_grad()
+    def update_moe_bias(self, sync_distributed: bool = True) -> int:
+        """Update all MoE routing biases once after an optimizer step.
+
+        Gate forwards accumulate assignment counts across gradient-accumulation
+        microbatches. With ``sync_distributed=True``, counts are summed across
+        ranks before every replica applies the same update.
+
+        Returns the number of gates that had observations and were updated.
+        """
+        updated = 0
+        for block in self.blocks:
+            if isinstance(block.mlp, DeepSeekMoE):
+                updated += int(block.mlp.gate.update_bias(sync_distributed))
+        return updated
+
+    @torch.no_grad()
+    def reset_moe_bias_statistics(self):
+        """Discard accumulated router counts without changing routing bias."""
+        for block in self.blocks:
+            if isinstance(block.mlp, DeepSeekMoE):
+                block.mlp.gate.reset_pending_counts()
 
     @torch._dynamo.disable
     def _get_block_mask(self, B: int, T: int, past_len: int, device) -> BlockMask:
@@ -793,8 +1007,10 @@ class GPT(nn.Module):
             B, T, past_len, device, self.attn_window, self.attn_global_tokens
         )
 
-    def _forward(self, idx, past_kvs=None):
+    def _forward(self, idx, past_kvs=None, use_cache: bool = True):
         B, T = idx.shape
+        if past_kvs is not None and not use_cache:
+            raise ValueError("past_kvs requires use_cache=True")
         if past_kvs is None:
             past_len = 0
             past_kvs = [None] * len(self.blocks)
@@ -821,27 +1037,48 @@ class GPT(nn.Module):
             for block, past in zip(self.blocks, past_kvs):
                 if use_ckpt:
                     blocks, partial, present = checkpoint.checkpoint(
-                        block.forward_attn_res, blocks, partial, cos, sin, block_mask, past,
-                        use_reentrant=False,
+                        block.forward_attn_res,
+                        blocks,
+                        partial,
+                        cos,
+                        sin,
+                        block_mask,
+                        past,
+                        use_cache,
+                        **self._checkpoint_kwargs(block),
                     )
                 else:
                     blocks, partial, present = block.forward_attn_res(
-                        blocks, partial, cos, sin, block_mask, past
+                        blocks, partial, cos, sin, block_mask, past, use_cache
                     )
-                presents.append(present)
-            x = partial
+                if use_cache:
+                    presents.append(present)
+            x = block_attn_res(
+                blocks,
+                partial,
+                self.attn_res_output_proj,
+                self.attn_res_output_norm,
+            )
         else:
             for block, past in zip(self.blocks, past_kvs):
                 if use_ckpt:
                     x, present = checkpoint.checkpoint(
-                        block, x, cos, sin, block_mask, past, use_reentrant=False
+                        block,
+                        x,
+                        cos,
+                        sin,
+                        block_mask,
+                        past,
+                        use_cache,
+                        **self._checkpoint_kwargs(block),
                     )
                 else:
-                    x, present = block(x, cos, sin, block_mask, past)
-                presents.append(present)
+                    x, present = block(x, cos, sin, block_mask, past, use_cache)
+                if use_cache:
+                    presents.append(present)
 
         x = self.ln_f(x)
-        return x, presents  # hidden states (pre-projection)
+        return x, presents if use_cache else None  # hidden states (pre-projection)
 
     @property
     def lm_head_weight(self):
@@ -856,7 +1093,7 @@ class GPT(nn.Module):
         assert idx.size(1) <= self.block_size, (
             "Cannot forward, model block size is exhausted."
         )
-        hidden, _ = self._forward(idx, past_kvs=None)
+        hidden, _ = self._forward(idx, past_kvs=None, use_cache=False)
         if return_hidden:
             return hidden
         return self.project(hidden)
@@ -877,6 +1114,18 @@ class GPT(nn.Module):
         run — it only pays off when generating repeatedly (the compiled step is cached
         on the module and reused across calls).
         """
+        if idx.ndim != 2 or idx.size(1) == 0:
+            raise ValueError("idx must have shape (batch, sequence) with a non-empty prompt")
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be >= 0")
+        if temperature <= 0:
+            raise ValueError("temperature must be > 0")
+        if idx.size(1) + max_new_tokens > self.block_size:
+            raise ValueError(
+                f"prompt length ({idx.size(1)}) + max_new_tokens ({max_new_tokens}) "
+                f"exceeds block_size ({self.block_size}); this cached generator does "
+                "not silently extrapolate or evict KV entries"
+            )
         self.eval()
 
         step = self._forward
@@ -887,9 +1136,9 @@ class GPT(nn.Module):
                 self._forward_compiled = torch.compile(self._forward, dynamic=True)
             step = self._forward_compiled
 
-        # Prefill the cache with the (cropped) prompt in a single pass.
-        idx_cond = idx[:, -self.block_size :]
-        hidden, past_kvs = step(idx_cond, past_kvs=None)
+        # Prefill the cache with the prompt in a single pass. The validation
+        # above guarantees that the cache remains within block_size.
+        hidden, past_kvs = step(idx, past_kvs=None, use_cache=True)
 
         for _ in range(max_new_tokens):
             # Only the last position is needed to sample the next token.
@@ -898,7 +1147,7 @@ class GPT(nn.Module):
             nxt = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, nxt], dim=1)
             # Feed only the new token; RoPE/attention use the cached keys/values.
-            hidden, past_kvs = step(nxt, past_kvs=past_kvs)
+            hidden, past_kvs = step(nxt, past_kvs=past_kvs, use_cache=True)
         return idx
 
 

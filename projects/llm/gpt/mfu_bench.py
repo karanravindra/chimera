@@ -28,7 +28,13 @@ logging overhead, which are not measured here.
 """
 
 import argparse
+import os
 import time
+
+# CCE ships hardcoded Triton block configs tuned on Apple's dev hardware; on
+# this repo's shapes/GPU letting Triton autotune is ~15% faster on both CCE
+# kernels (~8% whole-step). Must be set before cut_cross_entropy is imported.
+os.environ.setdefault("CCE_AUTOTUNE", "1")
 
 import torch
 from cut_cross_entropy import linear_cross_entropy
@@ -76,7 +82,11 @@ def parse_args():
     # since train.py's default 8 doesn't divide the default n_layer 6.
     p.add_argument("--attn-res-n-blocks", type=int, default=None)
     p.add_argument("--profile", action="store_true",
-                   help="also print a torch.profiler top-ops table (eager mode)")
+                   help="after timing each mode, profile 3 steps of it and print "
+                        "the top kernels by self CUDA time")
+    p.add_argument("--trace-dir", default=None,
+                   help="with --profile: also export a chrome trace per mode "
+                        "(<trace-dir>/<mode>.json, viewable in ui.perfetto.dev)")
     return p.parse_args()
 
 
@@ -205,6 +215,7 @@ def make_step(model, optimizer, args):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(raw.parameters(), 1.0)
         optimizer.step()
+        model.update_moe_bias()
 
     return step
 
@@ -249,6 +260,8 @@ def time_mode(args, mode: str, gemm_tflops: float, spec_tflops: float):
         f"{tflops:6.2f} TFLOPS  MFU {tflops / gemm_tflops * 100:5.1f}% (gemm) "
         f"{tflops / spec_tflops * 100:5.1f}% (spec)  {peak_gb:5.2f} GB peak"
     )
+    if args.profile:
+        profile_kernels(args, mode, step, ms)
     del model, optimizer
     torch._dynamo.reset()
     torch.cuda.empty_cache()
@@ -302,21 +315,40 @@ def component_breakdown(args):
     torch.cuda.empty_cache()
 
 
-def profile_top_ops(args, steps: int = 3):
-    torch.manual_seed(0)
-    model, optimizer = build(args)
-    step = make_step(model, optimizer, args)
-    for _ in range(5):
-        step()
-    torch.cuda.synchronize()
+def profile_kernels(args, mode: str, step, ms_per_step: float, steps: int = 3):
+    """Profile ``steps`` steps of an already-warm mode and print the kernels
+    that dominate GPU time (self CUDA time -- actual device execution, not
+    op-tree attribution). Optionally exports a chrome trace for perfetto."""
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
     ) as prof:
         for _ in range(steps):
             step()
-    torch.cuda.synchronize()
-    print("\n--- torch.profiler top ops (eager, sorted by CUDA time) ---")
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=25))
+        torch.cuda.synchronize()
+
+    kernels = [
+        e for e in prof.key_averages()
+        if e.device_type == torch.autograd.DeviceType.CUDA and e.self_device_time_total > 0
+    ]
+    kernels.sort(key=lambda e: -e.self_device_time_total)
+    total_us = sum(e.self_device_time_total for e in kernels)
+    print(f"\n--- {mode}: top kernels by self CUDA time "
+          f"({total_us / steps / 1000:.1f} ms/step GPU-busy of {ms_per_step:.1f} ms wall) ---")
+    print(f"{'ms/step':>8}  {'%':>5}  {'x/step':>6}  kernel")
+    for e in kernels[:15]:
+        print(
+            f"{e.self_device_time_total / steps / 1000:8.2f}  "
+            f"{e.self_device_time_total / total_us * 100:5.1f}  "
+            f"{e.count // steps:6d}  {e.key[:90]}"
+        )
+
+    if args.trace_dir:
+        import os
+
+        os.makedirs(args.trace_dir, exist_ok=True)
+        path = os.path.join(args.trace_dir, f"{mode}.json")
+        prof.export_chrome_trace(path)
+        print(f"trace: {path}")
 
 
 def main():
@@ -342,8 +374,6 @@ def main():
         time_mode(args, mode.strip(), gemm_tflops, spec_tflops)
 
     component_breakdown(args)
-    if args.profile:
-        profile_top_ops(args)
 
 
 if __name__ == "__main__":
