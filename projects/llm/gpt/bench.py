@@ -131,8 +131,90 @@ class ChimeraLM(TemplateLM):
     def eot_token_id(self):
         return self._eot_id
 
-    def tok_encode(self, string, **kwargs):
-        return self.tokenizer.encode(string)
+    def tok_encode(self, string, add_special_tokens: bool = False, **kwargs):
+        # add_special_tokens=False matches training-time tokenization
+        # (mixture.py / tokenize_source.py): the LFM2.5 post-processor otherwise
+        # auto-prepends <|startoftext|>, a token the model never saw in pretrain.
+        return self.tokenizer._tok.encode(
+            string, add_special_tokens=add_special_tokens
+        ).ids
+
+    def loglikelihood(self, requests, disable_tqdm=False):
+        # Override the base loop (which tok_encodes each pair one at a time, ~18s
+        # for the full suite) with a batched + disk-cached encode. The tokenized
+        # (context_enc, continuation_enc) depend only on the tokenizer + the
+        # request text, NOT the model weights, so the cache is reused across every
+        # run with the same tokenizer/tasks (e.g. the smoke run and the baseline).
+        new_reqs = self._encode_pairs_cached([req.args for req in requests])
+        return self._loglikelihood_tokens(new_reqs, disable_tqdm=disable_tqdm)
+
+    def _encode_pairs_cached(self, pairs):
+        import hashlib
+        import pickle
+        from pathlib import Path
+
+        version = "v1"  # bump if the encoding logic below changes
+        # fingerprint the tokenizer so a different tokenizer can't hit a stale key.
+        fp = tuple(self.tokenizer._tok.encode(
+            "The quick brown fox", add_special_tokens=False).ids)
+        h = hashlib.md5(f"{version}|{fp}|{len(pairs)}".encode())
+        for ctx, cont in pairs:
+            h.update(ctx.encode("utf-8")); h.update(b"\x00")
+            h.update(cont.encode("utf-8")); h.update(b"\x01")
+        cache_dir = Path(os.environ.get("LM_HARNESS_CACHE_PATH", "/mnt/ai/data/lm_eval_cache"))
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / f"chimera-tokcache-{h.hexdigest()}.pkl"
+        if cache_file.exists():
+            print(f"[bench] loaded pretokenized eval inputs from {cache_file.name}")
+            return pickle.loads(cache_file.read_bytes())
+        new_reqs = self._encode_pairs_batched(pairs)
+        cache_file.write_bytes(pickle.dumps(new_reqs))
+        print(f"[bench] pretokenized + cached {len(pairs)} eval inputs -> {cache_file.name}")
+        return new_reqs
+
+    def _encode_pairs_batched(self, pairs):
+        """Batched equivalent of the base loglikelihood tokenize loop.
+
+        Replicates lm-eval's ``_encode_pair`` trailing-space shift and empty-context
+        handling, but encodes all (context) and (context+continuation) strings in
+        two parallel ``encode_batch`` calls instead of 2 sequential ``encode`` calls
+        per request -- ~10x faster on the ~70k-request suite. Returns the same
+        ``((context, continuation), context_enc, continuation_enc)`` tuples the base
+        class feeds to ``_loglikelihood_tokens``.
+        """
+        enc = self.tokenizer._tok
+        ctxs, wholes, shifted = [], [], []
+        for context, continuation in pairs:
+            if context == "":
+                shifted.append(("", continuation, True))
+                continue
+            n_spaces = len(context) - len(context.rstrip())
+            if n_spaces > 0:
+                continuation = context[-n_spaces:] + continuation
+                context = context[:-n_spaces]
+            shifted.append((context, continuation, False))
+            ctxs.append(context)
+            wholes.append(context + continuation)
+        whole_encs = [e.ids for e in enc.encode_batch(wholes, add_special_tokens=False)] if wholes else []
+        ctx_encs = [e.ids for e in enc.encode_batch(ctxs, add_special_tokens=False)] if ctxs else []
+
+        new_reqs = []
+        j = 0  # index into the non-empty-context batches
+        for context, continuation, is_empty in shifted:
+            if is_empty:
+                # empty context: condition on prefix token (base loglikelihood).
+                cont_enc = enc.encode(continuation, add_special_tokens=False).ids
+                if self.prefix_token_id != cont_enc[0]:
+                    context_enc, continuation_enc = [self.prefix_token_id], cont_enc
+                else:
+                    context_enc, continuation_enc = cont_enc[:1], cont_enc[1:]
+                new_reqs.append((("", continuation), context_enc, continuation_enc))
+                continue
+            context_enc = ctx_encs[j]
+            continuation_enc = whole_encs[j][len(context_enc):]
+            new_reqs.append(((context, continuation), context_enc, continuation_enc))
+            j += 1
+        return new_reqs
 
     def loglikelihood_rolling(self, requests, disable_tqdm=False):
         raise NotImplementedError("no configured task needs rolling loglikelihood")
