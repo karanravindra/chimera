@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 os.environ.setdefault("HF_HOME", "/mnt/ai/data/hf")
 
 import sources as S  # noqa: E402
+from clean import clean_text  # noqa: E402
 from chimera.data import chat_template as ct  # noqa: E402
 from chimera.tokenizers import BPETokenizer  # noqa: E402
 
@@ -44,7 +45,11 @@ DEFAULT_BUDGET = 10_000_000_000
 def render(src, row) -> str:
     k = src.kind
     if k == "text":
-        return row.get("text") or row.get("content") or row.get("TEXT") or ""
+        text = row.get("text") or row.get("content") or row.get("TEXT") or ""
+        # Normalize line endings / whitespace and strip publishing boilerplate
+        # (scoped to prose sources) — clean toward the eval distribution. Chat
+        # is left to the template; openmath is model-generated (already clean).
+        return clean_text(text, src.key)
     if k == "openmath":
         prob = row.get("problem") or row.get("question") or ""
         sol = row.get("generated_solution") or row.get("solution") or ""

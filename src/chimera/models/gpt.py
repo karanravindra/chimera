@@ -1110,6 +1110,36 @@ class GPT(nn.Module):
         """The classifier weight matrix (V, C), whether tied or a separate head."""
         return self.head.weight if hasattr(self, "head") else self.tok_emb.weight
 
+    @torch.no_grad()
+    def untie_head(self):
+        """Fork the tied embedding into an independent output head, mid-training.
+
+        Replicates modded-nanogpt's dynamic untie ("untie embed/lm_head at 2/3 of
+        training"): the model trains with a single shared (tied) weight while it
+        learns basic structure, then the head is split off into its own parameter
+        so input and output representations can specialize for the final loss.
+
+        The new head is initialized to the current tied weight (continuity, not a
+        re-init). ``self.tok_emb`` keeps its own tensor identity, so the compiled
+        ``forward(return_hidden=True)`` graph (which reads ``tok_emb`` for the input
+        embedding but not the head) is unaffected — no recompile. Cut Cross Entropy
+        re-reads ``lm_head_weight`` eagerly each step, so it picks up the new head
+        immediately.
+
+        Returns ``(tok_emb_weight, head_weight)`` so the optimizer can copy the
+        embedding's moment estimates into the fresh head param, or ``None`` if the
+        head already exists (idempotent).
+        """
+        if hasattr(self, "head"):
+            return None
+        emb = self.tok_emb.weight  # (V, C)
+        head = nn.Linear(emb.size(1), emb.size(0), bias=False).to(
+            device=emb.device, dtype=emb.dtype
+        )
+        head.weight.copy_(emb)
+        self.head = head
+        return self.tok_emb.weight, self.head.weight
+
     def project(self, hidden):
         """Project hidden states to vocabulary logits (with the muP output multiplier)."""
         return (hidden @ self.lm_head_weight.t()) * self.output_mult

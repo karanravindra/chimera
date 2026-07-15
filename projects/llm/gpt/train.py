@@ -29,7 +29,7 @@ from pathlib import Path
 
 import torch
 from lightning import Trainer, seed_everything
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 
 from chimera.data import MixtureDataModule
 from chimera.models import GPT
@@ -47,6 +47,37 @@ ARCH_PRESETS = {
     "base": "512-16-1-6",    # 48.9M — Pareto winner; near the loss floor, below depth-12's wall
     "large": "1024-32-1-8",  # 150M — width ladder + a touch of depth (aspect 128) for long horizons
 }
+
+
+class DynamicUntie(Callback):
+    """Untie the (initially tied) embedding into a separate output head partway
+    through training — modded-nanogpt's "untie embed/lm_head at 2/3 of training".
+
+    Tied early = fewer params / better data-efficiency / less optimizer memory
+    while the model learns basic structure; untied late = input and output
+    representations specialize for the final loss. The fork copies the embedding's
+    Adam moments into the fresh head so there is no cold restart, and touches
+    neither ``tok_emb``'s tensor identity nor the compiled forward graph (the head
+    lives only in the eager CCE call), so no recompile is triggered.
+    """
+
+    def __init__(self, split_step: int):
+        # `| 1` -> an odd step, matching modded-nanogpt (keeps Adam bias-correction
+        # landing cleanly relative to the mirrored/forked state).
+        self.split_step = max(1, int(split_step)) | 1
+        self._done = False
+
+    def on_train_batch_end(self, trainer, pl_module, *args):
+        if self._done or trainer.global_step < self.split_step:
+            return
+        raw = getattr(pl_module.model, "_orig_mod", pl_module.model)
+        forked = raw.untie_head()
+        if forked is not None:
+            emb_w, head_w = forked
+            trainer.optimizers[0].add_adamw_param(head_w, copy_state_from=emb_w)
+            print(f"[untie] forked lm_head from tied embedding at step "
+                  f"{trainer.global_step} (split_step={self.split_step})")
+        self._done = True
 
 
 def parse_args():
@@ -186,6 +217,10 @@ def parse_args():
         help="Number of prefix tokens every query may attend to regardless of "
              "the window (only used with --attn-window).")
     p.add_argument("--no-tie-embedding", dest="tie_embedding", action="store_false")
+    p.add_argument("--untie-at-frac", type=float, default=None,
+                   help="modded-nanogpt dynamic untie: start tied, fork lm_head "
+                        "into a separate param at this fraction of --max-steps "
+                        "(e.g. 0.667). Requires tied embedding; None disables it.")
     p.add_argument("--no-compile", dest="compile", action="store_false")
     p.add_argument("--no-cce", dest="use_cce", action="store_false")
     # Skip the final trainer.test() pass (redundant with periodic validation when
@@ -384,8 +419,16 @@ def main():
             checkpoint,
             TokenAxisCallback(args.global_token_count),
             ProgressPrinter(args.print_every, args.global_token_count),
-        ],
+        ]
+        + (
+            [DynamicUntie(int(args.untie_at_frac * args.max_steps))]
+            if args.untie_at_frac and args.tie_embedding
+            else []
+        ),
     )
+    if args.untie_at_frac and not args.tie_embedding:
+        print("[warn] --untie-at-frac ignored: embedding is already untied "
+              "(--no-tie-embedding). Dynamic untie needs a tied start.")
     # FineWebEduDataModule exposes only train/val loaders (no test split), so the
     # loaders are passed explicitly; validation reuses the val loader as in the
     # notebook (logged under train/*, val/*, and test/* respectively).

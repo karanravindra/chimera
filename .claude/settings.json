@@ -1,14 +1,17 @@
 {
-    "attribution": {
-        "commit": "",
-        "pr": "",
-        "sessionUrl": false
-    },
-    "permissions": {
-        "defaultMode": "auto"
-    },
-    "statusLine": {
-        "type": "command",
-        "command": "bash /root/Code/chimera/.claude/statusline-command.sh"
-    }
+  "attribution": {
+    "commit": "",
+    "pr": "",
+    "sessionUrl": false
+  },
+  "permissions": {
+    "defaultMode": "auto"
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "bash /root/Code/chimera/.claude/statusline-command.sh"
+  },
+  "enabledPlugins": {
+    "frontend-design@claude-plugins-official": true
+  }
 }

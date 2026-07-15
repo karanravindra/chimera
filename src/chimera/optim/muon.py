@@ -142,6 +142,29 @@ class Muon(torch.optim.Optimizer):
                 self._delegates.append((i, "adamw", opt))
 
     @torch.no_grad()
+    def add_adamw_param(self, new_p, copy_state_from=None):
+        """Add ``new_p`` to the (existing) AdamW group after construction.
+
+        Used for modded-nanogpt dynamic untie: at the split step the tied embedding
+        is forked into a separate head param, which must join AdamW mid-training.
+        Optionally deep-copies the Adam moment state (``exp_avg``/``exp_avg_sq``/
+        ``step``) from ``copy_state_from`` (the embedding) so the fresh head
+        continues with warmed-up moments instead of a cold restart.
+        """
+        for i, kind, delegate in self._delegates:
+            if kind != "adamw":
+                continue
+            self.param_groups[i]["params"].append(new_p)
+            delegate.param_groups[0]["params"].append(new_p)
+            if copy_state_from is not None and copy_state_from in delegate.state:
+                delegate.state[new_p] = {
+                    k: (v.clone() if torch.is_tensor(v) else v)
+                    for k, v in delegate.state[copy_state_from].items()
+                }
+            return
+        raise RuntimeError("no AdamW param group to add to (all groups use Muon)")
+
+    @torch.no_grad()
     def step(self, closure=None):
         loss = None
         if closure is not None:

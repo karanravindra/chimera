@@ -3,7 +3,7 @@
 Detailed composition of the data the LLM is trained on, per phase. Weights and
 token counts are derived from the source registry (`data/sources.py`,
 `TARGET_TOKENS = 10B`) and the mixture builder (`data/build_mixture.py`). Browse
-any source with `data/browse.py`; see the running plan with `browse.py --plan`.
+any source and see the running plan from `data/main.ipynb`.
 
 **Shared setup (all phases)**
 - **Tokenizer:** default `LiquidAI/LFM2.5-230M` byte-level BPE, vocab **64,402** →
@@ -227,13 +227,17 @@ uv run python projects/llm/sft/train.py --mix sft_1B --init-ckpt <base>/gpt.ckpt
 
 ## Provenance / reproduction
 
-| Step | Command |
+All steps run from `data/main.ipynb` (the CLIs were folded into it; the pipeline
+modules stay importable). Each row below names the notebook section and the call
+it makes:
+
+| Step | Notebook section → call |
 |---|---|
-| Inspect a source | `data/browse.py --source <key> --n 3` |
-| See the plan + repeat factors | `data/browse.py --plan [TOTAL]` |
-| Tokenize (pretrain) | `data/tokenize_source.py --all --budget 17e9` |
-| Tokenize (SFT, masked) | `data/tokenize_source.py --sft --all --budget 1e9` |
-| Pack a mix | `data/build_mixture.py --name mix_10B --total 10e9 [--sft]` |
+| Inspect a source | *Peek at real samples* → `get(<key>).sample(3)` |
+| See the plan + repeat factors | *Training plan* → `plan(TOTAL)` |
+| Tokenize (pretrain) | *Tokenize sources* → `tokenize_source(key, cap)` |
+| Tokenize (SFT, masked) | *Tokenize sources* (`SFT=True`) → `tokenize_source_sft(key, cap)` |
+| Pack a mix | *Build the packed mixture* → `build(name, total, ..., sft=...)` |
 
 Each packed mix writes a `manifest.json` recording the exact realized token counts,
 per-source weights, repeat factors, and seed — the ground truth for a given run.

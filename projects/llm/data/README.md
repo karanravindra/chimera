@@ -32,12 +32,10 @@ weight means their per-source repeat factor is high but low-impact.
 
 ## Training plan (weights → tokens → repeat factors)
 
-```bash
-uv run python projects/llm/data/browse.py --plan            # default 10B budget
-uv run python projects/llm/data/browse.py --plan 20e9       # any budget
-```
+Open `main.ipynb` and run the **Training plan** section; set `BUDGET` to any token
+count (default 10B).
 
-At a **10B-token** budget this prints, per source, target tokens (`weight × budget`)
+At a **10B-token** budget this shows, per source, target tokens (`weight × budget`)
 and the **repeat factor** (`target ÷ unique available`). Every category now sits
 well under 1× (code 0.0×, web 0.2×, math 0.1×, tools 0.2×) — no repetition trap.
 `TARGET_TOKENS` in `sources.py` sets the default budget.
@@ -50,19 +48,17 @@ repetition. The choice is now about curriculum, not supply.
 
 ## Usage
 
-```bash
-# list the mixture + per-category weights
-uv run python projects/llm/data/browse.py --list
+Everything runs from **`main.ipynb`** (the old CLIs — `browse.py`,
+`tokenize_source.py`, `train_tokenizer.py`, `build_mixture.py` — were folded into
+it; the last three stay as importable library modules the notebook drives).
+Edit the config variables at the top of a section and run the cell:
 
-# peek at N samples from one slice
-uv run python projects/llm/data/browse.py --source finemath --n 3
-uv run python projects/llm/data/browse.py --source openmath-cot --n 1 --full
-
-# sample every non-deferred slice, 1 row each, truncated
-uv run python projects/llm/data/browse.py --all --n 1 --chars 800
-```
-
-Flags: `--n` rows per source, `--chars` truncation length, `--full` no truncation.
+- **The mixture / Training plan** — list slices, per-category weights, target
+  tokens + repeat factors for any `BUDGET`.
+- **Peek at real samples** — set `SOURCE` (or `None` to sweep all), `N`, `CHARS`,
+  `FULL`; streams real rows from the smallest cached shard (Stack v2 from S3).
+- **Document-length distributions** — token-length stats + histograms per source.
+- **Tokenize / Train tokenizer / Build mixture** — the packing pipeline.
 
 ## How sampling works (and why)
 
@@ -126,10 +122,14 @@ specific tool schemas your model will see in deployment.
 
 ## Files
 
+- `main.ipynb` — the interactive workbench (browse, plan, peek, length stats,
+  tokenize, train tokenizer, build mixture). This is the entry point.
 - `sources.py` — the mixture registry (`SOURCES`), one `Source` per slice with its
   weight, backing repo, and a streaming `sample()`; plus the shard-peek and SWH
   content helpers.
-- `browse.py` — the CLI described above.
+- `tokenize_source.py` / `train_tokenizer.py` / `build_mixture.py` — library
+  modules (row rendering, tokenization, corpus sampling, weighted packing) that
+  the notebook imports and drives.
 
 ## Next steps (not built yet)
 
