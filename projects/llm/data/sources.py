@@ -626,6 +626,24 @@ SOURCES: list[Source] = [
         notes="Plain FineWeb (NOT fineweb-edu) — broader, less-filtered web prose; 'text' column. ODC-By.",
         _sampler=_sample_plain_text,
     ),
+    # ---- synthetic simple-English stories : opt-in (weight=0.0) ------------
+    # TinyStoriesV2-GPT4, repackaged as our own HF dataset. Very short (~197
+    # tok/story), simple-vocabulary synthetic narratives — a clean tiny-scale
+    # pretraining corpus / curriculum warm-up. Kept out of the default mix
+    # (weight=0.0, like the prose sources); assign a build-time weight to opt in.
+    Source(
+        key="tinystories",
+        title="TinyStoriesV2-GPT4 (synthetic simple-English stories)",
+        category="prose",
+        weight=0.0,  # opt-in; excluded from the default pretrain mix
+        hf_repo="karanravindra/tinystories-v2",
+        config="default",
+        split="train",
+        file_prefix="data/train-",
+        avail_tokens=0.542 * _B,  # measured: 542.3M tok (LFM2.5); 2.72M stories
+        notes="Our repackaging of roneneldan/TinyStories GPT-4 V2; 'text' column, id+text schema. Public.",
+        _sampler=_sample_plain_text,
+    ),
 ]
 
 SOURCES_BY_KEY: dict[str, Source] = {s.key: s for s in SOURCES}
