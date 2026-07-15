@@ -39,6 +39,16 @@ from chimera.utils import ProgressPrinter, TokenAxisCallback, build_run_loggers
 from bench import DEFAULT_TASKS, flatten_for_wandb, print_table, run_benchmarks
 
 
+# Locked muP model family (W-H-K-L, head_dim=32, GQA n_kv=1, depth 6 wall-optimal).
+# Ladder doubles width; the swept muP LR (muon 0.013 / adamw 0.006) transfers to all.
+# Sizes: small 20.5M / base 48.9M / large 150M (tied embedding; vocab 64402).
+ARCH_PRESETS = {
+    "small": "256-8-1-6",    # 20.5M — smallest verified point off the loss floor
+    "base": "512-16-1-6",    # 48.9M — Pareto winner; near the loss floor, below depth-12's wall
+    "large": "1024-32-1-8",  # 150M — width ladder + a touch of depth (aspect 128) for long horizons
+}
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data-dir", default="/mnt/ai/data")
@@ -100,6 +110,11 @@ def parse_args():
     # (e.g. "48-2-1-3"). Lets a single wandb sweep vary width by sweeping ONE
     # coupled parameter (the dims are not independent, so a grid over each would
     # produce invalid combinations). When set, overrides --n-embd/--n-head/etc.
+    # Accepts either a compact "W-H-K-L" string or a named preset from the locked
+    # muP family (see ARCH_PRESETS): small/base/large. Family found via the muP LR
+    # sweep + width×depth coord-check (sweeps 60lc74lr/adlxq011/2ndqvuzp): depth-6
+    # is wall-optimal and width is the paying axis, so the ladder doubles width at
+    # head_dim=32 / GQA n_kv=1; the same swept LR (0.013/0.006) transfers to all.
     p.add_argument("--arch", default=None)
     # muP (Maximal Update Parameterization): tune muon-lr/adamw-lr (+ the mults
     # below) at a small proxy width, then transfer them to a large model by only
@@ -208,8 +223,9 @@ def default_run_name(args) -> str:
 def main():
     args = parse_args()
     if args.arch:
+        arch = ARCH_PRESETS.get(args.arch, args.arch)  # named preset -> "W-H-K-L"
         args.n_embd, args.n_head, args.n_kv_head, args.n_layer = (
-            int(x) for x in args.arch.split("-")
+            int(x) for x in arch.split("-")
         )
     if args.attn_window == 0:
         args.attn_window = None  # sweep-grid sentinel for the dense baseline
