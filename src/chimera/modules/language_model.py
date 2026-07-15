@@ -1,5 +1,6 @@
 import math
 
+import torch
 from lightning import LightningModule
 from torch import nn
 
@@ -29,6 +30,13 @@ class LanguageModelModule(LightningModule):
         self.use_cce = use_cce
 
         self.criterion = nn.CrossEntropyLoss()
+
+        # Per-batch accumulators for the cross-dataloader aggregate val/test
+        # metric (Lightning forbids logging one key across multiple dataloaders,
+        # so we mean it ourselves at epoch end); per-source keys are logged
+        # directly since each is unique to its dataloader.
+        self._val_acc: list = []
+        self._test_acc: list = []
 
     def forward(self, x):
         return self.model(x)
@@ -83,19 +91,63 @@ class LanguageModelModule(LightningModule):
         self.log("train/lr", lr, on_step=True, prog_bar=True)
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    def _source_name(self, dataloader_idx):
+        """Map a val/test dataloader index -> source key, when the datamodule
+        serves one loader per source (per-dataset metrics). Returns None for the
+        single-loader case (or if unavailable), i.e. log only the combined stage."""
+        dm = getattr(self.trainer, "datamodule", None)
+        names = getattr(dm, "val_source_names", None)
+        # Fallback: train.py passes explicit dataloaders (no datamodule on the
+        # trainer), so it also sets lm_module.val_source_names directly.
+        if not names:
+            names = getattr(self, "val_source_names", None)
+        if not names or len(names) < 2 or dataloader_idx >= len(names):
+            return None
+        return names[dataloader_idx]
+
+    def _log_eval(self, stage, loss, bpt, src, acc):
+        # Aggregate across ALL dataloaders: accumulate per batch, mean at epoch
+        # end (Lightning forbids logging one key from multiple dataloaders).
+        acc.append((loss.detach(), bpt.detach()))
+        # Per-source curves (grokking): val_<src>/* — unique key per dataloader,
+        # so Lightning averages over that source's batches with no conflict.
+        if src is not None:
+            self.log(f"{stage}_{src}/loss", loss, on_epoch=True, add_dataloader_idx=False)
+            self.log(f"{stage}_{src}/bpt", bpt, on_epoch=True, add_dataloader_idx=False)
+            if self.bytes_per_token:
+                self.log(f"{stage}_{src}/bpb", bpt / self.bytes_per_token,
+                         on_epoch=True, add_dataloader_idx=False)
+
+    def _log_aggregate(self, stage, acc):
+        if not acc:
+            return
+        loss = torch.stack([l for l, _ in acc]).mean()
+        bpt = torch.stack([b for _, b in acc]).mean()
+        self.log(f"{stage}/loss", loss, prog_bar=True)
+        self.log(f"{stage}/bpt", bpt, prog_bar=True)
+        if self.bytes_per_token:
+            self.log(f"{stage}/bpb", bpt / self.bytes_per_token, prog_bar=True)
+        acc.clear()
+
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
         if self._fully_masked(batch):
             return None
         loss, bpt = self._step(batch)
-        self._log_stage("val", loss, bpt, on_step=False)
+        self._log_eval("val", loss, bpt, self._source_name(dataloader_idx), self._val_acc)
         return loss
 
-    def test_step(self, batch, batch_idx):
+    def on_validation_epoch_end(self):
+        self._log_aggregate("val", self._val_acc)
+
+    def test_step(self, batch, batch_idx, dataloader_idx=0):
         if self._fully_masked(batch):
             return None
         loss, bpt = self._step(batch)
-        self._log_stage("test", loss, bpt, on_step=False)
+        self._log_eval("test", loss, bpt, self._source_name(dataloader_idx), self._test_acc)
         return loss
+
+    def on_test_epoch_end(self):
+        self._log_aggregate("test", self._test_acc)
 
     def configure_optimizers(self):
         # No scheduler -> constant LR (e.g. for clean muP LR sweeps).

@@ -68,6 +68,12 @@ class MixtureDataModule(pl.LightningDataModule):
 
         self.train_dataset: Optional[Dataset] = None
         self.val_dataset: Optional[Dataset] = None
+        # Per-source val slices (pretrain only): val.bin is written in manifest
+        # source order, so we window it per source to log per-dataset val curves
+        # (grokking). Populated in setup(); empty -> single combined val loader.
+        self.val_source_windows: list[tuple[str, int, int]] = []
+        self.val_datasets: dict[str, Dataset] = {}
+        self.val_source_names: list[str] = ["val"]
 
     @property
     def _dir(self) -> Path:
@@ -108,6 +114,24 @@ class MixtureDataModule(pl.LightningDataModule):
         self.train_dataset = self._make_dataset("train")
         self.val_dataset = self._make_dataset("val")
 
+        # Carve per-source val slices from the (source-ordered) val.bin so we can
+        # log per-dataset val loss/bpt/bpb. Pretrain only (SFT val is masked and
+        # kept as one combined loader). Needs >=2 sources with val tokens.
+        if self.manifest and not self.sft:
+            val_path = self._dir / "val.bin"
+            off = 0
+            for r in self.manifest.get("sources", []):
+                n = int(r.get("val_tokens", 0))
+                if n > 0:
+                    self.val_source_windows.append((r["key"], off, n))
+                off += n
+            if len(self.val_source_windows) >= 2:
+                self.val_datasets = {
+                    key: MemmapTokenDataset(val_path, self.seq_len, start=start, length=length)
+                    for key, start, length in self.val_source_windows
+                }
+                self.val_source_names = [k for k, _, _ in self.val_source_windows]
+
     def _encode(self, text: str) -> list:
         return self.tokenizer._tok.encode(text, add_special_tokens=False).ids
 
@@ -132,14 +156,24 @@ class MixtureDataModule(pl.LightningDataModule):
             drop_last=True,
         )
 
-    def val_dataloader(self):
+    def _val_dl(self, dataset) -> DataLoader:
         return DataLoader(
-            self.val_dataset,
+            dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
         )
+
+    def val_dataloader(self):
+        # >=2 sources -> one val loader PER source so metrics log per dataset
+        # (dataloader_idx k -> val_source_names[k]); the module also aggregates a
+        # combined val/* across them. Else the single combined loader (unchanged).
+        if self.val_datasets:
+            self.val_source_names = [k for k, _, _ in self.val_source_windows]
+            return [self._val_dl(self.val_datasets[k]) for k in self.val_source_names]
+        self.val_source_names = ["val"]
+        return self._val_dl(self.val_dataset)
 
 
 if __name__ == "__main__":

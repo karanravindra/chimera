@@ -18,8 +18,17 @@ class MemmapTokenDataset(Dataset):
     ``(input, target)`` next-token chunks, casting to ``int64`` per item.
     """
 
-    def __init__(self, path: Union[str, Path], seq_len: int, dtype=np.uint16):
-        self.data = np.memmap(str(path), dtype=dtype, mode="r")
+    def __init__(self, path: Union[str, Path], seq_len: int, dtype=np.uint16,
+                 start: int = 0, length: Optional[int] = None):
+        data = np.memmap(str(path), dtype=dtype, mode="r")
+        # Optional token window into the file — used to carve a source-ordered
+        # val.bin into per-source slices for per-dataset metrics. Slicing a memmap
+        # returns a view (no copy), so the on-disk backing is preserved.
+        if length is not None:
+            data = data[start : start + length]
+        elif start:
+            data = data[start:]
+        self.data = data
         self.seq_len = seq_len
 
     def __len__(self) -> int:

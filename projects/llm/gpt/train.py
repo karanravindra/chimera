@@ -389,6 +389,11 @@ def main():
     # FineWebEduDataModule exposes only train/val loaders (no test split), so the
     # loaders are passed explicitly; validation reuses the val loader as in the
     # notebook (logged under train/*, val/*, and test/* respectively).
+    # When the mix has >=2 sources, val_loader is a list (one loader per source);
+    # hand the source names to the module so it logs per-dataset val_<src>/* curves
+    # (grokking) alongside the aggregate val/* (the module can't reach the
+    # datamodule since loaders are passed explicitly).
+    lm_module.val_source_names = dm.val_source_names
     trainer.fit(lm_module, train_dataloaders=train_loader, val_dataloaders=val_loader)
     if args.run_test:
         trainer.test(lm_module, dataloaders=val_loader)
