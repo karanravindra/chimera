@@ -10,15 +10,11 @@ concern, out of scope for the pretraining mixture cache.
 Per-source cache is sized to the *largest* mixture budget (default 10B), so both
 the 1B and 10B packed mixes (see build_mixture.py) draw from the same caches.
 
-    uv run python projects/llm/data/tokenize_source.py --source fineweb-edu
-    uv run python projects/llm/data/tokenize_source.py --source stackv2-python
-    uv run python projects/llm/data/tokenize_source.py --all --budget 10e9
-    uv run python projects/llm/data/tokenize_source.py --source finemath --max-tokens 5_000_000  # smoke
+Library module — driven from the "Tokenize sources" section of ``main.ipynb``
+(call ``tokenize_source`` / ``tokenize_source_sft`` with a key + token cap).
 """
 
-import argparse
 import json
-import math
 import os
 import sys
 import time
@@ -48,7 +44,7 @@ DEFAULT_BUDGET = 10_000_000_000
 def render(src, row) -> str:
     k = src.kind
     if k == "text":
-        return row.get("text") or row.get("content") or ""
+        return row.get("text") or row.get("content") or row.get("TEXT") or ""
     if k == "openmath":
         prob = row.get("problem") or row.get("question") or ""
         sol = row.get("generated_solution") or row.get("solution") or ""
@@ -103,7 +99,7 @@ def _iter_rows(src, columns, start_shard=0):
 
 
 COLUMNS = {
-    "text": ["text", "content"],
+    "text": ["text", "content", "TEXT"],
     "openmath": ["problem", "generated_solution"],
     "chat": ["conversations", "messages", "tools"],
     "stackv2": ["blob_id", "src_encoding"],
@@ -318,44 +314,3 @@ def _progress(key, n, cap, n_docs, t0):
     print(f"[{key}] {n / 1e6:.1f}M/{cap / 1e6:.0f}M tok  {n_docs:,} docs  "
           f"{rate / 1e6:.2f}M tok/s  eta {eta / 60:.1f}min", flush=True)
 
-
-def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--source", help="source key (see browse.py --list)")
-    p.add_argument("--all", action="store_true", help="tokenize every non-deferred source")
-    p.add_argument("--budget", type=float, default=DEFAULT_BUDGET, help="total mixture budget (caps = weight*budget)")
-    p.add_argument("--max-tokens", type=float, default=None, help="hard per-source cap override (smoke tests)")
-    p.add_argument("--s3-workers", type=int, default=128, help="parallel SWH S3 fetchers (stackv2)")
-    p.add_argument("--tokenizer", default="LiquidAI/LFM2.5-230M",
-                   help="tokenizer: HF hub id or local path to a custom tokenizer.json/dir "
-                        "(see train_tokenizer.py). Caches are tokenizer-specific.")
-    p.add_argument("--sft", action="store_true",
-                   help="masked ChatML tokenization for SFT (chat/openmath sources -> ids+mask)")
-    args = p.parse_args()
-
-    def cap_for(src):
-        if args.max_tokens is not None:
-            return int(args.max_tokens)
-        # SFT uses sft_weight (chat-led composition); fall back to pretrain weight.
-        w = src.sft_weight if (args.sft and src.sft_weight is not None) else src.weight
-        return int(math.ceil(w * args.budget))
-
-    if args.all:
-        targets = [s for s in S.SOURCES if not s.deferred]
-        if args.sft:  # only conversational sources make sense for SFT
-            targets = [s for s in targets if s.kind in ("chat", "openmath")]
-    elif args.source:
-        targets = [S.get(args.source)]
-    else:
-        p.error("pass --source KEY or --all")
-
-    for src in targets:
-        if args.sft:
-            tokenize_source_sft(src.key, cap_for(src), tokenizer=args.tokenizer)
-        else:
-            tokenize_source(src.key, cap_for(src), s3_workers=args.s3_workers,
-                            tokenizer=args.tokenizer)
-
-
-if __name__ == "__main__":
-    main()

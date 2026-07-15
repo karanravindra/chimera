@@ -15,8 +15,8 @@ Planned mixture (weights = fraction of the whole blend; see TARGET_TOKENS/plan()
                           (xLAM, Dria, ToolACE, APIGen-MT, Hermes) for diversity
 
 Supply note: every category is drawn <<1 epoch at our scale. Toucan-1.5M (~6B
-tokens, Apache-2.0) removed the old tool-call scarcity; run ``browse.py --plan``
-to see per-source target tokens and repeat factors.
+tokens, Apache-2.0) removed the old tool-call scarcity; see the training-plan
+section of ``main.ipynb`` for per-source target tokens and repeat factors.
 
 Nothing here downloads a full corpus. Sharded parquet slices download only the
 smallest shard and read the first rows locally; the small tool-call JSON files
@@ -567,6 +567,64 @@ SOURCES: list[Source] = [
         kind="chat",
         sft_weight=0.50,  # chat-dominant: general chat leads the SFT mix
         _sampler=_sample_toolcall,
+    ),
+    # ---- narrative / prose : LAMBADA-mix-only (weight=0.0) -----------------
+    # Long-form narrative prose for a LAMBADA-optimized pretraining blend.
+    # LAMBADA rewards discourse-level, long-range coreference — exactly what
+    # book-length fiction supplies. Kept out of the default pretrain mix
+    # (weight=0.0, like ultrachat); the LAMBADA-mix builder assigns explicit
+    # weights at build time.
+    Source(
+        key="bookcorpus",
+        title="BookCorpusOpen (novels)",
+        category="prose",
+        weight=0.0,  # LAMBADA-mix-only; excluded from the default pretrain mix
+        hf_repo="lucadiliello/bookcorpusopen",
+        config="default",
+        split="train",
+        file_prefix="data/train-",
+        avail_tokens=1.6 * _B,  # est: 6.64GB text / ~4 chars/tok (17.9k books)
+        notes="Open BookCorpus replacement (full-length novels); 'text' column. Unknown license.",
+        _sampler=_sample_plain_text,
+    ),
+    Source(
+        key="gutenberg",
+        title="Project Gutenberg English eBooks",
+        category="prose",
+        weight=0.0,  # LAMBADA-mix-only; excluded from the default pretrain mix
+        hf_repo="sedthh/gutenberg_english",
+        config="default",
+        split="train",
+        file_prefix="data/train-",
+        avail_tokens=4.5 * _B,  # est: 18.1GB text / ~4 chars/tok (48.3k books)
+        notes="Gutenberg English books; TEXT column is UPPERCASE (also SOURCE/METADATA) — tokenize_source.render()/COLUMNS['text'] read lowercase 'text'/'content', so add a 'TEXT' fallback before tokenizing. MIT.",
+        _sampler=_sample_plain_text,
+    ),
+    Source(
+        key="pg19",
+        title="PG-19 (long-form pre-1919 books)",
+        category="prose",
+        weight=0.0,  # LAMBADA-mix-only; excluded from the default pretrain mix
+        hf_repo="emozilla/pg19",  # parquet mirror; canonical deepmind/pg19 ships no HF parquet
+        config="default",
+        split="train",
+        file_prefix="data/train-",
+        avail_tokens=2.9 * _B,  # est: 11.45GB text / ~4 chars/tok (28.6k books)
+        notes="PG-19 long-range LM benchmark; 'text' column. Uses emozilla/pg19 parquet mirror — canonical deepmind/pg19 is a loader script + GCS blobs with NO HF parquet, incompatible with the parquet-prefix loader. Apache-2.0.",
+        _sampler=_sample_plain_text,
+    ),
+    Source(
+        key="fineweb",
+        title="FineWeb (sample-10BT, plain web)",
+        category="web",
+        weight=0.0,  # LAMBADA-mix-only; excluded from the default pretrain mix
+        hf_repo="HuggingFaceFW/fineweb",
+        config="sample-10BT",
+        split="train",
+        file_prefix="sample/10BT/",
+        avail_tokens=10 * _B,  # the sample IS 10B tokens (GPT-2 tok); larger dumps available
+        notes="Plain FineWeb (NOT fineweb-edu) — broader, less-filtered web prose; 'text' column. ODC-By.",
+        _sampler=_sample_plain_text,
     ),
 ]
 

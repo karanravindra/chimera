@@ -11,11 +11,10 @@ Because it renormalizes over available caches, dropping the (slow) Stack v2 code
 slice for now "just works": build from web+math+tools today, then re-run once the
 code caches finish to fold code back in at its 40% weight.
 
-    uv run python projects/llm/data/build_mixture.py --name mix_1B  --total 1e9
-    uv run python projects/llm/data/build_mixture.py --name mix_10B --total 10e9
+Library module — driven from the "Build the packed mixture" section of
+``main.ipynb`` (call ``build(name, total, val_frac, seed, sft=...)``).
 """
 
-import argparse
 import json
 import os
 import sys
@@ -41,27 +40,38 @@ def _mix_dir(sft: bool) -> Path:
     return Path("/mnt/ai/data/llm-mix") / ("mix_sft" if sft else "mix")
 
 
-def available_sources(sft: bool) -> list[tuple[str, float, int]]:
-    """Return (key, weight, n_tokens) for every source with a complete cache."""
+def available_sources(sft: bool, weights: dict | None = None) -> list[tuple[str, float, int]]:
+    """Return (key, weight, n_tokens) for every source with a complete cache.
+
+    When ``weights`` is given (key -> weight), restrict the mix to exactly those
+    keys and use those weights — for custom mixes (e.g. a LAMBADA books mix) that
+    ignore the registry's default pretrain/sft weights.
+    """
     out = []
     tok = _tok_dir(sft)
     for src in S.SOURCES:
+        if weights is not None and src.key not in weights:
+            continue
         meta_p = tok / src.key / "meta.json"
         if not meta_p.exists():
             continue
         meta = json.loads(meta_p.read_text())
         if meta.get("n_tokens", 0) > 0:
-            # SFT uses a distinct composition (chat-led): prefer sft_weight when
-            # set, else fall back to the pretrain weight.
-            w = src.sft_weight if (sft and src.sft_weight is not None) else src.weight
+            if weights is not None:
+                w = weights[src.key]
+            else:
+                # SFT uses a distinct composition (chat-led): prefer sft_weight when
+                # set, else fall back to the pretrain weight.
+                w = src.sft_weight if (sft and src.sft_weight is not None) else src.weight
             out.append((src.key, w, meta["n_tokens"]))
     return out
 
 
-def build(name: str, total: int, val_frac: float, seed: int, sft: bool = False):
+def build(name: str, total: int, val_frac: float, seed: int, sft: bool = False,
+          weights: dict | None = None):
     TOK = _tok_dir(sft)
     MIX = _mix_dir(sft)
-    avail = available_sources(sft)
+    avail = available_sources(sft, weights)
     if not avail:
         raise SystemExit(
             "no tokenized sources found under "
@@ -147,17 +157,3 @@ def build(name: str, total: int, val_frac: float, seed: int, sft: bool = False):
               f"{r['train_tokens'] / 1e6:.1f}M train  ({r['repeat']}x){flag}")
     print(f"   manifest: {out_dir / 'manifest.json'}")
 
-
-def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--name", required=True, help="mix name, e.g. mix_1B")
-    p.add_argument("--total", type=float, required=True, help="total tokens, e.g. 1e9")
-    p.add_argument("--val-frac", type=float, default=0.005)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--sft", action="store_true", help="pack SFT caches (ids + supervise mask)")
-    args = p.parse_args()
-    build(args.name, int(args.total), args.val_frac, args.seed, sft=args.sft)
-
-
-if __name__ == "__main__":
-    main()
