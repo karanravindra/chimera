@@ -1,0 +1,46 @@
+# muP wide/shallow extension — push WIDTH up, DEPTH down, chase wall-efficiency.
+#
+# Phase 2 (coord_check.yaml, sweep adlxq011) showed: (1) LR transfers across
+# width+depth at the fixed swept LR; (2) the width curve is still STEEP at 384
+# (not floored — headroom above); (3) on the wall-clock Pareto, wide-shallow wins
+# — 384-12-1-6 dominated 256-8-1-12 (better loss AND faster), and depth-12 only
+# earns its extra wall at long horizons. So: try HIGHER emb at LOWER depth.
+#
+# Same fixed swept LR (0.013/0.006) + 65.5M-token budget as the coord-check, so
+# these drop straight onto the same loss-vs-wall Pareto. head_dim pinned at 32
+# (n_head scales with width). Ordered cheapest-first so the big configs' step-200
+# ETA can be checked against the 10-min/run cap before they burn full time.
+#
+# Run:  wandb sweep projects/llm/gpt/coord_check_wide.yaml
+#       wandb agent <entity>/llm-pretrain/<id> --count 4
+program: projects/llm/gpt/train.py
+project: llm-pretrain
+method: grid
+name: mup-wide-shallow
+metric:
+  name: val/loss
+  goal: minimize
+parameters:
+  arch:
+    values:
+      - 384-12-1-4     # depth-4 anchor: isolate depth 6->4 at the known-good width
+      - 512-16-1-4     # higher emb + lower depth — the direct hypothesis
+      - 512-16-1-6     # width-curve extension at depth 6 (continues 128/256/384)
+      - 640-20-1-4     # widest, shallow — furthest wall-efficient point
+command:
+  - ${env}
+  - /root/Code/chimera/.venv/bin/python
+  - ${program}
+  - --muon-lr=0.013           # fixed swept optimum (transfer verified in Phase 2)
+  - --adamw-lr=0.006
+  - --seq-len=512
+  - --global-token-count=65536
+  - --max-steps=1000          # ~65.5M tokens, matches coord_check for a shared Pareto
+  - --warmup-steps=100
+  - --mix=mix_1B
+  - --val-check-interval=250
+  - --limit-val-batches=100
+  - --print-every=200
+  - --wandb-project=llm-pretrain
+  - --tags=mup-wide-shallow,width-depth-transfer,grid
+  - ${args}
