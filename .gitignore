@@ -13,3 +13,5 @@ lightning_logs/
 checkpoints/
 /data/
 wandb/
+# generated per-source bytes/token cache
+projects/tiny-llm/gpt/bpb_cache.json

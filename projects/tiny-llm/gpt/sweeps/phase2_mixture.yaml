@@ -1,0 +1,37 @@
+# Phase-2 mixture axis: at the grid-A winner (tiny / seq512 / ema0.999 / 1B tokens),
+# vary only the data mixture. Baseline mix (tiny_2B_8k, stories 50%) already tested
+# as run 0dj5aixt (BLiMP 67.18) — reused, not rerun. These two rebalance mass off
+# stories toward the weak registers (web/textbook/expository; per-source bpb 1.3-1.4):
+#   bal  = stories 35 / textbooks 25 / web 20 / tutorial 10 / faq 10
+#   bal2 = stories 25 / textbooks 25 / web 30 / tutorial 10 / faq 10
+# Same 8k tokenizer + identical per-source val tails -> per-source bpb + benchmarks
+# are directly comparable across mixes.
+program: train.py
+method: grid
+project: tiny-llm-pretrain
+name: phase2-mixture
+metric:
+  name: val/loss
+  goal: minimize
+parameters:
+  arch:
+    value: tiny
+  seq-len:
+    value: 512
+  global-token-count:
+    value: 65536
+  max-steps:
+    value: 15259          # 1.0B tokens
+  ema-decay:
+    value: 0.999
+  val-check-interval:
+    value: 1000
+  mix:
+    values: [tiny_2B_8k_bal, tiny_2B_8k_bal2]
+command:
+  - ${env}
+  - uv
+  - run
+  - python
+  - ${program}
+  - ${args}

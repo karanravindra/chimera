@@ -1,0 +1,36 @@
+# Phase-2 vocab axis: at the grid-A winner (tiny / seq512 / ema0.999 / 1B tokens),
+# vary the tokenizer vocab size. 8k already tested as run 0dj5aixt (reused, not
+# rerun). --vocab-tag sets BOTH the tokenizer and the matched base mix so they
+# can't desync. Vocab changes the tied-embedding param count (4k smaller ~5M /
+# 16k larger ~8M model), so val/loss + bpt are NOT comparable across vocab — the
+# comparison is on **bpb** (bits-per-byte, tokenizer-invariant) + the zero-shot
+# benchmarks (also tokenizer-invariant).
+program: train.py
+method: grid
+project: tiny-llm-pretrain
+name: phase2-vocab
+metric:
+  name: val/bpb
+  goal: minimize
+parameters:
+  arch:
+    value: tiny
+  seq-len:
+    value: 512
+  global-token-count:
+    value: 65536
+  max-steps:
+    value: 15259          # 1.0B tokens
+  ema-decay:
+    value: 0.999
+  val-check-interval:
+    value: 1000
+  vocab-tag:
+    values: [4k, 16k]
+command:
+  - ${env}
+  - uv
+  - run
+  - python
+  - ${program}
+  - ${args}

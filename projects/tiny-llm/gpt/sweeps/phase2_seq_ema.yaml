@@ -1,0 +1,35 @@
+# Phase-2 baseline sweep: tiny arch, full 1B tokens/run (~30 min incl. evals).
+# Structural axes for the tiny (6.23M) model:
+#   seq_len  — 512 first (memory: shorter ctx beats 2048 at equal tokens + faster)
+#   ema      — 0.999 (on) vs 0.0 (off, via the --ema-decay sentinel)
+# Grid iterates in listed order -> most-promising combo (512 / ema-on) runs FIRST
+# (sweep-order-important-first). The 1024 / 0.999 cell reproduces the standalone
+# baseline (oalfi3m5) — a free run-to-run variance check.
+# Compared on benchmarks + matched-ctx bpb (raw val/loss across seq_len is confounded).
+program: train.py
+method: grid
+project: tiny-llm-pretrain
+name: phase2-seq-ema
+metric:
+  name: val/loss
+  goal: minimize
+parameters:
+  arch:
+    value: tiny
+  global-token-count:
+    value: 65536          # tokens/step fixed -> equal 1B-token budget across seq_len
+  max-steps:
+    value: 15259          # 15259 * 65536 ~= 1.0B tokens
+  val-check-interval:
+    value: 1000
+  seq-len:
+    values: [512, 1024, 2048]
+  ema-decay:
+    values: [0.999, 0.0]
+command:
+  - ${env}
+  - uv
+  - run
+  - python
+  - ${program}
+  - ${args}
