@@ -30,7 +30,7 @@ from pathlib import Path
 
 import torch
 from lightning import Trainer, seed_everything
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 
 from chimera.data import MixtureDataModule
 from chimera.models import GPT
@@ -169,7 +169,56 @@ def parse_args():
     p.add_argument("--no-eval", dest="run_eval", action="store_false")
     # Log sample generations (test/generations table) at the end of the test phase.
     p.add_argument("--no-gen", dest="gen_samples", action="store_false")
+    # Run the benchmark suite every N validation phases during fit (0=off) and log
+    # bench/<task>/<metric>, to chart downstream progression over training (not just
+    # the final point). Uses a small per-task cap for speed.
+    p.add_argument("--bench-every-val", type=int, default=0)
+    p.add_argument("--bench-progress-limit", type=int, default=200,
+                   help="examples/task cap for the in-training benchmark passes")
     return p.parse_args()
+
+
+class BenchmarkProgressCallback(Callback):
+    """Run the zero-shot suite every N validation phases during fit and log
+    ``bench/<task>/<metric>`` — so downstream metrics can be charted *over
+    training* instead of only at the single end-of-run point.
+
+    Runs on the eager model (``_orig_mod``, not the compiled graph) under
+    ``no_grad`` with a small ``limit`` for speed; ``run_benchmarks`` restores
+    train mode afterwards. Ordered before the EMA callback so it evaluates the
+    same (EMA-swapped) weights validation used.
+    """
+
+    def __init__(self, tokenizer, tasks, block_size, batch_tokens, limit,
+                 every_n_vals=1, prefix="bench"):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.tasks = tasks
+        self.block_size = block_size
+        self.batch_tokens = batch_tokens
+        self.limit = limit
+        self.every_n_vals = max(1, every_n_vals)
+        self.prefix = prefix
+        self._vc = 0
+
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+        self._vc += 1
+        if self._vc % self.every_n_vals != 0:
+            return
+        model = getattr(pl_module.model, "_orig_mod", pl_module.model)
+        with torch.no_grad():
+            results = run_benchmarks(
+                model, self.tokenizer, self.tasks, block_size=self.block_size,
+                batch_tokens=self.batch_tokens, device=str(pl_module.device),
+                limit=self.limit,
+            )
+        metrics = flatten_for_wandb(results, tasks=self.tasks, prefix=self.prefix)
+        for lg in trainer.loggers:
+            lg.log_metrics(metrics, step=trainer.global_step)
+        msg = "  ".join(f"{k.split('/')[1]} {v:.2f}" for k, v in sorted(metrics.items()))
+        print(f"[bench@step{trainer.global_step}] {msg}", flush=True)
 
 
 def use_ema(args) -> bool:
@@ -294,6 +343,15 @@ def main():
         TokenAxisCallback(args.global_token_count),
         ProgressPrinter(args.print_every, args.global_token_count),
     ]
+    if args.bench_every_val > 0:
+        bench_tasks = [t.strip() for t in args.eval_tasks.split(",") if t.strip()]
+        print(f"in-training benchmarks ON: every {args.bench_every_val} val phase(s), "
+              f"limit {args.bench_progress_limit}/task -> bench/<task>/<metric>")
+        callbacks.append(BenchmarkProgressCallback(
+            dm.tokenizer, bench_tasks, block_size=args.seq_len,
+            batch_tokens=args.eval_batch_tokens, limit=args.bench_progress_limit,
+            every_n_vals=args.bench_every_val,
+        ))
     if use_ema(args):
         print(f"EMA ON: decay={args.ema_decay}  warmup_steps={args.ema_warmup_steps} "
               f"(val/test + downstream eval use the averaged weights)")
@@ -330,11 +388,23 @@ def main():
         # reduce-overhead pins a CUDA-graph pool sized for the train shape — reset
         # dynamo + empty_cache so eval's larger batches don't OOM against dead
         # memory (see chimera cudagraph-eval memory).
+        import gc
         eval_model = getattr(model, "_orig_mod", model)
+        # Free the training CUDA-graph pool before eval. The reduce-overhead pool is
+        # sized for the train fwd/bwd (incl. the vocab-sized logits) and can be
+        # several GB — at large vocab it otherwise OOMs the benchmark's own logits
+        # (observed: 16k vocab, logits ~2GB, died against a 6GB residual pool). Drop
+        # the compiled wrapper's refs + gc so reset/empty_cache can reclaim it.
+        lm_module.model = eval_model
+        del model
+        gc.collect()
         torch._dynamo.reset()
         torch.cuda.empty_cache()
         eval_device = "cuda" if torch.cuda.is_available() else "cpu"
         eval_model.to(eval_device)
+        # Cap the eval batch so vocab-sized logits fit alongside any residual pool
+        # (a full 65k/1k run leaves a big pool; 16384 tokens * 16k vocab = ~1GB).
+        eval_bt = min(args.eval_batch_tokens, 16384)
 
         if args.gen_samples:
             log_generations(eval_model, dm.tokenizer, eval_device, loggers[1])
@@ -344,7 +414,7 @@ def main():
             if eval_tasks:
                 results = run_benchmarks(
                     eval_model, dm.tokenizer, eval_tasks,
-                    block_size=args.seq_len, batch_tokens=args.eval_batch_tokens,
+                    block_size=args.seq_len, batch_tokens=eval_bt,
                     device=eval_device, limit=args.eval_limit,
                 )
                 # headline metric per task only (BLiMP aggregate, not its 67

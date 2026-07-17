@@ -140,9 +140,13 @@ class ChimeraLM(TemplateLM):
         import hashlib
         import pickle
 
-        version = "v1"
-        fp = tuple(self.tokenizer._tok.encode("The quick brown fox",
-                                              add_special_tokens=False).ids)
+        version = "v2"
+        # Fingerprint the FULL tokenizer (vocab size + serialized vocab/merges), NOT
+        # a few common tokens: 4k/8k/16k share their low-id common tokens, so a short
+        # fingerprint collides across vocab sizes -> one vocab's cached token ids get
+        # fed to another model's embedding -> out-of-range index / device-side assert.
+        fp = (self.tokenizer._tok.get_vocab_size(),
+              hashlib.md5(self.tokenizer._tok.to_str().encode()).hexdigest())
         h = hashlib.md5(f"{version}|{fp}|{len(pairs)}".encode())
         for ctx, cont in pairs:
             h.update(ctx.encode("utf-8")); h.update(b"\x00")
@@ -296,8 +300,13 @@ def run_benchmarks(
     model.eval()
     lm = ChimeraLM(model, tokenizer, block_size, batch_tokens, device)
     try:
+        # cache_requests=False: lm-eval's request cache keys on a tokenizer hash
+        # that DOESN'T distinguish our 4k/8k/16k BPE tokenizers (same class/config),
+        # so it would feed one vocab's cached token ids to another model's embedding
+        # -> out-of-range index / device-side assert. Our own tokenizer-aware
+        # tokcache (_encode_pairs_cached) already caches the encoding safely.
         output = lm_eval.simple_evaluate(
-            model=lm, tasks=tasks, num_fewshot=0, limit=limit, cache_requests=True
+            model=lm, tasks=tasks, num_fewshot=0, limit=limit, cache_requests=False
         )
     finally:
         model.train(was_training)
