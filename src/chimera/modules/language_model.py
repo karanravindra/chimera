@@ -91,6 +91,17 @@ class LanguageModelModule(LightningModule):
         self.log("train/lr", lr, on_step=True, prog_bar=True)
         return loss
 
+    def on_before_zero_grad(self, optimizer):
+        # DeepSeek aux-loss-free MoE: nudge each router's load-balancing bias once
+        # per optimizer step (this hook fires after step(), before grads are
+        # zeroed — correct under gradient accumulation), from the assignment
+        # counts the gate forwards accumulated. No-op for dense models. Without
+        # it the router never balances and experts collapse.
+        raw = getattr(self.model, "_orig_mod", self.model)
+        update = getattr(raw, "update_moe_bias", None)
+        if update is not None:
+            update()
+
     def _source_name(self, dataloader_idx):
         """Map a val/test dataloader index -> source key, when the datamodule
         serves one loader per source (per-dataset metrics). Returns None for the

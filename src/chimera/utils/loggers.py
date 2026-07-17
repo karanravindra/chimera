@@ -1,5 +1,7 @@
 import time
+from collections import deque
 from pathlib import Path
+from statistics import median
 
 import lightning.pytorch as pl
 from lightning.pytorch.loggers import CSVLogger, Logger, WandbLogger
@@ -13,12 +15,22 @@ class ProgressPrinter(pl.Callback):
     run's stdout is block-buffered. Every print uses ``flush=True`` so the lines
     appear in the log file immediately. Metrics are read from
     ``trainer.callback_metrics`` (whatever the module logged: loss/bpt/bpb).
+
+    Rate + ETA come from a rolling median of per-optimizer-step *training*
+    durations (not the wall time since the last print): the interval straddling a
+    validation pass is discarded and the compile-warmup steps age out of the
+    window, so the ETA doesn't thrash (a naive "tokens since last print / wall
+    since last print" counts validation + compile as training and swings wildly).
+    ETA is training-only — it doesn't budget for remaining validation passes.
     """
 
-    def __init__(self, print_every: int = 500, tokens_per_step: int = 0):
+    def __init__(self, print_every: int = 500, tokens_per_step: int = 0,
+                 rate_window: int = 50):
         super().__init__()
         self.print_every = int(print_every)
         self.tokens_per_step = int(tokens_per_step)
+        # window of recent per-step durations (secs) for a stable rate estimate
+        self.rate_window = int(rate_window)
 
     @staticmethod
     def _fmt_dt(seconds: float) -> str:
@@ -44,8 +56,11 @@ class ProgressPrinter(pl.Callback):
 
     def on_train_start(self, trainer, pl_module):
         self._t0 = time.monotonic()
-        self._last_t = self._t0
+        self._prev_batch_t = self._t0
         self._last_step = trainer.global_step
+        self._recent = deque(maxlen=self.rate_window)
+        # discard the first interval (compile warmup / setup) — not a real step rate
+        self._skip_dur = True
         total = self._total_steps(trainer)
         print(f"[progress] train start: target {total or '?'} steps, "
               f"{self.tokens_per_step} tokens/step", flush=True)
@@ -53,16 +68,27 @@ class ProgressPrinter(pl.Callback):
     def on_train_epoch_start(self, trainer, pl_module):
         self._epoch_t = time.monotonic()
 
+    def _sps(self) -> float:
+        """Steady-state steps/sec from the rolling median per-step duration."""
+        return (1.0 / median(self._recent)) if self._recent else 0.0
+
     def on_train_batch_end(self, trainer, pl_module, *args, **kwargs):
         step = trainer.global_step
+        now = time.monotonic()
+        # Record one duration per optimizer step (global_step advances). Skip the
+        # interval flagged after start/validation (it includes compile/val time,
+        # not steady-state training).
+        if step != self._last_step:
+            if self._skip_dur:
+                self._skip_dur = False
+            else:
+                self._recent.append((now - self._prev_batch_t) / (step - self._last_step))
+            self._prev_batch_t = now
+            self._last_step = step
+
         if self.print_every <= 0 or step == 0 or step % self.print_every != 0:
             return
-        if step == self._last_step:  # same optimizer step (grad accum) -> skip dup
-            return
-        now = time.monotonic()
-        dstep = step - self._last_step
-        dt = max(now - self._last_t, 1e-9)
-        sps = dstep / dt
+        sps = self._sps()
         tps = sps * self.tokens_per_step
         total = self._total_steps(trainer)
         eta = self._fmt_dt((total - step) / sps) if (total and sps > 0) else "?"
@@ -71,7 +97,6 @@ class ProgressPrinter(pl.Callback):
               f"{self._metrics(trainer, 'train')}  |  {sps:.2f} step/s  "
               f"{tps/1e3:.0f}k tok/s  elapsed {self._fmt_dt(now - self._t0)}  eta {eta}",
               flush=True)
-        self._last_t, self._last_step = now, step
 
     def on_train_epoch_end(self, trainer, pl_module):
         if hasattr(self, "_epoch_t"):
@@ -87,6 +112,11 @@ class ProgressPrinter(pl.Callback):
         m = self._metrics(trainer, "val")
         print(f"[progress] val done in {self._fmt_dt(time.monotonic() - self._val_t)}"
               + (f"  |  {m}" if m else ""), flush=True)
+        # The next train interval straddles this val pass — discard it from the
+        # step-rate estimate so ETA doesn't spike (mirrors the compile-warmup skip).
+        if hasattr(self, "_recent"):
+            self._skip_dur = True
+            self._prev_batch_t = time.monotonic()
 
     def on_test_start(self, trainer, pl_module):
         self._test_t = time.monotonic()

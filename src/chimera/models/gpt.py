@@ -55,6 +55,19 @@ def _make_sparse_mask_mod(past_len: int, window: int, n_global: int):
     return mask_mod
 
 
+def _make_doc_causal_mask_mod(doc_ids):
+    """Causal AND same-document: a query attends only to earlier tokens *in its
+    own packed document*. ``doc_ids`` is a (B, T) int tensor of per-token segment
+    ids (docs delimited by the eos token). RoPE is relative, so no position reset
+    is needed — intra-doc relative offsets are already correct at any window
+    offset."""
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return (kv_idx <= q_idx) & (doc_ids[b, q_idx] == doc_ids[b, kv_idx])
+
+    return mask_mod
+
+
 def build_block_mask(
     B: int, T: int, past_len: int, device, window: int | None = None, n_global: int = 0
 ) -> BlockMask:
@@ -758,6 +771,7 @@ class GPT(nn.Module):
         use_flash_attn: bool = True,
         attn_window: int | None = None,
         attn_global_tokens: int = 16,
+        doc_mask_eos_id: int | None = None,
         use_attn_res: bool = False,
         attn_res_n_blocks: int = 8,
         use_mla: bool = False,
@@ -829,6 +843,11 @@ class GPT(nn.Module):
         # dense-causal case and is bypassed when a window is set.
         self.attn_window = attn_window
         self.attn_global_tokens = attn_global_tokens
+        # Document masking (packed pretraining): when set, tokens attend only
+        # within their own eos-delimited document (block-diagonal causal mask via
+        # flex_attention). Only applies to the prefill/training path (past_len==0);
+        # single-sequence decode/generation is unaffected. None -> disabled.
+        self.doc_mask_eos_id = doc_mask_eos_id
 
         # Maximal Update Parameterization (muP). The width multiplier m_d relates
         # this model's width to a base/proxy width; init variance and the output
@@ -1032,6 +1051,23 @@ class GPT(nn.Module):
             B, T, past_len, device, self.attn_window, self.attn_global_tokens
         )
 
+    @torch._dynamo.disable
+    def _doc_block_mask(self, idx) -> BlockMask:
+        """Per-batch block-diagonal causal mask: each token attends only within
+        its own eos-delimited document. Rebuilt every step (the boundaries are
+        data-dependent). ``@torch._dynamo.disable`` (like ``_get_block_mask``)
+        forces eager construction so the BlockMask — whose mask_mod closes over a
+        data-dependent ``doc_ids`` tensor — becomes a clean input to the compiled
+        region rather than something dynamo tries (and fails) to trace, and so
+        cudagraph replay can't corrupt it. The eos token stays in the document it
+        closes; the next token starts a new one."""
+        B, T = idx.shape
+        is_eos = (idx == self.doc_mask_eos_id).to(torch.int32)
+        doc_ids = is_eos.cumsum(1) - is_eos
+        return create_block_mask(
+            _make_doc_causal_mask_mod(doc_ids), B, None, T, T, device=idx.device
+        )
+
     def _forward(self, idx, past_kvs=None, use_cache: bool = True):
         B, T = idx.shape
         if past_kvs is not None and not use_cache:
@@ -1045,8 +1081,12 @@ class GPT(nn.Module):
         x = self.tok_emb(idx) * self.mup_input_mult  # muP embedding multiplier
         cos, sin = self.rope(past_len, T, idx.device)
         # block_mask=None -> pure causal via SDPA/flash in the attention
-        # modules; a BlockMask -> flex_attention (decode offset / sparse masks).
-        if self.use_flash_attn and past_len == 0 and self.attn_window is None:
+        # modules; a BlockMask -> flex_attention (decode offset / sparse / doc masks).
+        if self.doc_mask_eos_id is not None and past_len == 0:
+            # Packed pretraining: block-diagonal causal so tokens attend only
+            # within their own document (forces the flex path; no SDPA fast path).
+            block_mask = self._doc_block_mask(idx)
+        elif self.use_flash_attn and past_len == 0 and self.attn_window is None:
             block_mask = None
         else:
             block_mask = self._get_block_mask(B, T, past_len, idx.device)
@@ -1159,9 +1199,23 @@ class GPT(nn.Module):
         idx,
         max_new_tokens: int,
         temperature: float = 1.0,
+        top_k: int | None = None,
+        min_p: float | None = None,
+        repetition_penalty: float = 1.0,
         compile: bool = False,
     ):
         """Autoregressively sample ``max_new_tokens`` tokens with a KV cache.
+
+        Sampling controls (all default to no-op, so callers that pass only
+        ``temperature`` are unchanged):
+          * ``repetition_penalty`` > 1 divides the logit of every already-emitted
+            token (CTRL-style), the cheapest cure for the degenerate ``x x x …``
+            loops a small/under-trained model falls into under plain sampling.
+          * ``top_k`` keeps only the k highest-logit tokens.
+          * ``min_p`` keeps tokens with prob >= ``min_p * max_prob`` (a
+            confidence-relative nucleus that adapts to how peaked the step is —
+            usually a better fit than top_k for tiny models).
+        Filters compose in that order (penalty -> temperature -> top_k -> min_p).
 
         These tiny models are launch-overhead bound during decode, so ``compile=True``
         ``torch.compile``s the per-step forward (~2-3x faster steady-state). The first
@@ -1175,6 +1229,8 @@ class GPT(nn.Module):
             raise ValueError("max_new_tokens must be >= 0")
         if temperature <= 0:
             raise ValueError("temperature must be > 0")
+        if repetition_penalty <= 0:
+            raise ValueError("repetition_penalty must be > 0")
         if idx.size(1) + max_new_tokens > self.block_size:
             raise ValueError(
                 f"prompt length ({idx.size(1)}) + max_new_tokens ({max_new_tokens}) "
@@ -1197,8 +1253,22 @@ class GPT(nn.Module):
 
         for _ in range(max_new_tokens):
             # Only the last position is needed to sample the next token.
-            next_logits = self.project(hidden[:, -1, :]) / temperature
-            probs = torch.softmax(next_logits, dim=-1)
+            logits = self.project(hidden[:, -1, :])  # (B, V), raw
+            if repetition_penalty != 1.0:
+                # Penalize tokens already in the sequence (CTRL: /p if logit>0 else *p).
+                seen = torch.gather(logits, 1, idx)
+                seen = torch.where(seen > 0, seen / repetition_penalty,
+                                   seen * repetition_penalty)
+                logits.scatter_(1, idx, seen)
+            logits = logits / temperature
+            if top_k is not None:
+                kth = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1).values[:, -1:]
+                logits = logits.masked_fill(logits < kth, float("-inf"))
+            probs = torch.softmax(logits, dim=-1)
+            if min_p is not None:
+                keep = probs >= min_p * probs.max(dim=-1, keepdim=True).values
+                probs = torch.where(keep, probs, 0.0)
+                probs = probs / probs.sum(dim=-1, keepdim=True)
             nxt = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, nxt], dim=1)
             # Feed only the new token; RoPE/attention use the cached keys/values.

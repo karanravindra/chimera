@@ -41,12 +41,17 @@ class MixtureDataModule(pl.LightningDataModule):
         sft: bool = False,
         num_workers: int = 7,
         pin_memory: bool = True,
+        root_subdir: str = "llm-mix",
     ):
         super().__init__()
         self.save_hyperparameters()
 
         self.data_dir = Path(data_dir)
         self.mix_name = mix_name
+        # Container dir under data_dir holding {mix,mix_sft}/<name>/. Default is the
+        # llm project's "llm-mix"; other projects (e.g. tiny-llm) pass their own so
+        # their packed mixes live alongside their raw data.
+        self.root_subdir = root_subdir
         self.batch_size = batch_size
         self.seq_len = seq_len
         self.pretrained_id = pretrained_id
@@ -78,7 +83,7 @@ class MixtureDataModule(pl.LightningDataModule):
     @property
     def _dir(self) -> Path:
         sub = "mix_sft" if self.sft else "mix"
-        return self.data_dir / "llm-mix" / sub / self.mix_name
+        return self.data_dir / self.root_subdir / sub / self.mix_name
 
     def prepare_data(self):
         if not (self._dir / "train.bin").exists():

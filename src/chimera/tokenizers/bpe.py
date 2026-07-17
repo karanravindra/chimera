@@ -102,6 +102,7 @@ class BPETokenizer:
         vocab_size: int,
         special_tokens: Optional[list[str]] = None,
         min_frequency: int = 2,
+        split_digits: bool = False,
     ):
         """Train a byte-level BPE.
 
@@ -110,14 +111,17 @@ class BPETokenizer:
         corpus). ``special_tokens`` are reserved atomic tokens (e.g. ChatML
         markers) added to the vocabulary at fixed low ids; they are only honored
         by the ``hf`` backend. ``min_frequency`` is the minimum pair count for a
-        merge (``hf`` only).
+        merge (``hf`` only). ``split_digits`` pre-tokenizes runs of digits into
+        single characters (Llama/GPT-4 style) so no merge ever spans two digits —
+        better arithmetic generalization; ``hf`` backend only.
         """
         if self.backend == "pretrained":
             return self  # a pretrained tokenizer is fixed; nothing to train
         if self.backend == "scratch":
             self._train_scratch(text, vocab_size)
         else:
-            self._train_hf(text, vocab_size, special_tokens, min_frequency)
+            self._train_hf(text, vocab_size, special_tokens, min_frequency,
+                           split_digits)
         return self
 
     def _train_scratch(self, text: Union[str, Iterable[str]], vocab_size: int):
@@ -150,12 +154,22 @@ class BPETokenizer:
         vocab_size: int,
         special_tokens: Optional[list[str]] = None,
         min_frequency: int = 2,
+        split_digits: bool = False,
     ):
         from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
         specials = list(special_tokens or [])
         tok = Tokenizer(models.BPE(unk_token=None))
-        tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        byte_level = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        if split_digits:
+            # Split runs of digits into single chars *before* byte-level, so a
+            # merge never spans two digits (helps arithmetic). ByteLevel decoder
+            # still reconstructs bytes exactly — digits remain byte-encoded.
+            tok.pre_tokenizer = pre_tokenizers.Sequence(
+                [pre_tokenizers.Digits(individual_digits=True), byte_level]
+            )
+        else:
+            tok.pre_tokenizer = byte_level
         tok.decoder = decoders.ByteLevel()
         trainer = trainers.BpeTrainer(
             vocab_size=vocab_size,
