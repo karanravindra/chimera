@@ -744,6 +744,94 @@ class TransformerBlock(nn.Module):
         return blocks, partial, present
 
 
+class MTPModule(nn.Module):
+    """DeepSeek-V3-style Multi-Token-Prediction module (arXiv:2412.19437, §2.2).
+
+    One sequential depth of MTP: predicts a token one step *further* ahead than
+    the previous depth while keeping the full causal chain (unlike Gloeckle et
+    al. 2024's parallel independent heads). At depth k, for position i it
+    combines the previous depth's representation h_i^{k-1} with the input
+    embedding of token t_{i+k}:
+
+        h'_i = M_k [ RMSNorm(h_i^{k-1}) ; RMSNorm(Emb(t_{i+k})) ]   (concat, 2d->d)
+        h_i^k = TransformerBlock(h'_1 ... h'_T)                     (causal)
+
+    The module owns only ``proj`` (M_k) + one Transformer block + norms; the
+    input embedding (``Emb``) and the output head are SHARED with the main model
+    (passed in / applied by the caller), so MTP adds no vocab-sized parameters
+    and stays muP-clean on the readout. The whole module is discarded at
+    inference -- the base model is byte-identical to a non-MTP checkpoint -- so
+    its only cost is extra training compute (and, optionally, later reuse for
+    self-speculative decoding).
+
+    ``forward`` returns the post-norm representation (ready for the shared
+    output head via ``GPT.project``), which is also fed to the next depth as
+    h^k. Research context: at <~130M params MTP tends to *lag* plain NTP on
+    local-syntax benchmarks, so this is an opt-in auxiliary objective, not a
+    free win at tiny scale.
+    """
+
+    def __init__(self, dim, n_head, n_kv_head, attn_scale, residual_mult):
+        super().__init__()
+        self.norm_h = nn.RMSNorm(dim, eps=1e-6)  # on previous-depth hidden
+        self.norm_e = nn.RMSNorm(dim, eps=1e-6)  # on the shifted token embedding
+        self.proj = nn.Linear(2 * dim, dim, bias=False)  # M_k: [h;e] -> d
+        self.block = TransformerBlock(
+            dim=dim,
+            n_head=n_head,
+            n_kv_head=n_kv_head,
+            mlp_hidden_dim=4 * dim,
+            attn_scale=attn_scale,
+            residual_mult=residual_mult,
+        )
+        self.norm_out = nn.RMSNorm(dim, eps=1e-6)  # match ln_f before the shared head
+
+    def forward(self, h_prev, e_shift, cos, sin, block_mask):
+        h = self.proj(torch.cat([self.norm_h(h_prev), self.norm_e(e_shift)], dim=-1))
+        h, _ = self.block(h, cos, sin, block_mask, past_kv=None, use_cache=False)
+        return self.norm_out(h)
+
+
+class NextLatDynamics(nn.Module):
+    """NextLat latent-dynamics model p_ψ (arXiv:2511.05963, "Next-Latent
+    Prediction Transformers Learn Compact World Models").
+
+    A small MLP that predicts the transformer's *next hidden state* from the
+    current hidden state and the embedding of the next input token (the
+    "action"):
+
+        ĥ_{t+1} = h_t + MLP( LayerNorm( [ Emb(x_{t+1}) ; h_t ] ) )
+
+    Used only as a training-time auxiliary target (next-latent prediction) that
+    shapes the trunk toward belief-state representations; it is discarded at
+    inference (the base model is byte-identical to a plain checkpoint), or
+    optionally reused for variable-length self-speculative decoding. Unlike MTP,
+    the supervision lives in latent space, so it does not add extra token heads
+    and — per the paper — preserves next-token quality rather than degrading it.
+
+    Architecture matches the reference implementation: concat(next_emb, h) ->
+    LayerNorm -> Linear -> GELU -> Linear -> GELU -> Linear, plus a residual
+    around the current state. hidden_dim = round(proj_factor * 2*dim / 128) * 128.
+    """
+
+    def __init__(self, dim: int, proj_factor: float = 1.3):
+        super().__init__()
+        input_dim = 2 * dim
+        hidden_dim = max(128, 128 * round(proj_factor * input_dim / 128))
+        self.norm_x = nn.LayerNorm(input_dim, bias=False)
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim, bias=False),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim, bias=False),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim, bias=False),
+        )
+
+    def forward(self, current_states, next_token_embeds):
+        x = torch.cat([next_token_embeds, current_states], dim=-1)
+        return current_states + self.mlp(self.norm_x(x))
+
+
 class GPT(nn.Module):
     """A decoder-only Transformer (GPT-style) for character-level language modeling.
 
@@ -787,6 +875,9 @@ class GPT(nn.Module):
         moe_inter_dim: int | None = None,
         route_scale: float = 1.0,
         bias_update_speed: float = 0.001,
+        mtp_depth: int = 0,
+        nextlat: bool = False,
+        nextlat_proj_factor: float = 1.3,
     ):
         super().__init__()
         if vocab_size < 1 or block_size < 1 or n_embd < 1:
@@ -944,6 +1035,35 @@ class GPT(nn.Module):
         if not tie_embedding:
             self.head = nn.Linear(n_embd, vocab_size, bias=False)
 
+        # Multi-Token Prediction (DeepSeek-V3 style): mtp_depth extra sequential
+        # modules, each predicting one token further ahead, sharing the input
+        # embedding + output head with the main model. Auxiliary/training-only;
+        # discarded at inference. mtp_depth == 0 -> disabled (base model unchanged).
+        if mtp_depth < 0:
+            raise ValueError(f"mtp_depth must be >= 0, got {mtp_depth}")
+        self.mtp_depth = mtp_depth
+        if mtp_depth:
+            self.mtp_modules = nn.ModuleList(
+                [
+                    MTPModule(
+                        dim=n_embd,
+                        n_head=n_head,
+                        n_kv_head=n_kv_head,
+                        attn_scale=attn_scale,
+                        residual_mult=self.residual_mult,
+                    )
+                    for _ in range(mtp_depth)
+                ]
+            )
+
+        # NextLat (arXiv:2511.05963): a latent-dynamics MLP that predicts the
+        # model's own next hidden state. Training-only auxiliary objective
+        # (next-latent prediction); discarded at inference. Mutually exclusive
+        # with MTP in practice (both are aux objectives to A/B against NTP).
+        self.nextlat = nextlat
+        if nextlat:
+            self.dynamics_model = NextLatDynamics(n_embd, nextlat_proj_factor)
+
         self._init_weights()
 
     def _init_weights(self):
@@ -983,6 +1103,27 @@ class GPT(nn.Module):
                 nn.init.zeros_(block.attn_res_proj)
                 nn.init.zeros_(block.mlp_res_proj)
                 # AttnRes RMSNorm gains keep their default ones initialization.
+
+        # MTP modules: same muP/depth-aware scales as a main block. proj (M_k)
+        # is a hidden matrix; the module's Transformer block splits into
+        # hidden/residual params exactly like the main blocks. RMSNorm gains keep
+        # their default ones init.
+        if self.mtp_depth:
+            residual_std = hidden_std / math.sqrt(2 * self.mup_base_depth)
+            for m in self.mtp_modules:
+                nn.init.normal_(m.proj.weight, mean=0.0, std=hidden_std)
+                for p in m.block.attn.hidden_params() + m.block.mlp.hidden_params():
+                    nn.init.normal_(p, mean=0.0, std=hidden_std)
+                for p in m.block.attn.residual_params() + m.block.mlp.residual_params():
+                    nn.init.normal_(p, mean=0.0, std=residual_std)
+
+        # NextLat dynamics MLP: plain 0.02 init (matches the reference impl; it's
+        # an auxiliary side-network, not muP-parameterized). LayerNorm gains keep
+        # their default ones init.
+        if self.nextlat:
+            for module in self.dynamics_model.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
         # Initialize a genuinely untied head at readout scale.
         head = getattr(self, "head", None)
@@ -1184,11 +1325,51 @@ class GPT(nn.Module):
         """Project hidden states to vocabulary logits (with the muP output multiplier)."""
         return (hidden @ self.lm_head_weight.t()) * self.output_mult
 
-    def forward(self, idx, return_hidden: bool = False):
+    def _mtp_hiddens(self, main_hidden, idx):
+        """Run the MTP modules on top of the main trunk output.
+
+        Returns a list of ``mtp_depth`` post-norm hidden tensors (B, T, C); the
+        k-th (1-indexed) predicts the token at offset k+1 and is meant to be run
+        through the shared output head (``project``). Reuses the main model's
+        RoPE table and causal/doc mask so MTP attention matches the main path.
+
+        Tail safety: the k-th depth reads Emb(t_{i+k}); for a target position i
+        that is valid (i+k+1 <= T-1) every embedding it can attend to under
+        causal masking is in-range, and the garbage tail (zero-padded shift) sits
+        strictly *after* every valid position, so causal attention never mixes it
+        into a supervised position. The tail targets are masked (-100) by the
+        loss anyway.
+        """
+        B, T = idx.shape
+        cos, sin = self.rope(0, T, idx.device)
+        if self.doc_mask_eos_id is not None:
+            block_mask = self._doc_block_mask(idx)
+        elif self.use_flash_attn and self.attn_window is None:
+            block_mask = None  # SDPA causal fast path in the attention module
+        else:
+            block_mask = self._get_block_mask(B, T, 0, idx.device)
+        e = self.tok_emb(idx) * self.mup_input_mult  # shared, muP-scaled input emb
+        outs = []
+        h_prev = main_hidden
+        for k, module in enumerate(self.mtp_modules, start=1):
+            # Emb(t_{i+k}): shift left by k, zero-pad the (masked) tail.
+            e_shift = torch.cat(
+                [e[:, k:, :], e.new_zeros(B, k, e.size(-1))], dim=1
+            )
+            h_prev = module(h_prev, e_shift, cos, sin, block_mask)
+            outs.append(h_prev)
+        return outs
+
+    def forward(self, idx, return_hidden: bool = False, return_mtp: bool = False):
         assert idx.size(1) <= self.block_size, (
             "Cannot forward, model block size is exhausted."
         )
         hidden, _ = self._forward(idx, past_kvs=None, use_cache=False)
+        if return_mtp:
+            # Training-only MTP path: main trunk hidden + per-depth MTP hiddens.
+            # Both are pre-projection (like return_hidden); the caller applies the
+            # shared head (+ muP output mult) per depth.
+            return hidden, self._mtp_hiddens(hidden, idx)
         if return_hidden:
             return hidden
         return self.project(hidden)

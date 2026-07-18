@@ -154,9 +154,36 @@ def parse_args():
     p.add_argument("--no-ema", dest="use_ema", action="store_false")
     p.add_argument("--no-scheduler", dest="use_scheduler", action="store_false")
     p.add_argument("--no-compile", dest="compile", action="store_false")
+    # --no-cudagraph: torch.compile without CUDA graphs (mode="default"). Avoids
+    # the growing cudagraph private pool that OOMs multi-graph models (e.g. MTP)
+    # late in long runs; keeps Inductor fusion. Numerically identical.
+    p.add_argument("--no-cudagraph", dest="cudagraph", action="store_false")
     # CCE (fused lm_head+CE) barely helps at tiny vocab (logits are cheap), so it is
     # OFF by default here; --cce to enable.
     p.add_argument("--cce", dest="use_cce", action="store_true")
+    # Multi-Token Prediction (DeepSeek-V3 style, chimera.models.gpt.MTPModule):
+    # mtp-depth extra sequential modules (each +1 token ahead, sharing emb+head),
+    # auxiliary training loss L_main + mtp-weight*mean_k(L_k). Discarded at
+    # inference. OFF by default (depth 0). NB: published evidence shows MTP does
+    # not help — and can hurt local benchmarks (BLiMP) — below ~130M params, so
+    # at this 5-20M scale treat it as an experiment vs the NTP baseline.
+    p.add_argument("--mtp-depth", type=int, default=0,
+                   help="number of DeepSeek-style MTP modules (0=off)")
+    p.add_argument("--mtp-weight", type=float, default=0.1,
+                   help="MTP auxiliary loss weight lambda (DeepSeek used 0.3->0.1)")
+    # NextLat (arXiv:2511.05963): next-latent prediction. A latent-dynamics MLP
+    # predicts the model's own next hidden state; aux losses shape the trunk in
+    # latent space (SmoothL1 + KL), leaving the token objective/inference intact.
+    # Designed to PRESERVE next-token quality (unlike MTP, which degrades it at
+    # small scale). Defaults from the paper's ~100M config.
+    p.add_argument("--nextlat", action="store_true",
+                   help="enable NextLat next-latent prediction auxiliary loss")
+    p.add_argument("--nextlat-lambda-mse", type=float, default=1.0)
+    p.add_argument("--nextlat-lambda-kl", type=float, default=1.0)
+    p.add_argument("--nextlat-horizon", type=int, default=1,
+                   help="multi-step latent rollout horizon d")
+    p.add_argument("--nextlat-proj-factor", type=float, default=1.3,
+                   help="dynamics MLP hidden = round(proj_factor*2C/128)*128")
     # Final trainer.test() pass -> test/<src>/bpb on the held-out val windows.
     p.add_argument("--no-test", dest="run_test", action="store_false")
     # Zero-shot downstream benchmarks (bench.py, lm-eval-harness) run after
@@ -230,8 +257,11 @@ def use_ema(args) -> bool:
 def default_run_name(args) -> str:
     tok = Path(args.tokenizer).name  # e.g. "8k"
     ema = f"ema{args.ema_decay}" if use_ema(args) else "noema"
+    mtp = f"-mtp{args.mtp_depth}w{args.mtp_weight}" if args.mtp_depth else ""
+    nl = (f"-nextlat-mse{args.nextlat_lambda_mse}kl{args.nextlat_lambda_kl}"
+          f"h{args.nextlat_horizon}") if args.nextlat else ""
     return (f"gpt-{args.n_embd}-{args.n_head}-{args.n_kv_head}-{args.n_layer}"
-            f"-{tok}-seq{args.seq_len}-{ema}-{args.mix}-muon{args.muon_lr}-steps{args.max_steps}")
+            f"-{tok}-seq{args.seq_len}-{ema}{mtp}{nl}-{args.mix}-muon{args.muon_lr}-steps{args.max_steps}")
 
 
 def main():
@@ -289,7 +319,17 @@ def main():
         mup_input_mult=args.mup_input_mult,
         mup_output_mult=args.mup_output_mult,
         doc_mask_eos_id=dm.eos_id if args.doc_masking else None,
+        mtp_depth=args.mtp_depth,
+        nextlat=args.nextlat,
+        nextlat_proj_factor=args.nextlat_proj_factor,
     )
+    if args.mtp_depth:
+        print(f"MTP ON: depth={args.mtp_depth} weight={args.mtp_weight} "
+              f"(DeepSeek-style, training-only; discarded at inference)")
+    if args.nextlat:
+        print(f"NextLat ON: lambda_mse={args.nextlat_lambda_mse} "
+              f"lambda_kl={args.nextlat_lambda_kl} horizon={args.nextlat_horizon} "
+              f"proj_factor={args.nextlat_proj_factor} (training-only; discarded at inference)")
     if args.doc_masking:
         print(f"document masking ON (eos_id={dm.eos_id}): intra-doc attention + boundary loss mask")
     n_params = sum(p.numel() for p in model.parameters())
@@ -303,7 +343,7 @@ def main():
             muon_lr=args.muon_lr,
             adamw_lr=args.adamw_lr,
             adamw_weight_decay=args.adamw_weight_decay,
-            adamw_name_keywords=("emb", "head", "gate"),
+            adamw_name_keywords=("emb", "head", "gate", "dynamics"),
         )
     )
     scheduler = (
@@ -316,7 +356,14 @@ def main():
     )
 
     if args.compile:
-        model = torch.compile(model, mode="reduce-overhead")
+        # reduce-overhead uses CUDA graphs (lowest per-step overhead) but each
+        # distinct compiled graph keeps its own private memory pool. MTP adds a
+        # second graph shape (the return_mtp training path alongside return_hidden
+        # val), ~doubling the pool, which grows over many steps and OOMs a 16GB
+        # card late in a 1B-token run. --no-cudagraph keeps Inductor fusion (most
+        # of the speedup) without the growing pool; numerically identical.
+        mode = "reduce-overhead" if args.cudagraph else "default"
+        model = torch.compile(model, mode=mode)
 
     # per-source + aggregate bytes/token for tokenizer-invariant bpb logging.
     agg_bpt, src_bpt = measure_bpb(args.tokenizer, args.mix, data_dir=args.data_dir)
@@ -325,6 +372,10 @@ def main():
         model, optimizer, scheduler, use_cce=args.use_cce,
         bytes_per_token=agg_bpt, source_bpt=src_bpt,
         doc_boundary_eos_id=dm.eos_id if args.doc_masking else None,
+        mtp_weight=args.mtp_weight,
+        nextlat_lambda_mse=args.nextlat_lambda_mse if args.nextlat else 0.0,
+        nextlat_lambda_kl=args.nextlat_lambda_kl if args.nextlat else 0.0,
+        nextlat_horizon=args.nextlat_horizon,
     )
 
     run_dir = Path(args.run_dir)

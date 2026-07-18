@@ -34,12 +34,14 @@ class TinyLMModule(LanguageModelModule):
         # with the model's doc_mask_eos_id; None -> no boundary masking.
         self.doc_boundary_eos_id = doc_boundary_eos_id
 
-    def _step(self, batch):
+    def _target_mask(self, x, y):
+        # Document masking: ignore the target at every eos input position (it
+        # would predict the *next*, unrelated document's first token). Applied by
+        # both the plain next-token path and the MTP auxiliary path via the base
+        # class hook, so MTP targets inherit the same boundary masking.
         if self.doc_boundary_eos_id is not None:
-            x, y = batch
             y = y.masked_fill(x == self.doc_boundary_eos_id, -100)  # CE/CCE ignore_index
-            batch = (x, y)
-        return super()._step(batch)
+        return y
 
     def _log_stage(self, stage, loss, bpt, on_step):
         # train on-step: loss + aggregate bpb (mix-wide normalizer). No bpt.

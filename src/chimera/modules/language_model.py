@@ -1,6 +1,7 @@
 import math
 
 import torch
+import torch.nn.functional as F
 from lightning import LightningModule
 from torch import nn
 
@@ -15,7 +16,9 @@ class LanguageModelModule(LightningModule):
     and pass it from the training script).
     """
 
-    def __init__(self, model, optimizer, scheduler, use_cce=False, bytes_per_token=None):
+    def __init__(self, model, optimizer, scheduler, use_cce=False,
+                 bytes_per_token=None, mtp_weight=0.0,
+                 nextlat_lambda_mse=0.0, nextlat_lambda_kl=0.0, nextlat_horizon=1):
         super().__init__()
         self.model = model
         self.optimizer = optimizer
@@ -28,6 +31,21 @@ class LanguageModelModule(LightningModule):
         # a large memory saving with big vocabularies. Requires the model to
         # expose hidden states and lm_head_weight, and bf16/fp16 hidden states.
         self.use_cce = use_cce
+        # Multi-Token Prediction auxiliary loss weight (lambda). The training loss
+        # is L_main + mtp_weight * mean_k(L_mtp_k) when the model has MTP modules
+        # (see chimera.models.gpt.MTPModule). 0 -> MTP off (also a no-op if the
+        # model has no MTP modules). MTP affects TRAINING ONLY: val/test always
+        # log the pure next-token loss, so val/loss & bpb stay comparable to a
+        # non-MTP baseline. DeepSeek-V3 used lambda 0.3 early then 0.1.
+        self.mtp_weight = mtp_weight
+        # NextLat (arXiv:2511.05963) next-latent prediction auxiliary losses. When
+        # the model has a dynamics_model, the training loss becomes
+        # L_ntp + lambda_mse*L_smoothL1(sg[h_{t+i}], ĥ) + lambda_kl*L_KL. Both 0
+        # (or no dynamics_model) -> NextLat off. Training-only: val/test log pure
+        # next-token metrics (comparable to a non-NextLat baseline).
+        self.nextlat_lambda_mse = nextlat_lambda_mse
+        self.nextlat_lambda_kl = nextlat_lambda_kl
+        self.nextlat_horizon = nextlat_horizon
 
         self.criterion = nn.CrossEntropyLoss()
 
@@ -41,8 +59,35 @@ class LanguageModelModule(LightningModule):
     def forward(self, x):
         return self.model(x)
 
+    def _target_mask(self, x, y):
+        """Hook to mask the loss targets (-100 = ignore) before the CE. Identity
+        here; subclasses override (e.g. document-boundary masking). Applied by
+        both the plain and the MTP training path, so MTP auxiliary targets
+        inherit the same masking."""
+        return y
+
+    def _ce_from_hidden(self, hidden, targets):
+        """Cross-entropy of a (B, T, C) hidden state against (B, T) targets via
+        the shared output head, honoring -100 ignore. Mirrors ``_step``'s CCE /
+        dense split; used for the main head AND each MTP depth so they share one
+        code path."""
+        raw = getattr(self.model, "_orig_mod", self.model)
+        if self.use_cce:
+            from cut_cross_entropy import linear_cross_entropy
+
+            hidden = hidden * raw.output_mult
+            return linear_cross_entropy(
+                hidden.reshape(-1, hidden.size(-1)),
+                raw.lm_head_weight,  # (V, C)
+                targets.reshape(-1),
+            )
+        # Dense: replicate GPT.project() (hidden @ head.T * output_mult).
+        logits = (hidden @ raw.lm_head_weight.t()) * raw.output_mult
+        return self.criterion(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+
     def _step(self, batch):
         x, y = batch
+        y = self._target_mask(x, y)
         if self.use_cce:
             from cut_cross_entropy import linear_cross_entropy
 
@@ -61,6 +106,102 @@ class LanguageModelModule(LightningModule):
             loss = self.criterion(logits.reshape(-1, vocab_size), y.reshape(-1))
         bpt = loss / math.log(2)
         return loss, bpt
+
+    def _mtp_active(self) -> bool:
+        raw = getattr(self.model, "_orig_mod", self.model)
+        return self.mtp_weight > 0 and getattr(raw, "mtp_depth", 0) > 0
+
+    def _training_loss(self, batch):
+        """Single-forward MTP training loss. Returns (total, main_loss, bpt, aux):
+        ``total`` = main + mtp_weight * mean_k(aux_k) is what we backprop;
+        ``main_loss`` / ``bpt`` are the pure next-token metrics we log (kept
+        comparable to a non-MTP baseline). Depth k predicts the token at offset
+        k beyond the main next-token target, i.e. y shifted left by k with the
+        exposed tail masked to -100."""
+        x, y = batch
+        y = self._target_mask(x, y)
+        main_hidden, mtp_hiddens = self.model(x, return_mtp=True)
+        main_loss = self._ce_from_hidden(main_hidden, y)
+        B = y.size(0)
+        aux = main_loss.new_zeros(())
+        for k, hk in enumerate(mtp_hiddens, start=1):
+            yk = torch.cat([y[:, k:], y.new_full((B, k), -100)], dim=1)
+            aux = aux + self._ce_from_hidden(hk, yk)
+        aux = aux / len(mtp_hiddens)
+        total = main_loss + self.mtp_weight * aux
+        bpt = main_loss / math.log(2)
+        return total, main_loss, bpt, aux
+
+    def _nextlat_active(self) -> bool:
+        raw = getattr(self.model, "_orig_mod", self.model)
+        return getattr(raw, "nextlat", False) and (
+            self.nextlat_lambda_mse > 0 or self.nextlat_lambda_kl > 0
+        )
+
+    def _nextlat_aux(self, x, hidden, raw):
+        """NextLat auxiliary losses (arXiv:2511.05963) — one recursive rollout of
+        the latent-dynamics model p_ψ over ``nextlat_horizon`` steps, teacher-
+        forced on the true tokens. Returns (mse, kl):
+
+          * mse = mean_i SmoothL1( sg[h_{t+i}], ĥ_{t+i} )  — self-predictive; the
+            stop-gradient on the target prevents representational collapse.
+          * kl  = mean_i KL( sg[p(·|h_{t+i})] || p(·|ĥ_{t+i}) ), computed with the
+            output head weights *detached* so the KL updates only p_ψ and the
+            trunk (via ĥ), never the head (matches the reference impl).
+
+        ĥ depends on the live ``hidden`` (no stop-grad on the input), so both
+        losses backprop into the transformer trunk — that is what shapes it
+        toward belief states. Positions whose target hidden belongs to an eos
+        token are masked (they cross document boundaries)."""
+        d = self.nextlat_horizon
+        out_mult = raw.output_mult
+        head_w = raw.lm_head_weight.detach()  # frozen head for the latent losses
+        eos_id = raw.doc_mask_eos_id
+        curr_eos = (
+            (x == eos_id) if eos_id is not None
+            else torch.zeros_like(x, dtype=torch.bool)
+        )
+        use_kl = self.nextlat_lambda_kl > 0
+        pred = hidden                                   # ĥ rollout, starts at h_t
+        target = hidden                                 # true future hidden (sg'd below)
+        toks = raw.tok_emb(x) * raw.mup_input_mult      # next-token embeddings ("actions")
+        # Teacher token-distribution from the true hidden (fully detached).
+        teacher = (hidden.detach() @ head_w.t()) * out_mult if use_kl else None
+        mse_tot = hidden.new_zeros(())
+        kl_tot = hidden.new_zeros(())
+        for i in range(d):
+            pred = pred[:, :-1]
+            toks = toks[:, 1:]
+            target = target[:, 1:]
+            if use_kl:
+                teacher = teacher[:, 1:]
+            pred = raw.dynamics_model(pred, toks)       # ĥ_{t+i} = p_ψ(ĥ_{t+i-1}, x_{t+i})
+            mmask = (~curr_eos[:, i + 1:]).unsqueeze(-1).to(pred.dtype)
+            mse_elem = F.smooth_l1_loss(pred, target.detach(), reduction="none") * mmask
+            mse_tot = mse_tot + mse_elem.sum() / mmask.expand_as(mse_elem).sum().clamp_min(1.0)
+            if use_kl:
+                student = (pred @ head_w.t()) * out_mult
+                kmask = (~curr_eos[:, i + 1:]).to(student.dtype)
+                log_q = F.log_softmax(teacher.detach(), dim=-1)  # teacher (true)
+                log_p = F.log_softmax(student, dim=-1)           # student (predicted)
+                kl_pt = F.kl_div(log_p, log_q, log_target=True, reduction="none").sum(-1)
+                kl_tot = kl_tot + (kl_pt * kmask).sum() / kmask.sum().clamp_min(1.0)
+        return mse_tot / d, kl_tot / d
+
+    def _nextlat_training_loss(self, batch):
+        """Single-forward NextLat training loss. Returns (total, main_loss, bpt,
+        mse, kl); ``total`` = L_ntp + lambda_mse*mse + lambda_kl*kl is
+        backpropagated, while main_loss/bpt (pure next-token) are logged so the
+        metrics stay comparable to a non-NextLat baseline."""
+        x, y = batch
+        y = self._target_mask(x, y)
+        raw = getattr(self.model, "_orig_mod", self.model)
+        hidden = self.model(x, return_hidden=True)  # (B, T, C), grad-connected
+        main_loss = self._ce_from_hidden(hidden, y)
+        mse, kl = self._nextlat_aux(x, hidden, raw)
+        total = main_loss + self.nextlat_lambda_mse * mse + self.nextlat_lambda_kl * kl
+        bpt = main_loss / math.log(2)
+        return total, main_loss, bpt, mse, kl
 
     def _log_stage(self, stage, loss, bpt, on_step):
         self.log(f"{stage}/loss", loss, on_step=on_step, on_epoch=not on_step, prog_bar=True)
@@ -81,7 +222,18 @@ class LanguageModelModule(LightningModule):
     def training_step(self, batch, batch_idx):
         if self._fully_masked(batch):
             return None
-        loss, bpt = self._step(batch)
+        if self._nextlat_active():
+            total, loss, bpt, mse, kl = self._nextlat_training_loss(batch)
+            self.log("train/nextlat_mse", mse, on_step=True, prog_bar=False)
+            self.log("train/nextlat_kl", kl, on_step=True, prog_bar=False)
+        elif self._mtp_active():
+            total, loss, bpt, aux = self._training_loss(batch)
+            self.log("train/mtp_aux", aux, on_step=True, prog_bar=False)
+        else:
+            loss, bpt = self._step(batch)
+            total = loss
+        # Log the pure next-token loss/bpt (comparable across MTP on/off); the
+        # returned `total` (main + weighted MTP aux) is what gets backpropagated.
         self._log_stage("train", loss, bpt, on_step=True)
         lr = (
             self.scheduler.get_last_lr()[0]
@@ -89,7 +241,7 @@ class LanguageModelModule(LightningModule):
             else self.optimizer.param_groups[0]["lr"]
         )
         self.log("train/lr", lr, on_step=True, prog_bar=True)
-        return loss
+        return total
 
     def on_before_zero_grad(self, optimizer):
         # DeepSeek aux-loss-free MoE: nudge each router's load-balancing bias once
