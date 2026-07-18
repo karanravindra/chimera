@@ -14,4 +14,4 @@ checkpoints/
 /data/
 wandb/
 # generated per-source bytes/token cache
-projects/tiny-llm/gpt/bpb_cache.json
+projects/_archive/tiny-llm/gpt/bpb_cache.json
