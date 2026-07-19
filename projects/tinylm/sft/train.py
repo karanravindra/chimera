@@ -51,6 +51,14 @@ LOGIT_SOFTCAP = 30.0  # base model was trained under this cap; keep it
 # optimization — gentler than pretrain: the model is converged, SFT reshapes
 MUON_LR = 0.005
 ADAMW_LR = 2.5e-4
+
+# LoRA mode: freeze the base, train low-rank deltas on every Linear (qkv/out/
+# fc1/fc2; embeddings + tied head stay frozen). Merged back before saving, so
+# the checkpoint stays architecture-identical to full-FT runs.
+USE_LORA = os.environ.get("USE_LORA", "0") == "1"  # USE_LORA=1 uv run python train.py
+LORA_R = 16
+LORA_ALPHA = 32.0
+LORA_LR = 1e-3  # LoRA trains at ~10x the full-FT AdamW lr (standard practice)
 BATCH_SIZE = 128
 MAX_TRAIN_STEPS = 700
 VALIDATE_EVERY_N_STEPS = 100
@@ -63,7 +71,9 @@ TOKENIZER_PATH = "/mnt/ai/data/mixture_tokenizers/tok_hf_v16384_c1000000000_371c
 BASE_CHECKPOINT = "/mnt/ai/runs/tinylm/pretrain/chimera_gpt6m.pt"
 
 RUN_DIR = Path("/mnt/ai/runs/tinylm/sft")
-CHECKPOINT_PATH = RUN_DIR / "chimera_gpt6m_sft.pt"
+CHECKPOINT_PATH = RUN_DIR / (
+    "chimera_gpt6m_sft_lora.pt" if USE_LORA else "chimera_gpt6m_sft.pt"
+)
 
 GENERATION_PROMPTS = [
     [{"role": "user", "content": "What color is the sky?"}],
@@ -149,22 +159,23 @@ def evaluate(model, loader, eos_id: int) -> float:
 
 @torch.no_grad()
 def print_generations(model, tokenizer, bos_id: int, eos_id: int, im_end_id: int):
+    """Greedy continuation, sliced in TOKEN space (char-slicing the decoded text
+    is wrong: decode(encode(prompt)) need not equal the prompt string)."""
     net = getattr(model, "_orig_mod", model)
     net.eval()
+    device = next(net.parameters()).device
     for messages in GENERATION_PROMPTS:
         prompt = render(messages, add_generation_prompt=True)
-        out = net.sample(
-            tokenizer,
-            prompt,
-            max_new_tokens=80,
-            temperature=0.01,
-            top_k=1,
-            repetition_penalty=1.0,
-            bos_token_id=bos_id,
-            stop_token_ids={eos_id, im_end_id},
-            seed=0,
-        )
-        print(f"\n>>> {messages[-1]['content'][:80]}\n{out[len(prompt):].strip()!r}")
+        ids = tokenizer._tok.encode(prompt, add_special_tokens=False).ids
+        x = torch.tensor([[bos_id] + ids], device=device)
+        out: list[int] = []
+        for _ in range(80):
+            nxt = int(net(x)[0, -1].argmax())
+            if nxt in (eos_id, im_end_id):
+                break
+            out.append(nxt)
+            x = torch.cat([x, torch.tensor([[nxt]], device=device)], dim=1)
+        print(f"\n>>> {messages[-1]['content'][:80]}\n{tokenizer._tok.decode(out).strip()!r}")
     net.train()
 
 
@@ -194,11 +205,24 @@ def train():
     model.load_state_dict(state)
     print(f"loaded base checkpoint: {BASE_CHECKPOINT}")
 
+    if USE_LORA:
+        from chimera.models.lora import apply_lora
+
+        lora_params = apply_lora(model, r=LORA_R, alpha=LORA_ALPHA)
+        n_lora = sum(p.numel() for p in lora_params)
+        n_total = sum(p.numel() for p in model.parameters())
+        print(f"LoRA r={LORA_R}: {n_lora:,} trainable / {n_total:,} ({n_lora / n_total:.1%})")
+
     model.to(DEVICE, dtype=DTYPE)
     if DEVICE == "cuda":
         model = torch.compile(model)
 
-    optimizer = Muon(muon_param_groups(model, muon_lr=MUON_LR, adamw_lr=ADAMW_LR))
+    if USE_LORA:
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad], lr=LORA_LR
+        )
+    else:
+        optimizer = Muon(muon_param_groups(model, muon_lr=MUON_LR, adamw_lr=ADAMW_LR))
     base_lrs = [g["lr"] for g in optimizer.param_groups]
 
     def lr_factor(step: int) -> float:
@@ -237,10 +261,15 @@ def train():
             pbar.set_postfix(step=global_step, loss=f"{loss.item():.4f}")
 
     RUN_DIR.mkdir(parents=True, exist_ok=True)
-    torch.save(getattr(model, "_orig_mod", model).state_dict(), CHECKPOINT_PATH)
+    net = getattr(model, "_orig_mod", model)
+    if USE_LORA:
+        from chimera.models.lora import merge_lora
+
+        net = merge_lora(net)  # fold deltas back -> base-architecture state_dict
+    torch.save(net.state_dict(), CHECKPOINT_PATH)
     print(f"Checkpoint saved to {CHECKPOINT_PATH}")
 
-    net = getattr(model, "_orig_mod", model).to(DEVICE)
+    net = net.to(DEVICE)
     print_generations(net, tok, bos_id, eos_id, im_end_id)
 
 
