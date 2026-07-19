@@ -66,6 +66,10 @@ N_LAYERS = 6
 
 # optimization
 MUON_LR = 0.02
+# Final-logit soft-capping (cap*tanh(logits/cap)) during training + eval; None = off.
+# Inference-only capping strictly hurt (raw logits reach ~40, cap 30 saturates them);
+# this tests the Gemma-2-style TRAIN-time variant. Attention already has QK-norm.
+LOGIT_SOFTCAP = 30.0
 ADAMW_LR = 1e-3
 BATCH_SIZE = 128
 MAX_TRAIN_STEPS = 5000
@@ -188,6 +192,7 @@ def make_model(vocab_size: int) -> GPT:
         n_heads=N_HEADS,
         mlp_mult=MLP_MULT,
         n_layers=N_LAYERS,
+        logit_softcap=LOGIT_SOFTCAP,
     )
 
 
@@ -203,7 +208,7 @@ def compute_loss(model, x, y, eos_id: int, vocab_size: int):
         block_mask, pos_ids = build_block_mask_and_pos(x, eos_id)
         hidden = model(x, return_hidden=True, block_mask=block_mask, pos_ids=pos_ids)
         weight = getattr(model, "_orig_mod", model).token_emb.weight  # tied lm_head
-        return linear_cross_entropy(hidden, weight, y)
+        return linear_cross_entropy(hidden, weight, y, softcap=LOGIT_SOFTCAP)
     logits = model(x)  # CPU fallback: plain causal, no doc masking / flex
     return nn.CrossEntropyLoss()(logits.view(-1, vocab_size), y.view(-1))
 

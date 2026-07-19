@@ -143,10 +143,16 @@ class GPT(nn.Module):
         mlp_mult: int,
         n_layers: int,
         eos_id: int = 0,
+        logit_softcap: float | None = None,
     ):
         super().__init__()
         self.seq_len = seq_len
         self.eos_id = eos_id
+        # Gemma-2-style final-logit soft-capping: logits = cap*tanh(logits/cap).
+        # Train-time regularizer against logit blow-up; applied here so eval and
+        # sampling see the same capped distribution the loss was trained under
+        # (CCE applies the same cap via its softcap arg on the hidden path).
+        self.logit_softcap = logit_softcap
         self.token_emb = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList(
             [TransformerBlock(dim, n_heads, mlp_mult) for _ in range(n_layers)]
@@ -198,6 +204,8 @@ class GPT(nn.Module):
         if return_hidden:
             return (h, new_past_kv) if use_cache else h
         logits = F.linear(h, self.token_emb.weight)
+        if self.logit_softcap is not None:
+            logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
         return (logits, new_past_kv) if use_cache else logits
 
     @torch.no_grad()
