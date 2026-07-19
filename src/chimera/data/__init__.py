@@ -1,6 +1,12 @@
 from .afhq import AFHQDataModule
 from .celebahq import CelebAHQDataModule
 from .cifar10 import CIFAR10DataModule
+from .chat_sft import (
+    ChatSFTDataModule,
+    EverydayConversationsDataModule,
+    GooAQChatDataModule,
+    SQuADChatDataModule,
+)
 from .cifar100 import CIFAR100DataModule
 from .clevr import CLEVRVQADataModule
 from .concat_text import ConcatTextDataModule
@@ -28,6 +34,10 @@ __all__ = [
     "CIFAR100DataModule",
     "CLEVRVQADataModule",
     "CelebAHQDataModule",
+    "ChatSFTDataModule",
+    "EverydayConversationsDataModule",
+    "GooAQChatDataModule",
+    "SQuADChatDataModule",
     "ConcatTextDataModule",
     "CosmopediaV2DataModule",
     "FineWebEduDataModule",
