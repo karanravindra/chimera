@@ -55,7 +55,9 @@ source `id`s are defined in Datasets above.
 
 | run    | steps | mix                       | blimp     | lambada   | piqa      | sciq      | arc_easy  |
 |--------|-------|---------------------------|-----------|-----------|-----------|-----------|-----------|
-| qa-mix | 5k    | cos30 fw34 ts30 gq5 sq1 +doc | 69.53  | **17.27** | 57.24     | **67.40** | 34.76     |
+| curric | 5k    | qa-mix, sc30, cosine LR, cos20→40 | 69.86 | **17.47** | 56.47 | **68.10** | **35.23** |
+| sc30   | 5k    | qa-mix + logit softcap 30 | 69.18     | 16.86     | 55.93     | 67.70     | 34.93     |
+| qa-mix | 5k    | cos30 fw34 ts30 gq5 sq1 +doc | 69.53  | 17.27     | 57.24     | 67.40     | 34.76     |
 | cos    | 5k    | cos30 fw40 ts30           | **70.09** | 16.94     | 55.44     | 54.50     | 33.96     |
 | 3-way  | 5k    | str30 fw40 ts30           | 68.66     | 15.54     | 56.37     | 54.80     | 34.55     |
 | 4-way  | 5k    | tt30 str30 fw25 ts15      | 67.63     | 16.01     | **57.29** | **55.80** | 34.34     |
@@ -90,6 +92,23 @@ answers are often correct ("What color is Tom's ball?" → "red"), closed-book a
 are fluent but circular (capacity, not format). Run log:
 `/mnt/ai/runs/tinylm/pretrain/train_qa-mix_2026-07-19.log`; prior checkpoint preserved
 as `chimera_gpt6m_pre-qa-mix.pt`.
+
+sc30 (2026-07-19): qa-mix + Gemma-2-style final-logit soft-capping (30) in training +
+eval (CCE `softcap` + capped forward). Verdict: wash — every benchmark within noise,
+val_loss −0.03, bpb +0.05. Inference-only capping on the uncapped model strictly HURTS
+(monotonic with tighter caps; raw logits reach ~40 so cap 30 saturates); it's a
+training-time stabilizer, not a quality lever at 6M with QK-norm already present.
+Kept on (harmless); `LOGIT_SOFTCAP=None` disables.
+
+curric (2026-07-19): sc30 + warmup(250)+cosine LR (→0.1x) + two-phase data curriculum —
+same per-source totals, reordered so phase 2 (steps 2500-5000) is cosmopedia-dominant
+(cos 20%→40%, fw 38→30, ts 36→24). First clearly positive intervention since qa-mix:
+best-in-table lambada/sciq/arc + best val_loss 3.154 / bpb 0.844; sciq 68.1 is +3.7
+over gpt2. Anneal did NOT erase early/rare data: documents still ppl 1.02 (verbatim
+recall), QA format intact. Confounded pair (schedule + curriculum changed together) —
+isolate before crediting either alone. Trained-doc coverage audit (sciq/arc wrong
+answers vs training text): 96% of missed sciq facts WERE in training (cosmopedia
+provides ~90% of coverage) — misses are capacity, not data absence.
 
 ## TODO
 
