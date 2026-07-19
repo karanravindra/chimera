@@ -205,7 +205,13 @@ class GPT(nn.Module):
             return (h, new_past_kv) if use_cache else h
         logits = F.linear(h, self.token_emb.weight)
         if self.logit_softcap is not None:
-            logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+            cap = self.logit_softcap
+            if logits.requires_grad:
+                logits = cap * torch.tanh(logits / cap)
+            else:
+                # eval logits are (B, L, V) and huge (lm-eval batches ~131k tokens
+                # x 16k vocab = 4GB bf16); out-of-place tanh doubles that and OOMs
+                logits = logits.div_(cap).tanh_().mul_(cap)
         return (logits, new_past_kv) if use_cache else logits
 
     @torch.no_grad()
