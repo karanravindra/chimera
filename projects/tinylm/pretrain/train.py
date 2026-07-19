@@ -17,6 +17,7 @@ analysis-only and loads that checkpoint.
 
 import math
 import os
+from itertools import islice
 from pathlib import Path
 
 os.environ.setdefault("CCE_AUTOTUNE", "1")
@@ -319,9 +320,12 @@ def train():
     global_step = 1
     for epoch in range(N_EPOCHS):
         model.train()
+        # cap the epoch at MAX_TRAIN_STEPS batches (the pool is far larger) so the
+        # bar tracks the real run length instead of the full ~9k-batch dataloader.
         pbar = tqdm(
-            dm.train_dataloader(),
+            islice(dm.train_dataloader(), MAX_TRAIN_STEPS),
             desc=f"Epoch {epoch + 1}/{N_EPOCHS}",
+            total=MAX_TRAIN_STEPS,
             dynamic_ncols=True,
         )
 
