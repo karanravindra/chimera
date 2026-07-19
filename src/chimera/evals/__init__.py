@@ -3,7 +3,6 @@ from .bench import (
     GPT2_SMALL,
     TASKS,
     headline,
-    model_fingerprint,
     results_table,
     run_eval,
 )
@@ -15,7 +14,6 @@ __all__ = [
     "TASKS",
     "ChimeraLM",
     "headline",
-    "model_fingerprint",
     "results_table",
     "run_eval",
 ]

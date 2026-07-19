@@ -32,9 +32,9 @@ from tqdm import tqdm
 
 from chimera.data import (
     ConcatTextDataModule,
+    CosmopediaV2DataModule,
     FineWebEduTextDataModule,
     TinyStoriesV2DataModule,
-    TinyStrangeTextbooksDataModule,
     TinyTextbooksDataModule,
     TinyWebTextDataModule,
 )
@@ -67,6 +67,7 @@ ADAMW_LR = 1e-3
 BATCH_SIZE = 128
 MAX_TRAIN_STEPS = 5000
 VALIDATE_EVERY_N_STEPS = 500
+BENCH_EVERY_N_STEPS = 1500  # in-training benchmark curve (0/None to disable)
 N_EPOCHS = 1
 
 RUN_DIR = Path("/mnt/ai/runs/tinylm/pretrain")
@@ -82,6 +83,27 @@ def make_datamodule() -> ConcatTextDataModule:
     # via train_tokenizer_on_mixture rather than any single register.
     DATA_DIR = "/mnt/ai/data"
     VAL_TOKENS = 500_000
+    TRAIN_TOKENS = 600_000_000
+
+    ratios = {
+        "tiny-textbooks": 0,
+        "cosmopedia-v2": 30,  # str→cos ablation (vs the logged 3-way str30 fw40 ts30)
+        "fineweb-edu": 40,
+        "tinystories-v2": 30,
+        "tiny-webtext": 0,
+    }
+    total = sum(ratios.values())
+    if total != 100:
+        raise ValueError(f"train mix ratios must sum to 100, got {total}")
+
+    ratios = {k: v / total for k, v in ratios.items()}  # normalize to sum=1
+    print(
+        "train mix: "
+        + "  ".join(
+            f"{k}={int(r * TRAIN_TOKENS):,} ({r:.0%})" for k, r in ratios.items()
+        )
+    )
+
     dm = ConcatTextDataModule(
         [
             # owner: carries the canonical vocab_size / backend / doc convention
@@ -90,31 +112,31 @@ def make_datamodule() -> ConcatTextDataModule:
                 data_dir=DATA_DIR,
                 add_bos=True,
                 vocab_size=16_384,
-                max_train_tokens=180_000_000,
+                max_train_tokens=int(ratios["tiny-textbooks"] * TRAIN_TOKENS),
                 max_val_tokens=VAL_TOKENS,
             ),
-            TinyStrangeTextbooksDataModule(
+            CosmopediaV2DataModule(
                 data_dir=DATA_DIR,
                 add_bos=True,
-                max_train_tokens=150_000_000,
+                max_train_tokens=int(ratios["cosmopedia-v2"] * TRAIN_TOKENS),
                 max_val_tokens=VAL_TOKENS,
             ),
             FineWebEduTextDataModule(
                 data_dir=DATA_DIR,
                 add_bos=True,
-                max_train_tokens=120_000_000,
+                max_train_tokens=int(ratios["fineweb-edu"] * TRAIN_TOKENS),
                 max_val_tokens=VAL_TOKENS,
             ),
             TinyStoriesV2DataModule(
                 data_dir=DATA_DIR,
                 add_bos=True,
-                max_train_tokens=90_000_000,
+                max_train_tokens=int(ratios["tinystories-v2"] * TRAIN_TOKENS),
                 max_val_tokens=VAL_TOKENS,
             ),
             TinyWebTextDataModule(
                 data_dir=DATA_DIR,
                 add_bos=True,
-                max_train_tokens=60_000_000,
+                max_train_tokens=int(ratios["tiny-webtext"] * TRAIN_TOKENS),
                 max_val_tokens=VAL_TOKENS,
             ),
         ],
@@ -251,6 +273,57 @@ def bits_per_byte(model, X: torch.Tensor, Y: torch.Tensor, n_bytes: int) -> floa
     return total_nll / n_bytes / LN2
 
 
+@torch.no_grad()
+def run_benchmarks(model, dm, step=None):
+    """Zero-shot lm-eval over the standard task set.
+
+    With ``step`` given, prints a compact one-line checkpoint row — call it every
+    BENCH_EVERY_N_STEPS to get the in-training benchmark *curve* (is blimp/lambada
+    still climbing, or plateaued?). At the end (``step=None``) prints the full
+    table + a copy-paste README Results row. Scored on the UNCOMPILED net (varied
+    eval shapes would otherwise thrash torch.compile). Mirrors main.ipynb's eval cell."""
+    from chimera.evals import CHANCE, GPT2_SMALL, TASKS, ChimeraLM, headline, run_eval
+
+    net = getattr(model, "_orig_mod", model)
+    net.eval()
+    lm = ChimeraLM(
+        net,
+        dm.tokenizer,
+        eot_id=dm.eos_id,
+        bos_id=dm.bos_id,
+        block_size=net.seq_len,
+        device=DEVICE,
+        batch_tokens=131_072,  # tiny model -> big batches, fewer kernel launches
+    )
+    results = run_eval(lm, TASKS)
+
+    order = ["blimp", "lambada_openai", "piqa", "sciq", "arc_easy"]
+    metrics = {}  # task -> (metric_name, value as %)
+    for task in TASKS:
+        name, val, _ = headline(results[task])
+        metrics[task] = (name, val if ("perplex" in name or "bits_per_byte" in name) else val * 100)
+    row = " | ".join(f"{t}={metrics[t][1]:.2f}" for t in order if t in metrics)
+
+    if step is not None:
+        print(f"\n[bench @ step {step}] {row}")
+    else:
+        print("\n" + "=" * 60)
+        print(f"zero-shot benchmarks  ({MAX_TRAIN_STEPS} steps)")
+        print(f"{'task':<16}{'metric':<10}{'model':>8}{'chance':>8}{'gpt2':>8}")
+        print("-" * 60)
+        for task in TASKS:
+            name, pct = metrics[task]
+            gpt2 = GPT2_SMALL.get(task)
+            print(
+                f"{task:<16}{name:<10}{pct:>8.2f}{CHANCE.get(task, float('nan')):>8.1f}"
+                f"{'-' if gpt2 is None else f'{gpt2:>8.2f}'}"
+            )
+        print("=" * 60)
+        print(f"[bench] {row}")  # copy-paste into the README Results table
+    net.train()
+    return {t: metrics[t][1] for t in metrics}
+
+
 def print_model_stats(model: GPT, global_batch_size: int):
     # verbose=0 + explicit print → exactly one table (avoids a duplicate when the
     # returned ModelStatistics is auto-displayed under a REPL/notebook kernel).
@@ -349,6 +422,15 @@ def train():
                     f"\nStep {global_step}: train_loss={step_loss:.4f}, train_perplexity={step_perplexity:.2f}, val_loss={val_loss:.4f}, val_perplexity={val_perplexity:.2f}, val_bpb={val_bpb:.4f}"
                 )
 
+            # in-training benchmark curve (skip the final step; the full table runs
+            # after the loop). Adds ~20s/eval — a few points to see the trajectory.
+            if (
+                BENCH_EVERY_N_STEPS
+                and global_step % BENCH_EVERY_N_STEPS == 0
+                and global_step < MAX_TRAIN_STEPS
+            ):
+                run_benchmarks(model, dm, step=global_step)
+
             # val metrics get their own `Step N:` line; keep the bar to live-changing fields
             pbar.set_postfix(
                 step=global_step,
@@ -364,6 +446,10 @@ def train():
     # Unwrap torch.compile so the checkpoint has clean (no _orig_mod.) keys.
     torch.save(getattr(model, "_orig_mod", model).state_dict(), CHECKPOINT_PATH)
     print(f"Checkpoint saved to {CHECKPOINT_PATH}")
+
+    # Benchmarks run AFTER the checkpoint is on disk, so an eval hiccup can never
+    # cost the trained model.
+    run_benchmarks(model, dm)
 
 
 if __name__ == "__main__":

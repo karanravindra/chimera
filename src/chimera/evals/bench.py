@@ -5,13 +5,7 @@ the highest logprob), so models are only exposed through lm-eval's loglikelihood
 interface (see ChimeraLM) — no generation needed.
 """
 
-import hashlib
-import os
-import pickle
-from pathlib import Path
-
 import pandas as pd
-import torch
 
 from .lm_harness import ChimeraLM  # noqa: F401  (env setup + re-export for callers)
 
@@ -55,36 +49,15 @@ def get_loaded_tasks(tasks):
     return _LOADED_TASKS[key]
 
 
-def model_fingerprint(model) -> str:
-    """Content hash of the model weights, so the results cache invalidates iff the
-    weights change (retraining -> re-score; re-running the same model -> instant)."""
-    h = hashlib.md5()
-    for name, p in sorted(model.state_dict().items()):
-        h.update(name.encode())
-        h.update(p.detach().to(torch.float32).cpu().numpy().tobytes())
-    return h.hexdigest()[:16]
-
-
-def run_eval(model, lm, tasks=TASKS, force_rerun=False):
-    """Cached lm-eval. Three independent caches, each keyed on what actually changes it:
-      * results dict   -> model weights   (same model -> instant, skip everything below)
+def run_eval(lm, tasks=TASKS):
+    """Run lm-eval over ``tasks``. Two independent caches, each keyed on what actually
+    changes it:
       * loaded tasks   -> task set        (in-process; skips the ~35s dataset reload)
       * tokenized reqs -> tokenizer       (in the adapter; skips re-encoding every run)
-    So after a retrain only the ~19s scoring + bootstrap actually re-run.
-    ``force_rerun=True`` ignores the results cache and re-scores."""
-    cache_dir = Path(os.environ["LM_HARNESS_CACHE_PATH"])
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    key = f"{model_fingerprint(model)}|{lm.tokenizer_name}|{','.join(sorted(tasks))}|0shot"
-    cache_file = cache_dir / f"results-{hashlib.md5(key.encode()).hexdigest()}.pkl"
-    if cache_file.exists() and not force_rerun:
-        print(f"[eval] loaded cached results from {cache_file.name} (same weights)")
-        return pickle.loads(cache_file.read_bytes())
+    So after a retrain only the ~19s scoring + bootstrap actually re-run."""
     task_dict = get_loaded_tasks(tasks)  # in-process; loads datasets once per session
     out = lm_eval.evaluate(lm=lm, task_dict=task_dict, cache_requests=True)
-    results = out["results"]
-    cache_file.write_bytes(pickle.dumps(results))
-    print(f"[eval] scored + cached results -> {cache_file.name}")
-    return results
+    return out["results"]
 
 
 def headline(task_metrics):

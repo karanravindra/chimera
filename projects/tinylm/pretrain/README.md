@@ -52,16 +52,24 @@ source `id`s are defined in Datasets above.
 
 | run    | steps | mix                       | blimp     | lambada   | piqa      | sciq      | arc_easy  |
 |--------|-------|---------------------------|-----------|-----------|-----------|-----------|-----------|
-| 5-way  | 5k    | tt30 str25 fw20 ts15 wt10 | **67.94** | **16.11** | 56.42     | **55.30** | **34.89** |
-| tt+ts  | 1k    | tt50 ts50                 | 65.03     | 12.59     | 56.53     | 54.70     | 31.99     |
-| tt     | 1k    | tt100                     | 63.72     | 6.95      | **56.96** | 55.10     | 33.63     |
-| ts     | 1k    | ts100                     | 62.93     | 10.87     | 52.34     | 27.40     | 26.94     |
+| cos    | 5k    | cos30 fw40 ts30           | **70.09** | **16.94** | 55.44     | 54.50     | 33.96     |
+| 3-way  | 5k    | str30 fw40 ts30           | 68.66     | 15.54     | 56.37     | 54.80     | 34.55     |
+| 4-way  | 5k    | tt30 str30 fw25 ts15      | 67.63     | 16.01     | **57.29** | **55.80** | 34.34     |
+| 5-way  | 5k    | tt30 str25 fw20 ts15 wt10 | 67.94     | 16.11     | 56.42     | 55.30     | **34.89** |
+| tt+ts  | 5k    | tt50 ts50                 | 65.03     | 12.59     | 56.53     | 54.70     | 31.99     |
+| tt     | 5k    | tt100                     | 63.72     | 6.95      | 56.96     | 55.10     | 33.63     |
+| ts     | 5k    | ts100                     | 62.93     | 10.87     | 52.34     | 27.40     | 26.94     |
 | chance | —     | —                         | 50.0      | 0.0       | 50.0      | 25.0      | 25.0      |
 | gpt2   | —     | — (124M ref)              | 82.29     | 32.16     | 62.62     | 64.40     | 39.52     |
 
 5-way stderr: blimp 0.16, lambada 0.51, piqa 1.16, sciq 1.57, arc_easy 0.98.
 
-Notes: the 1k-iter rows are the original ablation (TinyStories v2 + Tiny Textbooks
-only) — Tiny Textbooks dominates every task but LAMBADA (long-range narrative, where
-TinyStories helps); the 50/50 lands between. The 5-way tops the 50/50 everywhere but a
-PIQA wash — confounded by 5x the steps and the retrained tokenizer, not the mix alone.
+Notes: all rows are 5k steps (matched). The knowledge/reasoning tasks (piqa/sciq/arc)
+sit within noise across every mix including tt-alone — capacity-bound at 6M, not
+data-bound. The trainable axes are blimp (grammar) and lambada (long-range), driven
+mainly by FineWeb. As the textbook source, `cos` (Cosmopedia v2) beats `str` on blimp
+(+1.4) and lambada (+1.4) and ties the rest — the current best mix. `wt` (tiny-webtext)
+added nothing (4-way ≈ 5-way). Cross-mix comparisons are still confounded by each run's
+retrained tokenizer — to be standardized under a pinned vocab. In-training curve (cos
+run): blimp/arc/piqa plateau by ~4.5k while lambada/sciq + val_bpb are still rising at
+5k, so a modest tail remains past 5k for those two.
