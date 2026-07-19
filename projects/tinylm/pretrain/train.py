@@ -118,10 +118,11 @@ def make_datamodule() -> ConcatTextDataModule:
     DATA_DIR = "/mnt/ai/data"
     VAL_TOKENS = 500_000
     TRAIN_TOKENS = 600_000_000
-    # projects/tinylm/documents/*.md: always in the mix, outside the ratios.
-    # The files are tiny, so they ride along repeated (~a few hundred exposures
-    # over the run) rather than as a ratio share; excluded from the mixture
-    # tokenizer so the existing vocab + ids caches stay valid.
+    # projects/tinylm/documents/*.md: any files dropped here are always in the
+    # mix, outside the ratios. Tiny files ride along repeated (~a few hundred
+    # exposures over the run) rather than as a ratio share; excluded from the
+    # mixture tokenizer so the vocab + ids caches stay valid. Directory may be
+    # empty (source is skipped then).
     DOCUMENTS_DIR = Path(__file__).parent.parent / "documents"
     DOCUMENTS_REPEAT = 200
 
@@ -195,11 +196,17 @@ def make_datamodule() -> ConcatTextDataModule:
                 max_train_tokens=int(ratios["squad"] * TRAIN_TOKENS),
                 max_val_tokens=VAL_TOKENS,
             ),
-            LocalDocumentsDataModule(
-                doc_dir=str(DOCUMENTS_DIR),
-                repeat=DOCUMENTS_REPEAT,
-                data_dir=DATA_DIR,
-                add_bos=True,
+            *(
+                [
+                    LocalDocumentsDataModule(
+                        doc_dir=str(DOCUMENTS_DIR),
+                        repeat=DOCUMENTS_REPEAT,
+                        data_dir=DATA_DIR,
+                        add_bos=True,
+                    )
+                ]
+                if any(DOCUMENTS_DIR.glob("*.md"))
+                else []
             ),
         ],
         batch_size=BATCH_SIZE,
