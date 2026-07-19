@@ -236,6 +236,8 @@ class HFTextDataModule(pl.LightningDataModule):
         kwargs = {"cache_dir": str(self.data_dir / "hf_cache")}
         if self.DATA_FILES is not None:
             kwargs["data_files"] = self.DATA_FILES
+            # a shard subset can't match the repo's declared full-split sizes
+            kwargs["verification_mode"] = "no_checks"
         if self.CONFIG_NAME is not None:
             kwargs["name"] = self.CONFIG_NAME
         return load_dataset(

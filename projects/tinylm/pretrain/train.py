@@ -34,6 +34,9 @@ from chimera.data import (
     ConcatTextDataModule,
     CosmopediaV2DataModule,
     FineWebEduTextDataModule,
+    GooAQDataModule,
+    LocalDocumentsDataModule,
+    SQuADTextDataModule,
     TinyStoriesV2DataModule,
     TinyTextbooksDataModule,
     TinyWebTextDataModule,
@@ -84,13 +87,23 @@ def make_datamodule() -> ConcatTextDataModule:
     DATA_DIR = "/mnt/ai/data"
     VAL_TOKENS = 500_000
     TRAIN_TOKENS = 600_000_000
+    # projects/tinylm/documents/*.md: always in the mix, outside the ratios.
+    # The files are tiny, so they ride along repeated (~a few hundred exposures
+    # over the run) rather than as a ratio share; excluded from the mixture
+    # tokenizer so the existing vocab + ids caches stay valid.
+    DOCUMENTS_DIR = Path(__file__).parent.parent / "documents"
+    DOCUMENTS_REPEAT = 200
 
     ratios = {
         "tiny-textbooks": 0,
         "cosmopedia-v2": 30,  # str→cos ablation (vs the logged 3-way str30 fw40 ts30)
-        "fineweb-edu": 40,
+        "fineweb-edu": 34,
         "tinystories-v2": 30,
         "tiny-webtext": 0,
+        "gooaq": 5,  # closed-book Question:/Answer: format signal
+        # grounded passage + Question:/Answer: format signal; the full corpus
+        # is only ~6M tokens, so 1% ~= all of SQuAD (a bigger share can't fill)
+        "squad": 1,
     }
     total = sum(ratios.values())
     if total != 100:
@@ -138,6 +151,24 @@ def make_datamodule() -> ConcatTextDataModule:
                 add_bos=True,
                 max_train_tokens=int(ratios["tiny-webtext"] * TRAIN_TOKENS),
                 max_val_tokens=VAL_TOKENS,
+            ),
+            GooAQDataModule(
+                data_dir=DATA_DIR,
+                add_bos=True,
+                max_train_tokens=int(ratios["gooaq"] * TRAIN_TOKENS),
+                max_val_tokens=VAL_TOKENS,
+            ),
+            SQuADTextDataModule(
+                data_dir=DATA_DIR,
+                add_bos=True,
+                max_train_tokens=int(ratios["squad"] * TRAIN_TOKENS),
+                max_val_tokens=VAL_TOKENS,
+            ),
+            LocalDocumentsDataModule(
+                doc_dir=str(DOCUMENTS_DIR),
+                repeat=DOCUMENTS_REPEAT,
+                data_dir=DATA_DIR,
+                add_bos=True,
             ),
         ],
         batch_size=BATCH_SIZE,

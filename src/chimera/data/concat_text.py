@@ -110,6 +110,29 @@ class ConcatTextDataModule(pl.LightningDataModule):
         for dm in self.datamodules:
             dm.prepare_data()
 
+    def _tokenizer_sources(self) -> list[HFTextDataModule]:
+        """Submodules the mixture tokenizer is trained on.
+
+        Sources flagged ``exclude_from_mixture_tokenizer`` (e.g. a few KB of
+        local documents) are left out of both the training sample and the
+        cache key, so adding/editing them keeps the existing tokenizer — and
+        every other source's ids caches — valid.
+        """
+        srcs = [
+            dm
+            for dm in self.datamodules
+            if not getattr(dm, "exclude_from_mixture_tokenizer", False)
+        ]
+        assert srcs, "every source is excluded from the mixture tokenizer"
+        return srcs
+
+    def _tokenizer_source_names(self) -> list[str]:
+        return [
+            name
+            for name, dm in zip(self.source_names, self.datamodules)
+            if not getattr(dm, "exclude_from_mixture_tokenizer", False)
+        ]
+
     def _blended_tokenizer_path(self):
         """Cache path for the mixture-trained tokenizer.
 
@@ -119,7 +142,7 @@ class ConcatTextDataModule(pl.LightningDataModule):
         tokenizer paths in :class:`HFTextDataModule`).
         """
         owner = self.datamodules[0]
-        names = "+".join(sorted(self.source_names))
+        names = "+".join(sorted(self._tokenizer_source_names()))
         key = hashlib.blake2b(names.encode(), digest_size=6).hexdigest()
         tag = f"{owner.tokenizer_backend}_v{owner.vocab_size}_c{self.tokenizer_sample_chars}"
         return owner.data_dir / "mixture_tokenizers" / f"tok_{tag}_{key}.json"
@@ -134,9 +157,10 @@ class ConcatTextDataModule(pl.LightningDataModule):
         owner = self.datamodules[0]
         path = self._blended_tokenizer_path()
         if not path.exists():
-            per_source = max(1, self.tokenizer_sample_chars // len(self.datamodules))
+            sources = self._tokenizer_sources()
+            per_source = max(1, self.tokenizer_sample_chars // len(sources))
             docs: list[str] = []
-            for dm in self.datamodules:
+            for dm in sources:
                 ds = dm._load_dataset(dm.TRAIN_SPLIT)
                 total = 0
                 for text in dm.iter_texts(ds):
