@@ -41,3 +41,14 @@ checkpoint noted per run (SFT shouldn't tank them).
 
 | run | steps | base ckpt | mix | val_loss | notes |
 |-----|-------|-----------|-----|----------|-------|
+| full-ft | 700 | curric | gqc44 sqc55 evc1 | **2.975** | chat format lands; grounded extraction regressed (Tom's ball: base "red" → "white") |
+| lora-r16 | 700 | curric | gqc44 sqc55 evc1 | 3.293 | 3.3% trainable, AdamW 1e-3 no-wd; identical greeting behavior, same extraction regression ("blue kite") |
+
+full-ft (2026-07-19): masked val 2.975. Generations: greeting canned-correct, closed-book
+fluent-but-circular (capacity), grounded extraction WORSE than base — suspect sqc's terse
+span answers at 55% of the mix; try capping SQuAD-chat below GooAQ next.
+
+lora-r16 (2026-07-19): plateaus ~0.32 behind full-ft; chat format transfers fully at 30x
+fewer trained params. GOTCHA (2 failed attempts): flex_attn breaks when base weights are
+requires_grad_(False)-frozen — zero grads + forward pinned at uniform (loss = ln V =
+9.7041). Freeze by optimizer exclusion instead (see chimera.models.lora docstring).
