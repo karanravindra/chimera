@@ -17,7 +17,7 @@ analysis-only and loads that checkpoint.
 
 import math
 import os
-from itertools import islice
+from itertools import chain, islice
 from pathlib import Path
 
 os.environ.setdefault("CCE_AUTOTUNE", "1")
@@ -72,6 +72,27 @@ MUON_LR = 0.02
 LR_SCHEDULE = "warmup-cosine"
 WARMUP_STEPS = 250
 FINAL_LR_FRAC = 0.1
+
+# Two-phase data curriculum: same per-source TOTALS as the flat mix (so every ids
+# cache stays valid), but reordered so cosmopedia dominates the tail of training
+# (paired with the LR anneal: what the model sees last under a decaying LR is what
+# it consolidates). Ratios are per-phase shares (each sums to 100); their mean must
+# equal the flat mix ratios. None disables (single flat-shuffled pool).
+CURRICULUM_PHASE_FRAC = 0.5  # fraction of MAX_TRAIN_STEPS in phase 1
+RATIOS_PHASE1 = {
+    "cosmopedia-v2": 20,
+    "fineweb-edu": 38,
+    "tinystories-v2": 36,
+    "gooaq": 5,
+    "squad": 1,
+}
+RATIOS_PHASE2 = {
+    "cosmopedia-v2": 40,  # cos-dominant tail
+    "fineweb-edu": 30,
+    "tinystories-v2": 24,
+    "gooaq": 5,
+    "squad": 1,
+}
 # Final-logit soft-capping (cap*tanh(logits/cap)) during training + eval; None = off.
 # Inference-only capping strictly hurt (raw logits reach ~40, cap 30 saturates them);
 # this tests the Gemma-2-style TRAIN-time variant. Attention already has QK-norm.
@@ -188,6 +209,46 @@ def make_datamodule() -> ConcatTextDataModule:
     dm.prepare_data()
     dm.setup("fit")
     return dm
+
+
+def make_curriculum_loaders(dm: ConcatTextDataModule):
+    """Split each source's token stream into phase-1/phase-2 chunks per the phase
+    ratios and return one shuffled DataLoader per phase. Slicing each source at
+    r1/(r1+r2) keeps per-source totals (and ids caches) identical to the flat mix —
+    only the ORDER across phases changes. `documents` (and any source not in the
+    ratio dicts) is split evenly so it stays present throughout."""
+    from torch.utils.data import DataLoader
+
+    from chimera.data._text import TokenDataset
+
+    phase1, phase2 = [], []
+    for name, sub in zip(dm.source_names, dm.datamodules):
+        data = sub.train_dataset.data
+        r1 = RATIOS_PHASE1.get(name)
+        r2 = RATIOS_PHASE2.get(name)
+        frac = 0.5 if not (r1 or r2) else r1 / (r1 + r2)
+        cut = int(len(data) * frac)
+        phase1.append(data[:cut])
+        phase2.append(data[cut:])
+
+    for label, parts in (("phase1", phase1), ("phase2", phase2)):
+        total = sum(len(p) for p in parts)
+        mix = "  ".join(
+            f"{n}={len(p) / total:.0%}" for n, p in zip(dm.source_names, parts)
+        )
+        print(f"curriculum {label}: {total:,} tokens  ({mix})")
+
+    def loader(parts):
+        return DataLoader(
+            TokenDataset(torch.cat(parts), dm.seq_len),
+            batch_size=dm.batch_size,
+            shuffle=True,
+            num_workers=dm.num_workers,
+            pin_memory=dm.pin_memory,
+            drop_last=True,
+        )
+
+    return loader(phase1), loader(phase2)
 
 
 def make_model(vocab_size: int) -> GPT:
@@ -446,8 +507,17 @@ def train():
         model.train()
         # cap the epoch at MAX_TRAIN_STEPS batches (the pool is far larger) so the
         # bar tracks the real run length instead of the full ~9k-batch dataloader.
+        if CURRICULUM_PHASE_FRAC is not None:
+            p1_steps = int(MAX_TRAIN_STEPS * CURRICULUM_PHASE_FRAC)
+            loader1, loader2 = make_curriculum_loaders(dm)
+            train_iter = chain(
+                islice(loader1, p1_steps),
+                islice(loader2, MAX_TRAIN_STEPS - p1_steps),
+            )
+        else:
+            train_iter = islice(dm.train_dataloader(), MAX_TRAIN_STEPS)
         pbar = tqdm(
-            islice(dm.train_dataloader(), MAX_TRAIN_STEPS),
+            train_iter,
             desc=f"Epoch {epoch + 1}/{N_EPOCHS}",
             total=MAX_TRAIN_STEPS,
             dynamic_ncols=True,
