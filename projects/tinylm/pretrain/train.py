@@ -66,6 +66,12 @@ N_LAYERS = 6
 
 # optimization
 MUON_LR = 0.02
+# Warmup + cosine LR schedule (None disables -> constant LR). Late-run decay is
+# the anti-forgetting lever: what erases early-seen data (documents, early mix
+# samples) is late HIGH-lr updates; annealing to FINAL_LR_FRAC consolidates.
+LR_SCHEDULE = "warmup-cosine"
+WARMUP_STEPS = 250
+FINAL_LR_FRAC = 0.1
 # Final-logit soft-capping (cap*tanh(logits/cap)) during training + eval; None = off.
 # Inference-only capping strictly hurt (raw logits reach ~40, cap 30 saturates them);
 # this tests the Gemma-2-style TRAIN-time variant. Attention already has QK-norm.
@@ -414,6 +420,15 @@ def train():
 
     model = make_model(dm.vocab_size)
     optimizer = make_optimizer(model)
+    base_lrs = [g["lr"] for g in optimizer.param_groups]
+
+    def lr_factor(step: int) -> float:
+        if LR_SCHEDULE is None:
+            return 1.0
+        if step < WARMUP_STEPS:
+            return (step + 1) / WARMUP_STEPS
+        t = (step - WARMUP_STEPS) / max(1, MAX_TRAIN_STEPS - WARMUP_STEPS)
+        return FINAL_LR_FRAC + (1 - FINAL_LR_FRAC) * 0.5 * (1 + math.cos(math.pi * t))
     print_model_stats(model, global_batch_size)
 
     model.to(DEVICE, dtype=DTYPE)
@@ -440,6 +455,8 @@ def train():
 
         for x, y in pbar:
             x, y = x.to(DEVICE), y.to(DEVICE)
+            for g, base in zip(optimizer.param_groups, base_lrs):
+                g["lr"] = base * lr_factor(global_step)
             optimizer.zero_grad()
             loss = compute_loss(model, x, y, dm.eos_id, dm.vocab_size)
             loss.backward()
