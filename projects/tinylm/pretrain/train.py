@@ -66,18 +66,17 @@ N_LAYERS = 6
 
 # optimization
 MUON_LR = 0.02
-# Warmup + cosine LR schedule (None disables -> constant LR). Late-run decay is
-# the anti-forgetting lever: what erases early-seen data (documents, early mix
-# samples) is late HIGH-lr updates; annealing to FINAL_LR_FRAC consolidates.
+# Warmup + cosine decay to FINAL_LR_FRAC (None -> constant LR). The late-run
+# decay doubles as the anti-forgetting lever: high-lr updates near the end are
+# what erase early-seen data.
 LR_SCHEDULE = "warmup-cosine"
 WARMUP_STEPS = 250
 FINAL_LR_FRAC = 0.1
 
-# Two-phase data curriculum: same per-source TOTALS as the flat mix (so every ids
-# cache stays valid), but reordered so cosmopedia dominates the tail of training
-# (paired with the LR anneal: what the model sees last under a decaying LR is what
-# it consolidates). Ratios are per-phase shares (each sums to 100); their mean must
-# equal the flat mix ratios. None disables (single flat-shuffled pool).
+# Two-phase data curriculum: same per-source TOTALS as the flat mix (so every
+# ids cache stays valid), only the order across phases changes — what the model
+# sees last under the decaying LR is what it consolidates. Each phase dict sums
+# to 100 and their mean must equal the flat mix ratios below. None disables.
 CURRICULUM_PHASE_FRAC = 0.5  # fraction of MAX_TRAIN_STEPS in phase 1
 RATIOS_PHASE1 = {
     "cosmopedia-v2": 20,
@@ -87,15 +86,15 @@ RATIOS_PHASE1 = {
     "squad": 1,
 }
 RATIOS_PHASE2 = {
-    "cosmopedia-v2": 40,  # cos-dominant tail
+    "cosmopedia-v2": 40,
     "fineweb-edu": 30,
     "tinystories-v2": 24,
     "gooaq": 5,
     "squad": 1,
 }
-# Final-logit soft-capping (cap*tanh(logits/cap)) during training + eval; None = off.
-# Inference-only capping strictly hurt (raw logits reach ~40, cap 30 saturates them);
-# this tests the Gemma-2-style TRAIN-time variant. Attention already has QK-norm.
+# Gemma-2-style final-logit soft-capping (cap*tanh(logits/cap)), applied in
+# training AND eval so both see the same distribution; None = off. Must be a
+# train-time setting — capping an uncapped model at inference only hurts.
 LOGIT_SOFTCAP = 30.0
 ADAMW_LR = 1e-3
 BATCH_SIZE = 128
@@ -109,32 +108,29 @@ CHECKPOINT_PATH = RUN_DIR / "chimera_gpt6m.pt"
 
 
 def make_datamodule() -> ConcatTextDataModule:
-    # Balanced 5-way mix (per-source max_train_tokens = sampling weight over the
-    # concatenated stream). ~600M-token pool; the run is step-capped so the model
-    # sees ~328M of it (pool > seen => negligible repetition). The 16k vocab is
-    # trained on a round-robin 1GB-char sample of ALL sources (200M/source —
-    # saturating region for 16k, cheap now that training streams a doc iterator)
-    # via train_tokenizer_on_mixture rather than any single register.
+    # Per-source max_train_tokens = sampling weight over the concatenated
+    # stream. The pool (TRAIN_TOKENS) deliberately exceeds what the step-capped
+    # run consumes, so repetition is negligible. The vocab is trained on a
+    # round-robin sample of ALL sources (train_tokenizer_on_mixture) rather
+    # than any single register.
     DATA_DIR = "/mnt/ai/data"
     VAL_TOKENS = 500_000
     TRAIN_TOKENS = 600_000_000
-    # projects/tinylm/documents/*.md: any files dropped here are always in the
-    # mix, outside the ratios. Tiny files ride along repeated (~a few hundred
-    # exposures over the run) rather than as a ratio share; excluded from the
-    # mixture tokenizer so the vocab + ids caches stay valid. Directory may be
-    # empty (source is skipped then).
+    # Any .md files dropped in documents/ are always in the mix, outside the
+    # ratios: repeated DOCUMENTS_REPEAT times (tiny files would otherwise be
+    # invisible) and excluded from the mixture tokenizer so the vocab + ids
+    # caches stay valid. Empty directory => source skipped.
     DOCUMENTS_DIR = Path(__file__).parent.parent / "documents"
     DOCUMENTS_REPEAT = 200
 
     ratios = {
         "tiny-textbooks": 0,
-        "cosmopedia-v2": 30,  # str→cos ablation (vs the logged 3-way str30 fw40 ts30)
+        "cosmopedia-v2": 30,
         "fineweb-edu": 34,
         "tinystories-v2": 30,
         "tiny-webtext": 0,
         "gooaq": 5,  # closed-book Question:/Answer: format signal
-        # grounded passage + Question:/Answer: format signal; the full corpus
-        # is only ~6M tokens, so 1% ~= all of SQuAD (a bigger share can't fill)
+        # grounded passage+QA format signal; small corpus, this share ~= all of it
         "squad": 1,
     }
     total = sum(ratios.values())
@@ -503,7 +499,7 @@ def train():
     if DEVICE == "cuda":
         model = torch.compile(
             model
-        )  # fuse rope/act/residuals; ~1.8x step with FlexAttn
+        )  # fuse rope/act/residuals around FlexAttention
 
     # tokenizer-agnostic BPB yardstick (fixed held-out, tokenized once for this run)
     bpb_X, bpb_Y, bpb_bytes = prepare_bpb(dm.tokenizer)
@@ -512,8 +508,8 @@ def train():
     global_step = 1
     for epoch in range(N_EPOCHS):
         model.train()
-        # cap the epoch at MAX_TRAIN_STEPS batches (the pool is far larger) so the
-        # bar tracks the real run length instead of the full ~9k-batch dataloader.
+        # cap the epoch at MAX_TRAIN_STEPS batches (the pool is far larger) so
+        # the bar tracks the real run length, not the full dataloader.
         if CURRICULUM_PHASE_FRAC is not None:
             p1_steps = int(MAX_TRAIN_STEPS * CURRICULUM_PHASE_FRAC)
             loader1, loader2 = make_curriculum_loaders(dm)
@@ -553,7 +549,7 @@ def train():
                 )
 
             # in-training benchmark curve (skip the final step; the full table runs
-            # after the loop). Adds ~20s/eval — a few points to see the trajectory.
+            # after the loop) — a few cheap points to see the trajectory.
             if (
                 BENCH_EVERY_N_STEPS
                 and global_step % BENCH_EVERY_N_STEPS == 0

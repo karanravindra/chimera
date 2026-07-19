@@ -11,9 +11,9 @@ of the textbook/web sources. Each pair is rendered as one document::
     Answer: {answer}
 
 All machinery lives in :class:`chimera.data.hf_text.HFTextDataModule`.
-``DATA_FILES`` bounds the download to the first of two ~307MB parquet shards
-(~1.5M pairs, far beyond a tiny model's slice); the corpus ships only a
-``train`` split, so ``VAL_FROM_TRAIN`` carves validation off its head.
+``DATA_FILES`` bounds the download to the first parquet shard (still far beyond
+a tiny model's slice); the corpus ships only a ``train`` split, so
+``VAL_FROM_TRAIN`` carves validation off its head.
 
 Usage:
     dm = GooAQDataModule(data_dir="/mnt/ai/data", add_bos=True)
@@ -27,8 +27,7 @@ class GooAQDataModule(HFTextDataModule):
     HF_REPO = "sentence-transformers/gooaq"
     DIR_NAME = "gooaq"
     UNIT = "pair"
-    # First of two ~307MB shards (~1.5M pairs) — covers a tiny model's cap
-    # without pulling the full 613MB config.
+    # first shard alone covers a tiny model's cap; skip the rest of the config
     DATA_FILES = ["pair/train-00000-of-00002.parquet"]
     VAL_FROM_TRAIN = 0.01
 

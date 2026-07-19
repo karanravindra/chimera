@@ -209,8 +209,8 @@ class GPT(nn.Module):
             if logits.requires_grad:
                 logits = cap * torch.tanh(logits / cap)
             else:
-                # eval logits are (B, L, V) and huge (lm-eval batches ~131k tokens
-                # x 16k vocab = 4GB bf16); out-of-place tanh doubles that and OOMs
+                # in-place: eval logits are (B, L, V) and huge (lm-eval scores
+                # in big batches); an out-of-place tanh doubles the peak and OOMs
                 logits = logits.div_(cap).tanh_().mul_(cap)
         return (logits, new_past_kv) if use_cache else logits
 

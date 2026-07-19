@@ -1,7 +1,7 @@
 """SFT the pretrained tinylm GPT (~6M params) on a simple-QA chat mixture.
 
 Mirrors ../pretrain/train.py: same model (imported from there), same packed
-seq-512 FlexAttention doc-masking + CCE + Muon/AdamW rails — but the stream is
+FlexAttention doc-masking + CCE + Muon/AdamW rails — but the stream is
 ChatML conversations with loss only on assistant tokens (labels are -100
 elsewhere; CCE's ignore_index). Starts from the pretrain checkpoint and keeps
 its tokenizer (chat special tokens were reserved in the vocab from day one).
@@ -58,15 +58,15 @@ ADAMW_LR = 2.5e-4
 USE_LORA = os.environ.get("USE_LORA", "0") == "1"  # USE_LORA=1 uv run python train.py
 LORA_R = 16
 LORA_ALPHA = 32.0
-LORA_LR = 1e-3  # ~10x the full-FT AdamW lr (standard LoRA practice)
+LORA_LR = 1e-3  # LoRA convention: well above the full-FT AdamW lr
 BATCH_SIZE = 128
 MAX_TRAIN_STEPS = 700
 VALIDATE_EVERY_N_STEPS = 100
-N_EPOCHS = 2  # ~23M-token pool at 65k tokens/step => ~350 steps/epoch
+N_EPOCHS = 2  # small pool; MAX_TRAIN_STEPS is the real cap
 WARMUP_STEPS = 50
 FINAL_LR_FRAC = 0.1
 
-# the pretrain vocab (16k, chat specials reserved); SFT never retrains it
+# the pretrain vocab (chat specials already reserved); SFT never retrains it
 TOKENIZER_PATH = "/mnt/ai/data/mixture_tokenizers/tok_hf_v16384_c1000000000_371c2bf05f53.json"
 BASE_CHECKPOINT = "/mnt/ai/runs/tinylm/pretrain/chimera_gpt6m.pt"
 
