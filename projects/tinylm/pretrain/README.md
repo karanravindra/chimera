@@ -36,8 +36,11 @@ Add a row here when a new source gets an id.
 | ts  | TinyStories v2            | `TinyStoriesV2DataModule`        | `noanabeshima/TinyStoriesV2`                  |
 | wt  | tiny-webtext              | `TinyWebTextDataModule`          | `nampdn-ai/tiny-webtext`                      |
 | cos | Cosmopedia v2             | `CosmopediaV2DataModule`         | `HuggingFaceTB/smollm-corpus` (cosmopedia-v2) |
+| gq  | GooAQ (Q:/A: pairs)       | `GooAQDataModule`                | `sentence-transformers/gooaq`                 |
+| sq  | SQuAD-as-text (passage+QA)| `SQuADTextDataModule`            | `rajpurkar/squad`                             |
+| doc | local documents (always-on)| `LocalDocumentsDataModule`      | `projects/tinylm/documents/*.md`              |
 
-`cos` is wired but not yet in a logged run.
+`cos` is the current best textbook source (see Results) — beats `str` on blimp + lambada.
 
 ## Results
 
@@ -52,7 +55,8 @@ source `id`s are defined in Datasets above.
 
 | run    | steps | mix                       | blimp     | lambada   | piqa      | sciq      | arc_easy  |
 |--------|-------|---------------------------|-----------|-----------|-----------|-----------|-----------|
-| cos    | 5k    | cos30 fw40 ts30           | **70.09** | **16.94** | 55.44     | 54.50     | 33.96     |
+| qa-mix | 5k    | cos30 fw34 ts30 gq5 sq1 +doc | 69.53  | **17.27** | 57.24     | **67.40** | 34.76     |
+| cos    | 5k    | cos30 fw40 ts30           | **70.09** | 16.94     | 55.44     | 54.50     | 33.96     |
 | 3-way  | 5k    | str30 fw40 ts30           | 68.66     | 15.54     | 56.37     | 54.80     | 34.55     |
 | 4-way  | 5k    | tt30 str30 fw25 ts15      | 67.63     | 16.01     | **57.29** | **55.80** | 34.34     |
 | 5-way  | 5k    | tt30 str25 fw20 ts15 wt10 | 67.94     | 16.11     | 56.42     | 55.30     | **34.89** |
@@ -73,3 +77,27 @@ added nothing (4-way ≈ 5-way). Cross-mix comparisons are still confounded by e
 retrained tokenizer — to be standardized under a pinned vocab. In-training curve (cos
 run): blimp/arc/piqa plateau by ~4.5k while lambada/sciq + val_bpb are still rising at
 5k, so a modest tail remains past 5k for those two.
+
+qa-mix (2026-07-19): adds QA-FORMAT sources to the cos mix — `gq` (closed-book
+`Question:/Answer:` pairs, 5%) and `sq` (passage + its Q/A pairs as one doc, 1% ≈ the
+full corpus) — plus the always-on `doc` source (`projects/tinylm/documents/`, ~0.95M
+tokens = 200 copies, excluded from the mixture tokenizer). Verdict: sciq +12.9 over
+`cos` (67.40, above the gpt2 ref) — sciq is question-formatted, so format practice
+transfers; lambada + piqa best-in-table; blimp −0.6 (noise-adjacent). Probes: both
+documents fully memorized (~109 exposures each, doc ppl 1.02; `DEMO` prompt reproduces
+either file verbatim); `Question:/Answer:` elicits direct answers — grounded/extractive
+answers are often correct ("What color is Tom's ball?" → "red"), closed-book answers
+are fluent but circular (capacity, not format). Run log:
+`/mnt/ai/runs/tinylm/pretrain/train_qa-mix_2026-07-19.log`; prior checkpoint preserved
+as `chimera_gpt6m_pre-qa-mix.pt`.
+
+## TODO
+
+- **Standardize the tokenizer before trusting cross-mix rankings (circle back).**
+  Every Results row retrained its own 16k vocab on that run's mixture, so mix-to-mix
+  deltas — including the `cos`-vs-`str` blimp/lambada gap that currently crowns `cos` —
+  are confounded by tokenizer differences, not just the data. Fix: pin ONE shared vocab
+  (train it once on a fixed broad sample; add a `tokenizer_path=` to
+  `ConcatTextDataModule` to load-and-share instead of retraining per source-set), then
+  re-run the key mixes under it to confirm the rankings hold. Until then, treat the
+  table's cross-mix comparisons as provisional.
