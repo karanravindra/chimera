@@ -1,10 +1,21 @@
-"""tinylm GPT: pre-norm transformer with RoPE, QK-norm, ReLU^2 MLP, tied embeddings.
+"""tinylm GPT with Virtual Width Networks (VWN).
 
-Deliberately separate from ``chimera.models.gpt``: this one resets RoPE positions per
-packed document (via ``pos_ids`` from ``build_block_mask_and_pos``) instead of relying
-on RoPE's relative-offset invariance, has no muP parameterization, and keeps the
-architecture minimal. It becomes a candidate for the shared library when the unified
-LLM redo picks the canonical GPT.
+Pre-norm Transformer with RoPE, QK-norm, ReLU^2 MLP, tied base
+embeddings, and Generalized Hyper-Connections (GHC).
+
+The persistent residual state has virtual width::
+
+    virtual_dim = (vwn_n / vwn_m) * dim
+
+while attention and the MLP continue to operate at backbone width ``dim``.
+The default ``(vwn_m, vwn_n) = (2, 3)`` is the paper's practical 1.5x
+configuration. Set ``vwn_m=vwn_n=1`` to recover ordinary residual
+connections and the original model width.
+
+This model resets RoPE positions per packed document (via ``pos_ids`` from
+``build_block_mask_and_pos``) instead of relying on RoPE's relative-offset
+invariance. It has no muP parameterization and deliberately stays separate
+from ``chimera.models.gpt``.
 """
 
 import torch
@@ -43,9 +54,7 @@ class MultiHeadAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
 
-        # QK-norm: per-head RMSNorm over the head dimension, applied before RoPE
-        # (same convention as chimera.models.gpt). Tames logit growth / attention
-        # entropy collapse; the 1-D weights route to the AdamW side of Muon.
+        # QK-norm: per-head RMSNorm over the head dimension, applied before RoPE.
         self.q_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
 
@@ -83,10 +92,8 @@ class MultiHeadAttention(nn.Module):
             # Training path: fused causal + document masking via FlexAttention.
             out = flex_attn(q, k, v, block_mask=block_mask)
         else:
-            # No block mask -> plain causal via FlashAttention (prefill / eval), or full
-            # attention over the KV cache on a decode step (past_len > 0, N == 1).
-            # Branch (not a bool var): under dynamic shapes `N > 1` is a SymBool,
-            # which SDPA rejects; an if forces Dynamo to guard/specialize instead.
+            # No block mask -> plain causal via FlashAttention (prefill / eval), or
+            # full attention over the KV cache on a one-token decode step.
             if past_len == 0 and N > 1:
                 out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             else:
@@ -97,40 +104,190 @@ class MultiHeadAttention(nn.Module):
         return out, new_kv
 
 
-class PreNorm(nn.Module):
-    def __init__(self, module: nn.Module, norm: nn.Module):
-        super().__init__()
-        self.module = module
-        self.norm = norm
+def safe_tanh(x: torch.Tensor) -> torch.Tensor:
+    """Run tanh in fp32, then return to the activation dtype."""
+    return torch.tanh(x.float()).to(dtype=x.dtype)
 
-    def forward(self, x, **kwargs):
-        return self.module(self.norm(x), **kwargs)
+
+class GeneralizedHyperConnection(nn.Module):
+    """Dynamic Generalized Hyper-Connection from the VWN paper.
+
+    The external state is ``[..., virtual_dim]`` with ``n`` slots, each of
+    width ``dim / m``. A width connection mixes that state into:
+
+    - ``m`` slots flattened to the ordinary backbone width ``dim``;
+    - ``n`` carried slots that bypass the backbone sublayer.
+
+    The depth connection splits the sublayer output back into ``m`` slots,
+    writes them into the ``n`` virtual slots using beta, and adds the carry.
+    """
+
+    def __init__(self, dim: int, m: int, n: int, eps: float = 1e-6):
+        super().__init__()
+
+        if m < 1:
+            raise ValueError(f"m must be positive, got {m}")
+        if n < m:
+            raise ValueError(f"n must be >= m, got m={m}, n={n}")
+        if dim % m != 0:
+            raise ValueError(f"dim={dim} must be divisible by m={m}")
+
+        self.dim = dim
+        self.m = m
+        self.n = n
+        self.block_dim = dim // m
+        self.virtual_dim = n * self.block_dim
+        self.factor = self.block_dim**-0.5
+
+        # B^T in the paper, represented as [n, m]. Each virtual slot receives
+        # the backbone output block matching j mod m at initialization.
+        static_beta = torch.zeros(n, m)
+        slot_ids = torch.arange(n)
+        static_beta[slot_ids, slot_ids.remainder(m)] = 1.0
+        self.static_beta = nn.Parameter(static_beta)
+
+        # [A | A_hat] in the paper, represented as [n, m + n]. The first m
+        # slots are read by the backbone and all n slots have an identity carry.
+        static_alpha = torch.zeros(n, m + n)
+        static_alpha[:m, :m] = torch.eye(m)
+        static_alpha[:, m:] = torch.eye(n)
+        self.static_alpha = nn.Parameter(static_alpha)
+
+        # Token-conditioned routing. Zero initialization makes the first
+        # forward pass use only the stable static routing above.
+        self.dynamic_alpha_fn = nn.Parameter(torch.zeros(self.block_dim, m + n))
+        self.dynamic_beta_fn = nn.Parameter(torch.zeros(self.block_dim, m))
+        self.dynamic_alpha_scale = nn.Parameter(torch.ones(n, m + n))
+        self.dynamic_beta_scale = nn.Parameter(torch.ones(n, m))
+
+        self.routing_norm = nn.RMSNorm(self.block_dim, eps=eps)
+
+    def width_connection(
+        self, h: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compress virtual width to backbone width and return the carry path."""
+        if h.shape[-1] != self.virtual_dim:
+            raise ValueError(
+                f"expected hidden width {self.virtual_dim}, got {h.shape[-1]}"
+            )
+
+        prefix = h.shape[:-1]
+        slots = h.reshape(prefix + (self.n, self.block_dim))
+        norm_slots = self.routing_norm(slots)
+
+        dynamic_alpha = safe_tanh(
+            torch.matmul(
+                norm_slots,
+                self.dynamic_alpha_fn.to(dtype=norm_slots.dtype),
+            )
+            * self.factor
+        )
+        dynamic_beta = safe_tanh(
+            torch.matmul(
+                norm_slots,
+                self.dynamic_beta_fn.to(dtype=norm_slots.dtype),
+            )
+            * self.factor
+        )
+
+        alpha = self.static_alpha.to(dtype=slots.dtype) + (
+            dynamic_alpha * self.dynamic_alpha_scale.to(dtype=slots.dtype)
+        )
+        beta = self.static_beta.to(dtype=slots.dtype) + (
+            dynamic_beta * self.dynamic_beta_scale.to(dtype=slots.dtype)
+        )
+
+        # slots^T @ alpha: [..., block_dim, n] @ [..., n, m+n]
+        mixed = torch.matmul(slots.transpose(-2, -1), alpha).transpose(-2, -1)
+        branch_input = mixed[..., : self.m, :].reshape(prefix + (self.dim,))
+        carry = mixed[..., self.m :, :]
+        return branch_input, carry, beta
+
+    def depth_connection(
+        self,
+        carry: torch.Tensor,
+        branch_output: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> torch.Tensor:
+        """Expand a backbone-width output and update the virtual state."""
+        if branch_output.shape[-1] != self.dim:
+            raise ValueError(
+                f"expected branch width {self.dim}, got {branch_output.shape[-1]}"
+            )
+
+        prefix = branch_output.shape[:-1]
+        output_blocks = branch_output.reshape(prefix + (self.m, self.block_dim))
+        written = torch.matmul(beta.to(dtype=output_blocks.dtype), output_blocks)
+        slots = carry + written
+        return slots.reshape(prefix + (self.virtual_dim,)).contiguous()
+
+
+class LastDimGroupNorm(nn.Module):
+    """GroupNorm over the final dimension of a [B, L, D] tensor."""
+
+    def __init__(self, dim: int, group_size: int, eps: float = 1e-5):
+        super().__init__()
+        if dim % group_size != 0:
+            raise ValueError(f"dim={dim} must be divisible by group_size={group_size}")
+        self.dim = dim
+        self.norm = nn.GroupNorm(
+            num_groups=dim // group_size,
+            num_channels=dim,
+            eps=eps,
+            affine=True,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shape = x.shape
+        x = x.reshape(-1, self.dim, 1)
+        x = self.norm(x)
+        return x.reshape(shape)
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim: int, n_heads: int, mlp_mult: int):
+    """A Transformer block operating on a persistent virtual-width state."""
+
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int,
+        mlp_mult: int,
+        vwn_m: int,
+        vwn_n: int,
+    ):
         super().__init__()
-        self.attn = PreNorm(MultiHeadAttention(dim, n_heads), nn.RMSNorm(dim))
-        self.mlp = PreNorm(MLP(dim, mlp_mult), nn.RMSNorm(dim))
+        self.attn_norm = nn.RMSNorm(dim)
+        self.attn = MultiHeadAttention(dim, n_heads)
+        self.attn_connection = GeneralizedHyperConnection(dim, vwn_m, vwn_n)
+
+        self.mlp_norm = nn.RMSNorm(dim)
+        self.mlp = MLP(dim, mlp_mult)
+        self.mlp_connection = GeneralizedHyperConnection(dim, vwn_m, vwn_n)
 
     def forward(
         self,
-        x,
+        h,
         block_mask=None,
         pos_ids=None,
         past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
         use_cache: bool = False,
     ):
+        # Attention: virtual-width read -> D-width attention -> virtual-width write.
+        x, carry, beta = self.attn_connection.width_connection(h)
         attn_out, new_kv = self.attn(
-            x,
+            self.attn_norm(x),
             block_mask=block_mask,
             pos_ids=pos_ids,
             past_kv=past_kv,
             use_cache=use_cache,
         )
-        x = x + attn_out
-        x = x + self.mlp(x)
-        return x, new_kv
+        h = self.attn_connection.depth_connection(carry, attn_out, beta)
+
+        # MLP: virtual-width read -> D-width MLP -> virtual-width write.
+        x, carry, beta = self.mlp_connection.width_connection(h)
+        mlp_out = self.mlp(self.mlp_norm(x))
+        h = self.mlp_connection.depth_connection(carry, mlp_out, beta)
+        return h, new_kv
 
 
 class GPT(nn.Module):
@@ -144,18 +301,70 @@ class GPT(nn.Module):
         n_layers: int,
         eos_id: int = 0,
         logit_softcap: float | None = None,
+        vwn_m: int = 2,
+        vwn_n: int = 3,
+        vwn_group_norm: bool | None = None,
     ):
         super().__init__()
+
+        if vwn_m < 1:
+            raise ValueError(f"vwn_m must be positive, got {vwn_m}")
+        if vwn_n < vwn_m:
+            raise ValueError(f"vwn_n must be >= vwn_m, got m={vwn_m}, n={vwn_n}")
+        if dim % vwn_m != 0:
+            raise ValueError(f"dim={dim} must be divisible by vwn_m={vwn_m}")
+
         self.seq_len = seq_len
         self.eos_id = eos_id
-        # Gemma-2-style final-logit soft-capping: logits = cap*tanh(logits/cap).
-        # Train-time regularizer against logit blow-up; applied here so eval and
-        # sampling see the same capped distribution the loss was trained under
-        # (CCE applies the same cap via its softcap arg on the hidden path).
+        self.dim = dim
+        self.vwn_m = vwn_m
+        self.vwn_n = vwn_n
+        self.block_dim = dim // vwn_m
+        self.virtual_dim = vwn_n * self.block_dim
+        self.virtual_width_ratio = vwn_n / vwn_m
+
+        # Gemma-2-style final-logit soft-capping.
         self.logit_softcap = logit_softcap
+
+        # Factorized over-width embedding: a D-wide table remains tied to the
+        # unembedding, while a learned projection creates the D'-wide VWN state.
         self.token_emb = nn.Embedding(vocab_size, dim)
+        self.input_expand = (
+            nn.Identity()
+            if self.virtual_dim == dim
+            else nn.Linear(dim, self.virtual_dim, bias=False)
+        )
+
         self.blocks = nn.ModuleList(
-            [TransformerBlock(dim, n_heads, mlp_mult) for _ in range(n_layers)]
+            [
+                TransformerBlock(
+                    dim=dim,
+                    n_heads=n_heads,
+                    mlp_mult=mlp_mult,
+                    vwn_m=vwn_m,
+                    vwn_n=vwn_n,
+                )
+                for _ in range(n_layers)
+            ]
+        )
+
+        # The paper omits pre-reduce GroupNorm for its fractional 1.5x setup.
+        # In auto mode, use it only for integer expansions >1, with group size D.
+        if vwn_group_norm is None:
+            vwn_group_norm = self.virtual_dim > dim and vwn_n % vwn_m == 0
+        if vwn_group_norm:
+            if self.virtual_dim % dim != 0:
+                raise ValueError(
+                    "vwn_group_norm=True requires an integer virtual-width ratio"
+                )
+            self.pre_reduce_norm = LastDimGroupNorm(self.virtual_dim, group_size=dim)
+        else:
+            self.pre_reduce_norm = nn.Identity()
+
+        self.output_reduce = (
+            nn.Identity()
+            if self.virtual_dim == dim
+            else nn.Linear(self.virtual_dim, dim, bias=False)
         )
         self.ln_f = nn.RMSNorm(dim)
 
@@ -172,6 +381,18 @@ class GPT(nn.Module):
 
         return init_fn
 
+    def no_weight_decay(self) -> set[str]:
+        """Parameter names the VWN paper says to exclude from weight decay.
+
+        Merge this set into any existing no-weight-decay policy used by the
+        trainer. Dynamic routing matrices and scales should still receive decay.
+        """
+        return {
+            name
+            for name, _ in self.named_parameters()
+            if name.endswith("static_alpha") or name.endswith("static_beta")
+        }
+
     def forward(
         self,
         x,
@@ -181,11 +402,9 @@ class GPT(nn.Module):
         past_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         use_cache: bool = False,
     ):
-        # block_mask + pos_ids (built with build_block_mask_and_pos) enable FlexAttention
-        # document masking with per-document RoPE positions; pass both during training.
-        # Leave them None for eval/sampling, where attention falls back to a plain causal
-        # FlashAttention kernel with absolute positions.
-        h = self.token_emb(x)
+        # block_mask + pos_ids enable packed-document FlexAttention with
+        # per-document RoPE positions. Leave both None for eval/sampling.
+        h = self.input_expand(self.token_emb(x))
 
         new_past_kv = [] if use_cache else None
         for i, block in enumerate(self.blocks):
@@ -200,9 +419,15 @@ class GPT(nn.Module):
             if use_cache:
                 new_past_kv.append(new_kv)
 
+        # VWN state D' -> optional GroupNorm -> learned reduce -> final RMSNorm.
+        h = self.pre_reduce_norm(h)
+        h = self.output_reduce(h)
         h = self.ln_f(h)
+
         if return_hidden:
             return (h, new_past_kv) if use_cache else h
+
+        # Tied to the base D-wide input embedding table.
         logits = F.linear(h, self.token_emb.weight)
         if self.logit_softcap is not None:
             cap = self.logit_softcap
@@ -276,8 +501,7 @@ class GPT(nn.Module):
 
         for _ in range(max_new_tokens):
             if use_cache:
-                out = self(model_input, past_kv=past_kv, use_cache=True)
-                logits, past_kv = out
+                logits, past_kv = self(model_input, past_kv=past_kv, use_cache=True)
             else:
                 model_input = generated_ids[:, -context_length:]
                 logits = self(model_input)

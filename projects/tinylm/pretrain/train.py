@@ -97,6 +97,13 @@ RATIOS_PHASE2 = {
 # train-time setting — capping an uncapped model at inference only hurts.
 LOGIT_SOFTCAP = 30.0
 ADAMW_LR = 1e-3
+ADAMW_WEIGHT_DECAY = 0.0
+
+# Virtual Width Networks: residual state runs at (VWN_N/VWN_M)*dim while
+# attention/MLP stay at dim. (2, 3) = the paper's 1.5x; (1, 1) recovers the
+# plain model. Static routing matrices are excluded from weight decay.
+VWN_M = 2
+VWN_N = 3
 BATCH_SIZE = 128
 MAX_TRAIN_STEPS = 5000
 VALIDATE_EVERY_N_STEPS = 500
@@ -263,11 +270,40 @@ def make_model(vocab_size: int) -> GPT:
         mlp_mult=MLP_MULT,
         n_layers=N_LAYERS,
         logit_softcap=LOGIT_SOFTCAP,
+        vwn_m=VWN_M,
+        vwn_n=VWN_N,
     )
 
 
 def make_optimizer(model: GPT) -> Muon:
-    return Muon(muon_param_groups(model, muon_lr=MUON_LR, adamw_lr=ADAMW_LR))
+    # VWN routing tensors ("connection") are not hidden weight matrices — keep
+    # them off Muon's orthogonalization and on AdamW. The static routing
+    # matrices additionally get no weight decay (model.no_weight_decay()).
+    groups = muon_param_groups(
+        model,
+        muon_lr=MUON_LR,
+        adamw_lr=ADAMW_LR,
+        adamw_weight_decay=ADAMW_WEIGHT_DECAY,
+        adamw_name_keywords=("emb", "head", "connection"),
+    )
+    no_decay = model.no_weight_decay()
+    if no_decay and ADAMW_WEIGHT_DECAY:
+        _split_no_decay_group(model, groups, no_decay)
+    return Muon(groups)
+
+
+def _split_no_decay_group(model, groups, no_decay_names: set[str]) -> None:
+    """Move the named params into a sibling AdamW group with weight_decay=0."""
+    no_decay_ids = {id(p) for n, p in model.named_parameters() if n in no_decay_names}
+    for group in list(groups):
+        if group.get("use_muon"):
+            continue
+        keep = [p for p in group["params"] if id(p) not in no_decay_ids]
+        move = [p for p in group["params"] if id(p) in no_decay_ids]
+        if not move:
+            continue
+        group["params"] = keep
+        groups.append({**group, "params": move, "weight_decay": 0.0})
 
 
 def compute_loss(model, x, y, eos_id: int, vocab_size: int):
