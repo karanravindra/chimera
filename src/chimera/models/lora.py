@@ -15,9 +15,6 @@ class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, r: int, alpha: float):
         super().__init__()
         self.base = base
-        self.base.weight.requires_grad_(False)
-        if self.base.bias is not None:
-            self.base.bias.requires_grad_(False)
         self.r = r
         self.scale = alpha / r
         self.lora_A = nn.Parameter(torch.zeros(r, base.in_features))
@@ -41,14 +38,23 @@ class LoRALinear(nn.Module):
 
 
 def apply_lora(model: nn.Module, r: int = 16, alpha: float = 32.0) -> list[nn.Parameter]:
-    """Freeze the model, wrap every nn.Linear in LoRA; returns trainable params."""
-    for p in model.parameters():
-        p.requires_grad_(False)
+    """Wrap every nn.Linear in LoRA; returns the LoRA (A/B) params to optimize.
+
+    Base weights are NOT requires_grad_(False)-frozen: the compiled
+    flex_attention wrapper (chimera.models.attention.flex_attn) silently breaks
+    when q/k/v don't require grad — zero gradients everywhere and a corrupted
+    forward after the first backward. Freeze by optimizer exclusion instead:
+    pass ONLY the returned params to the optimizer, and call
+    ``model.zero_grad(set_to_none=True)`` each step so base grads don't
+    accumulate. ``merge_lora``-verified: base weights stay bit-identical.
+    """
+    params: list[nn.Parameter] = []
     for module in list(model.modules()):
         for name, child in list(module.named_children()):
             if isinstance(child, nn.Linear):
-                setattr(module, name, LoRALinear(child, r, alpha))
-    params = [p for p in model.parameters() if p.requires_grad]
+                wrapped = LoRALinear(child, r, alpha)
+                setattr(module, name, wrapped)
+                params += [wrapped.lora_A, wrapped.lora_B]
     assert params, "no nn.Linear found to LoRA-wrap"
     return params
 

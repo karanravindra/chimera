@@ -58,9 +58,7 @@ ADAMW_LR = 2.5e-4
 USE_LORA = os.environ.get("USE_LORA", "0") == "1"  # USE_LORA=1 uv run python train.py
 LORA_R = 16
 LORA_ALPHA = 32.0
-# 1e-3 blew up: deltas exploded during warmup, logits saturated the tanh
-# softcap (loss pinned at ln V = 9.704, zero gradient — unrecoverable).
-LORA_LR = 2e-4
+LORA_LR = 1e-3  # ~10x the full-FT AdamW lr (standard LoRA practice)
 BATCH_SIZE = 128
 MAX_TRAIN_STEPS = 700
 VALIDATE_EVERY_N_STEPS = 100
@@ -220,8 +218,10 @@ def train():
         model = torch.compile(model)
 
     if USE_LORA:
+        # only the LoRA A/B params; base weights keep requires_grad=True (the
+        # flex_attn wrapper breaks on no-grad q/k/v) but are never stepped
         optimizer = torch.optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad],
+            lora_params,
             lr=LORA_LR,
             weight_decay=0.0,  # don't decay low-rank deltas toward zero
         )
@@ -250,7 +250,9 @@ def train():
             x, y = x.to(DEVICE), y.to(DEVICE)
             for g, base in zip(optimizer.param_groups, base_lrs):
                 g["lr"] = base * lr_factor(global_step)
-            optimizer.zero_grad()
+            # model-wide (not optimizer-wide): in LoRA mode base weights still
+            # produce grads (see apply_lora) which must not accumulate
+            model.zero_grad(set_to_none=True)
             loss = compute_loss(model, x, y, eos_id)
             loss.backward()
             optimizer.step()
