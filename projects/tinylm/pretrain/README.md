@@ -28,17 +28,17 @@ uv run python train.py
 Index of source `id`s used in the `mix` column below (`chimera.data` module → HF repo).
 Add a row here when a new source gets an id.
 
-| id  | dataset                   | module                           | HF repo                                       |
-|-----|---------------------------|----------------------------------|-----------------------------------------------|
-| tt  | Tiny Textbooks            | `TinyTextbooksDataModule`        | `nampdn-ai/tiny-textbooks`                    |
-| str | Tiny Strange Textbooks    | `TinyStrangeTextbooksDataModule` | `nampdn-ai/tiny-strange-textbooks`            |
-| fw  | FineWeb-Edu (sample-10BT) | `FineWebEduTextDataModule`       | `HuggingFaceFW/fineweb-edu`                   |
-| ts  | TinyStories v2            | `TinyStoriesV2DataModule`        | `noanabeshima/TinyStoriesV2`                  |
-| wt  | tiny-webtext              | `TinyWebTextDataModule`          | `nampdn-ai/tiny-webtext`                      |
-| cos | Cosmopedia v2             | `CosmopediaV2DataModule`         | `HuggingFaceTB/smollm-corpus` (cosmopedia-v2) |
-| gq  | GooAQ (Q:/A: pairs)       | `GooAQDataModule`                | `sentence-transformers/gooaq`                 |
-| sq  | SQuAD-as-text (passage+QA)| `SQuADTextDataModule`            | `rajpurkar/squad`                             |
-| doc | local documents (always-on)| `LocalDocumentsDataModule`      | `projects/tinylm/documents/*.md`              |
+| id  | dataset                     | module                           | HF repo                                       |
+|-----|-----------------------------|----------------------------------|-----------------------------------------------|
+| tt  | Tiny Textbooks              | `TinyTextbooksDataModule`        | `nampdn-ai/tiny-textbooks`                    |
+| str | Tiny Strange Textbooks      | `TinyStrangeTextbooksDataModule` | `nampdn-ai/tiny-strange-textbooks`            |
+| fw  | FineWeb-Edu (sample-10BT)   | `FineWebEduTextDataModule`       | `HuggingFaceFW/fineweb-edu`                   |
+| ts  | TinyStories v2              | `TinyStoriesV2DataModule`        | `noanabeshima/TinyStoriesV2`                  |
+| wt  | tiny-webtext                | `TinyWebTextDataModule`          | `nampdn-ai/tiny-webtext`                      |
+| cos | Cosmopedia v2               | `CosmopediaV2DataModule`         | `HuggingFaceTB/smollm-corpus` (cosmopedia-v2) |
+| gq  | GooAQ (Q:/A: pairs)         | `GooAQDataModule`                | `sentence-transformers/gooaq`                 |
+| sq  | SQuAD-as-text (passage+QA)  | `SQuADTextDataModule`            | `rajpurkar/squad`                             |
+| doc | local documents (always-on) | `LocalDocumentsDataModule`       | `projects/tinylm/documents/*.md`              |
 
 `cos` is the current best textbook source (see Results) — beats `str` on blimp + lambada.
 
@@ -53,20 +53,20 @@ batch 128 × seq 512). Best real run bolded per task; `gpt2` is a reference ceil
 `mix` = per-source share of the training pool (sampling weight = per-source token cap);
 source `id`s are defined in Datasets above.
 
-| run    | steps | mix                       | blimp     | lambada   | piqa      | sciq      | arc_easy  |
-|--------|-------|---------------------------|-----------|-----------|-----------|-----------|-----------|
-| curric | 5k    | qa-mix, sc30, cosine LR, cos20→40 | 69.86 | **17.47** | 56.47 | **68.10** | **35.23** |
-| sc30   | 5k    | qa-mix + logit softcap 30 | 69.18     | 16.86     | 55.93     | 67.70     | 34.93     |
-| qa-mix | 5k    | cos30 fw34 ts30 gq5 sq1 +doc | 69.53  | 17.27     | 57.24     | 67.40     | 34.76     |
-| cos    | 5k    | cos30 fw40 ts30           | **70.09** | 16.94     | 55.44     | 54.50     | 33.96     |
-| 3-way  | 5k    | str30 fw40 ts30           | 68.66     | 15.54     | 56.37     | 54.80     | 34.55     |
-| 4-way  | 5k    | tt30 str30 fw25 ts15      | 67.63     | 16.01     | **57.29** | **55.80** | 34.34     |
-| 5-way  | 5k    | tt30 str25 fw20 ts15 wt10 | 67.94     | 16.11     | 56.42     | 55.30     | **34.89** |
-| tt+ts  | 5k    | tt50 ts50                 | 65.03     | 12.59     | 56.53     | 54.70     | 31.99     |
-| tt     | 5k    | tt100                     | 63.72     | 6.95      | 56.96     | 55.10     | 33.63     |
-| ts     | 5k    | ts100                     | 62.93     | 10.87     | 52.34     | 27.40     | 26.94     |
-| chance | —     | —                         | 50.0      | 0.0       | 50.0      | 25.0      | 25.0      |
-| gpt2   | —     | — (124M ref)              | 82.29     | 32.16     | 62.62     | 64.40     | 39.52     |
+| run    | steps | mix                               | blimp     | lambada   | piqa      | sciq      | arc_easy  |
+|--------|-------|-----------------------------------|-----------|-----------|-----------|-----------|-----------|
+| curric | 5k    | qa-mix, sc30, cosine LR, cos20→40 | 69.86     | **17.47** | 56.47     | **68.10** | **35.23** |
+| sc30   | 5k    | qa-mix + logit softcap 30         | 69.18     | 16.86     | 55.93     | 67.70     | 34.93     |
+| qa-mix | 5k    | cos30 fw34 ts30 gq5 sq1 +doc      | 69.53     | 17.27     | 57.24     | 67.40     | 34.76     |
+| cos    | 5k    | cos30 fw40 ts30                   | **70.09** | 16.94     | 55.44     | 54.50     | 33.96     |
+| 3-way  | 5k    | str30 fw40 ts30                   | 68.66     | 15.54     | 56.37     | 54.80     | 34.55     |
+| 4-way  | 5k    | tt30 str30 fw25 ts15              | 67.63     | 16.01     | **57.29** | 55.80     | 34.34     |
+| 5-way  | 5k    | tt30 str25 fw20 ts15 wt10         | 67.94     | 16.11     | 56.42     | 55.30     | 34.89     |
+| tt+ts  | 5k    | tt50 ts50                         | 65.03     | 12.59     | 56.53     | 54.70     | 31.99     |
+| tt     | 5k    | tt100                             | 63.72     | 6.95      | 56.96     | 55.10     | 33.63     |
+| ts     | 5k    | ts100                             | 62.93     | 10.87     | 52.34     | 27.40     | 26.94     |
+| chance | —     | —                                 | 50.0      | 0.0       | 50.0      | 25.0      | 25.0      |
+| gpt2   | —     | — (124M ref)                      | 82.29     | 32.16     | 62.62     | 64.40     | 39.52     |
 
 5-way stderr: blimp 0.16, lambada 0.51, piqa 1.16, sciq 1.57, arc_easy 0.98.
 

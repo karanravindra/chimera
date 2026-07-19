@@ -27,11 +27,11 @@ Simple-QA brief: bulk single-turn QA + grounded QA + a little chat style.
 Full smol-smoltalk deliberately skipped (code/math/long multi-turn — beyond
 6M capacity).
 
-| id  | dataset                        | module                            | role                          |
-|-----|--------------------------------|-----------------------------------|-------------------------------|
-| gqc | GooAQ (chat)                   | `GooAQChatDataModule`             | closed-book simple QA (bulk)  |
-| sqc | SQuAD (chat)                   | `SQuADChatDataModule`             | grounded QA (model's strength)|
-| evc | smoltalk/everyday-conversations| `EverydayConversationsDataModule` | multi-turn chat style         |
+| id  | dataset                         | module                            | role                           |
+|-----|---------------------------------|-----------------------------------|--------------------------------|
+| gqc | GooAQ (chat)                    | `GooAQChatDataModule`             | closed-book simple QA (bulk)   |
+| sqc | SQuAD (chat)                    | `SQuADChatDataModule`             | grounded QA (model's strength) |
+| evc | smoltalk/everyday-conversations | `EverydayConversationsDataModule` | multi-turn chat style          |
 
 ## Results
 
@@ -39,10 +39,10 @@ One row per run — append-only, as in `../pretrain`. Metrics: masked val loss
 (assistant tokens only) + qualitative generations; benchmark deltas vs the base
 checkpoint noted per run (SFT shouldn't tank them).
 
-| run | steps | base ckpt | mix | val_loss | notes |
-|-----|-------|-----------|-----|----------|-------|
-| full-ft | 700 | curric | gqc44 sqc55 evc1 | **2.975** | chat format lands; grounded extraction regressed (Tom's ball: base "red" → "white") |
-| lora-r16 | 700 | curric | gqc44 sqc55 evc1 | 3.293 | 3.3% trainable, AdamW 1e-3 no-wd; identical greeting behavior, same extraction regression ("blue kite") |
+| run      | steps | base ckpt | mix              | val_loss  | notes                                                                                                   |
+|----------|-------|-----------|------------------|-----------|---------------------------------------------------------------------------------------------------------|
+| full-ft  | 700   | curric    | gqc44 sqc55 evc1 | **2.975** | chat format lands; grounded extraction regressed (Tom's ball: base "red" → "white")                     |
+| lora-r16 | 700   | curric    | gqc44 sqc55 evc1 | 3.293     | 3.3% trainable, AdamW 1e-3 no-wd; identical greeting behavior, same extraction regression ("blue kite") |
 
 full-ft (2026-07-19): masked val 2.975. Generations: greeting canned-correct, closed-book
 fluent-but-circular (capacity), grounded extraction WORSE than base — suspect sqc's terse
