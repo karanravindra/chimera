@@ -58,7 +58,9 @@ ADAMW_LR = 2.5e-4
 USE_LORA = os.environ.get("USE_LORA", "0") == "1"  # USE_LORA=1 uv run python train.py
 LORA_R = 16
 LORA_ALPHA = 32.0
-LORA_LR = 1e-3  # LoRA trains at ~10x the full-FT AdamW lr (standard practice)
+# 1e-3 blew up: deltas exploded during warmup, logits saturated the tanh
+# softcap (loss pinned at ln V = 9.704, zero gradient — unrecoverable).
+LORA_LR = 2e-4
 BATCH_SIZE = 128
 MAX_TRAIN_STEPS = 700
 VALIDATE_EVERY_N_STEPS = 100
@@ -219,7 +221,9 @@ def train():
 
     if USE_LORA:
         optimizer = torch.optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad], lr=LORA_LR
+            [p for p in model.parameters() if p.requires_grad],
+            lr=LORA_LR,
+            weight_decay=0.0,  # don't decay low-rank deltas toward zero
         )
     else:
         optimizer = Muon(muon_param_groups(model, muon_lr=MUON_LR, adamw_lr=ADAMW_LR))
