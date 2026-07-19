@@ -135,6 +135,7 @@ def tokenize_with_progress(
     total: Optional[int] = None,
     unit: str = "doc",
     eos_id: Optional[int] = None,
+    bos_id: Optional[int] = None,
     max_tokens: Optional[int] = None,
     batch_size: int = 1024,
 ) -> list[int]:
@@ -142,15 +143,18 @@ def tokenize_with_progress(
 
     Texts are encoded in batches via ``tokenizer.encode_batch`` (parallel on the
     fast backends), which is much faster than encoding one at a time. Optionally
-    appends ``eos_id`` after each text (a document separator) and stops once
-    ``max_tokens`` ids have been collected — so with a cap we never tokenize more
-    than the last batch beyond it, and the surplus is trimmed off at the end.
+    prepends ``bos_id`` before and/or appends ``eos_id`` after each text (document
+    start marker / separator) and stops once ``max_tokens`` ids have been
+    collected — so with a cap we never tokenize more than the last batch beyond
+    it, and the surplus is trimmed off at the end.
     """
     ids: list[int] = []
     bar = tqdm(total=total, desc=desc, unit=unit)
 
     def flush(batch: list[str]) -> None:
         for enc in tokenizer.encode_batch(batch):
+            if bos_id is not None:
+                ids.append(bos_id)
             ids.extend(enc)
             if eos_id is not None:
                 ids.append(eos_id)
