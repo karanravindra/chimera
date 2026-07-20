@@ -29,7 +29,6 @@ import torch
 import torch.nn as nn
 from cut_cross_entropy import linear_cross_entropy
 from model import GPT
-from sampled_ce_triton import sampled_cross_entropy
 from torchinfo import summary
 from tqdm import tqdm
 
@@ -103,15 +102,6 @@ RATIOS_PHASE2 = {
 # training AND eval so both see the same distribution; None = off. Must be a
 # train-time setting — capping an uncapped model at inference only hurts.
 LOGIT_SOFTCAP = 30.0
-# Sampled-softmax CE for TRAINING steps only (eval stays exact CCE/full CE).
-# ~1.2x tok/s over CCE at k=1024 but the objective is biased low (see
-# bench_sampled_ce.py); train loss values are not comparable to CE. Off by
-# default — CCE remains the reference loss.
-SAMPLED_CE = os.environ.get("TINYLM_SAMPLED_CE", "0") == "1"
-SAMPLED_CE_K = 1024
-# logQ proposal correction (+ln(V/k) on negative logits): consistent loss
-# scale + restores full-softmax-equivalent negative gradient pressure.
-SAMPLED_CE_LOGQ = os.environ.get("TINYLM_SAMPLED_CE_LOGQ", "0") == "1"
 ADAMW_LR = 1e-3
 ADAMW_WEIGHT_DECAY = 0.0
 
@@ -332,7 +322,7 @@ def _split_no_decay_group(model, groups, no_decay_names: set[str]) -> None:
         groups.append({**group, "params": move, "weight_decay": 0.0})
 
 
-def compute_loss(model, x, y, eos_id: int, vocab_size: int, sampled: bool = False):
+def compute_loss(model, x, y, eos_id: int, vocab_size: int):
     if USE_CCE:
         # FlexAttention block mask (causal + document) + per-document RoPE position
         # ids — rebuilt per batch. Note: the smaller last validation batch triggers a
@@ -340,17 +330,6 @@ def compute_loss(model, x, y, eos_id: int, vocab_size: int, sampled: bool = Fals
         block_mask, pos_ids = build_block_mask_and_pos(x, eos_id)
         hidden = model(x, return_hidden=True, block_mask=block_mask, pos_ids=pos_ids)
         weight = getattr(model, "_orig_mod", model).token_emb.weight  # tied lm_head
-        if sampled:
-            # Fused Triton kernel (flash-style online LSE, never materializes
-            # the [T, k] logits); same biased objective as sampled_ce.py.
-            return sampled_cross_entropy(
-                hidden,
-                weight,
-                y,
-                num_samples=SAMPLED_CE_K,
-                softcap=LOGIT_SOFTCAP,
-                logq=SAMPLED_CE_LOGQ,
-            )
         return linear_cross_entropy(hidden, weight, y, softcap=LOGIT_SOFTCAP)
     logits = model(x)  # CPU fallback: plain causal, no doc masking / flex
     return nn.CrossEntropyLoss()(logits.view(-1, vocab_size), y.view(-1))
@@ -480,10 +459,7 @@ def run_benchmarks(model, dm, step=None):
     metrics = {}  # task -> (metric_name, value as %)
     for task in TASKS:
         name, val, _ = headline(results[task])
-        metrics[task] = (
-            name,
-            val if ("perplex" in name or "bits_per_byte" in name) else val * 100,
-        )
+        metrics[task] = (name, val if ("perplex" in name or "bits_per_byte" in name) else val * 100)
     row = " | ".join(f"{t}={metrics[t][1]:.2f}" for t in order if t in metrics)
 
     if step is not None:
@@ -569,7 +545,6 @@ def train():
             return (step + 1) / WARMUP_STEPS
         t = (step - WARMUP_STEPS) / max(1, MAX_TRAIN_STEPS - WARMUP_STEPS)
         return FINAL_LR_FRAC + (1 - FINAL_LR_FRAC) * 0.5 * (1 + math.cos(math.pi * t))
-
     print_model_stats(model, global_batch_size)
 
     model.to(DEVICE, dtype=DTYPE)
@@ -617,14 +592,7 @@ def train():
             for mb in range(GRAD_ACCUM_STEPS):
                 sl = slice(mb * micro, (mb + 1) * micro)
                 mb_loss = (
-                    compute_loss(
-                        model,
-                        x[sl],
-                        y[sl],
-                        dm.eos_id,
-                        dm.vocab_size,
-                        sampled=SAMPLED_CE,
-                    )
+                    compute_loss(model, x[sl], y[sl], dm.eos_id, dm.vocab_size)
                     / GRAD_ACCUM_STEPS
                 )
                 mb_loss.backward()
