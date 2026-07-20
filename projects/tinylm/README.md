@@ -59,6 +59,105 @@ Mix by tokens rather than examples. Preserve complete conversations as documents
 keep train/evaluation splits plus benchmark-derived sources auditable to avoid claiming
 zero-shot performance on tasks seen during training.
 
+## Tokenizer plan
+
+Train one immutable tokenizer on a fixed, future-facing corpus, compare a small suite
+of vocabulary sizes with model-aware pilots, and freeze the winner before rerunning
+pretraining. Every later stage—SFT, preference tuning, and RLVR—must reuse the exact
+same artifact.
+
+### Contract
+
+- UTF-8 byte-level BPE with no unknown token, normalization, or lowercasing.
+- Lossless round trips for arbitrary Unicode, whitespace, Markdown, and structured
+  text.
+- Reserve the canonical chat, reasoning, and tool markers at stable low IDs from the
+  first training run; never append special tokens after pretraining.
+- Keep `split_digits=False` initially. Commonsense and grounded assistance matter more
+  than arithmetic, and unsplit digits compress dates and numbers better. Revisit only
+  if arithmetic becomes an RLVR target.
+- Save and identify the tokenizer by a content hash, not a mutable path or the current
+  data-mixture name.
+
+### Fixed training corpus
+
+Sample approximately 250M characters with a fixed seed and explicit per-source
+character budgets. This corpus represents the model's lifetime inputs rather than any
+single pretraining run:
+
+| source family                             | character share |
+| ----------------------------------------- | --------------: |
+| FineWeb-Edu                               |             35% |
+| Cosmopedia                                |             20% |
+| TinyStories                               |             15% |
+| Stack Exchange                            |             10% |
+| Wikipedia/Wikibooks                       |              5% |
+| CoQA, QuAC, and SQuAD                     |            7.5% |
+| OASST1, No Robots, and filtered UltraChat |            7.5% |
+
+Cache the sampled corpus once and train every candidate from those identical bytes.
+Preserve complete documents and conversations, render conversations with the canonical
+ChatML template, and hold out separate source-stratified documents for evaluation.
+Record dataset revisions, requested and realized character shares, seed, and a corpus
+hash. Do not let `ConcatTextDataModule` resample tokenizer data from each experiment's
+mixture.
+
+### Candidate suite
+
+Train 8,192-, 12,288-, and 16,384-token vocabularies. Skip 32k at this model scale:
+with tied embeddings at width 384, every additional 8k vocabulary entries cost about
+3.1M parameters as well as extra output-loss compute. The existing 16k tokenizer's
+roughly 4.0–4.7 characters/token is already a reasonable compression ceiling, so a
+larger vocabulary must justify its parameter cost through downstream results.
+
+Evaluate each candidate on the same held-out corpus:
+
+- Characters and UTF-8 bytes per token, aggregate and per source.
+- Mean and p95 tokens per document/conversation, plus the fraction fitting within
+  512, 2,048, and 8,192 tokens.
+- Vocabulary utilization and rare/dead-token rates.
+- Atomic special-token encoding and stable IDs.
+- Exact round trips and representative tokenizations for Unicode, Markdown, JSON,
+  URLs, contractions, dates, and ChatML.
+- Embedding parameters, their share of the full model, tokenizer throughput, and the
+  effective amount of text visible in each context window.
+
+Reject a tokenizer with a severe chat, grounded-QA, or structured-text regression even
+when its aggregate compression is better.
+
+### Model-aware selection
+
+Compression alone does not choose the tokenizer. Run otherwise identical 1k–2k-step
+pretraining pilots for every candidate using the same backbone, data mixture, seed,
+schedule, global token batch, and tokenizer-specific caches. Compare held-out BPB—not
+loss per token—alongside throughput, peak VRAM, total parameters, BLiMP, LAMBADA,
+grounded prompt probes, and prompt-format robustness. Select for the complete system;
+8k or 12k is the expected winner, while 16k must show a meaningful BPB or capability
+gain to pay for its embedding budget.
+
+### Frozen artifact
+
+Store the winner as:
+
+```text
+/mnt/ai/data/tinylm/tokenizer/v1/
+├── tokenizer.json
+├── corpus.jsonl
+├── meta.json
+└── evaluation.json
+```
+
+`meta.json` records the tokenizer hash, vocabulary and special-token IDs, dataset
+revisions, realized mixture, seed, training options, corpus hash, and `tokenizers`
+version. Add a required `tokenizer_path` to `ConcatTextDataModule`; all tokenized-data
+caches remain keyed by the tokenizer content fingerprint.
+
+Implementation starts with `projects/tinylm/data/train_tokenizer.py`, adapted from the
+archived suite trainer but using deterministic weighted sampling. It should build the
+corpus once, train all candidates, validate round trips and special tokens, and write a
+single comparison report. Only after the winner is frozen should the full sources be
+retokenized and the key pretraining mixtures rerun.
+
 ## Evaluation direction
 
 The public demo accepts arbitrary prompts, so curated examples cannot hide brittle

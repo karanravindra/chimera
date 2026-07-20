@@ -159,11 +159,8 @@ the ~13% eval overhead. Run log:
   dominated by chance noise at 6M parameters; OpenBookQA overlaps SciQ/ARC-Easy; GSM8K
   needs generation support; and TruthfulQA is a poor fit for the model size and
   512-token context.
-- **Standardize the tokenizer before trusting cross-mix rankings (circle back).**
-  Every Results row retrained its own 16k vocab on that run's mixture, so mix-to-mix
-  deltas — including the `cos`-vs-`str` blimp/lambada gap that currently crowns `cos` —
-  are confounded by tokenizer differences, not just the data. Fix: pin ONE shared vocab
-  (train it once on a fixed broad sample; add a `tokenizer_path=` to
-  `ConcatTextDataModule` to load-and-share instead of retraining per source-set), then
-  re-run the key mixes under it to confirm the rankings hold. Until then, treat the
-  table's cross-mix comparisons as provisional.
+- **Standardize the tokenizer before trusting cross-mix rankings.** Follow the
+  project-level [tokenizer plan](../README.md#tokenizer-plan), pin the selected artifact
+  through `ConcatTextDataModule.tokenizer_path`, and rerun the key mixtures. Until
+  then, every cross-mixture result remains confounded by its independently trained
+  vocabulary and should be treated as provisional.
