@@ -129,6 +129,69 @@ all ≤3% dead ends. Eval cadence trimmed this run (val 500→1000, bench 1500�
 the ~13% eval overhead. Run log:
 `/mnt/ai/runs/tinylm/pretrain/train_vwn_2026-07-20_0008.log`.
 
+## 512-token training plan
+
+The final 512-token base should preserve the language mixture that already works while
+adding a bounded technical slice. Sample every share by tokens, not document count:
+
+| source family                 | token share |
+| ----------------------------- | ----------: |
+| FineWeb-Edu                   |         30% |
+| Cosmopedia v2                 |         25% |
+| TinyStories v2                |         20% |
+| GooAQ + SQuAD                 |          5% |
+| FineMath-4+                   |          6% |
+| Tiny Math Textbooks           |          2% |
+| Python-Edu                    |          6% |
+| filtered The Stack Smol       |          2% |
+| filtered Tiny Codes           |          1% |
+| validated JSON/XML/tool forms |          3% |
+
+This gives 80% general language and QA, 8% math, and 12% code or structured data.
+Within QA, start with GooAQ 4% and SQuAD 1%. FineMath remains the primary math source;
+Tiny Math Textbooks is a small, manually audited synthetic supplement. Python-Edu is
+the primary code source. Filter The Stack Smol to useful assistant-facing formats such
+as Python, Shell, SQL, JavaScript, TypeScript, HTML, Markdown, and Dockerfile rather
+than sampling its 30 languages uniformly. Tiny Codes is also synthetic and
+template-prone, so retain only parseable, deduplicated Python, Bash, SQL, JavaScript,
+and TypeScript examples.
+
+The structured-data slice should contain valid JSON/JSONL, JSON Schema paired with
+instances, function signatures paired with argument objects, API examples, and a
+smaller amount of XML, HTML, and YAML. Validate every generated or transformed record
+with a real parser. Raw code and serialization formats only teach syntax; they do not
+teach when to call a tool. Keep NL2Bash and request → tool call → result → grounded
+response trajectories for SFT/RLVR, rendered in one canonical tool-call grammar.
+
+Train the initial 4B-token candidate as a curriculum:
+
+| phase | token budget | approximate steps | general/QA | math | code/data | LR policy       |
+| ----- | -----------: | ----------------: | ---------: | ---: | --------: | --------------- |
+| 1     |         2.0B |            30,518 |        88% |   4% |        8% | warmup + stable |
+| 2     |         1.6B |            24,414 |        72% |  12% |       16% | stable          |
+| 3     |         0.4B |             6,104 |        72% |  12% |       16% | decay           |
+
+These step counts assume the current effective batch of `128 × 512 = 65,536` tokens.
+Across all three phases, the realized mixture is approximately the 80/8/12 target
+above. Save and fully evaluate checkpoints at 0.5B, 1B, 2B, and 4B tokens. Preserve a
+pre-decay checkpoint at 3.6B so training can continue without reversing a completed
+cooldown.
+
+Treat 10B tokens (approximately 152,588 steps) as a maximum extension budget, not the
+default run. Continue beyond 4B only if held-out BPB and at least one real capability
+metric improve outside noise. Stop when the latest doubling produces less than roughly
+1–2% relative BPB improvement and no convincing gain in grammar, grounded QA, math,
+code parsing, or arbitrary-prompt probes. If the run is extended, branch from the
+pre-decay checkpoint, preserve the overall 80/8/12 mixture, and reserve roughly the
+final 10% of the eventual run for learning-rate decay.
+
+Train the pinned tokenizer on the same domain proportions, including the math, code,
+and structured-data slices. Because math is now an explicit target, compare the
+current `split_digits=False` tokenizer with a digit-splitting candidate rather than
+assuming the existing choice still wins. Report held-out BPB separately for prose,
+math, Python, JSON, and XML, and add deterministic `ast.parse`, JSON/XML parse-rate,
+elementary arithmetic exact-match, and later tool-schema-validity diagnostics.
+
 ## Context expansion route
 
 Expand the trained context progressively from the broad 512-token base through 2,048,
