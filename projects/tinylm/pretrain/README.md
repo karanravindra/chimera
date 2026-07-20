@@ -129,6 +129,50 @@ all ≤3% dead ends. Eval cadence trimmed this run (val 500→1000, bench 1500�
 the ~13% eval overhead. Run log:
 `/mnt/ai/runs/tinylm/pretrain/train_vwn_2026-07-20_0008.log`.
 
+## Context expansion route
+
+Expand the trained context progressively from the broad 512-token base through 2,048,
+4,096, and 8,192 tokens. Each phase mixes broad short examples for capability retention
+with genuinely long, coherent documents for long-distance attention training:
+
+| phase context |   broad short data |    long coherent data |
+| ------------- | -----------------: | --------------------: |
+| 2,048         | 30–40% below 1,024 | 60–70% at 1,024–2,048 |
+| 4,096         | 25–30% below 2,048 | 70–75% at 2,048–4,096 |
+| 8,192         | 20–30% below 4,096 | 70–80% at 4,096–8,192 |
+
+Sample these shares by tokens, not document count. Broad short data retains the normal
+FineWeb, Cosmopedia, stories, QA, and conversational registers. Long data must contain
+mutually visible tokens from coherent FineWeb pages, Wikipedia sections, books, Stack
+Exchange threads, grounded passages, or complete conversations. Packing unrelated
+short documents into an 8k tensor does not train 8k dependencies because document
+masking resets attention and positions at every EOS boundary.
+
+Do not discard source documents longer than 8,192 tokens. Treat them as reservoirs of
+contiguous windows: sample randomized or overlapping offsets across epochs, cap windows
+per source document so a few books cannot dominate, and avoid always selecting the
+beginning. A window taken from the middle of a document does not receive a false BOS;
+include EOS only when it contains the real document ending.
+
+Positions remain window- and document-relative. Every standalone 8k window uses
+`pos_ids=0..8191`, even when its source offset was much larger. Pure RoPE depends on
+relative displacement, inference requests also start at zero, and the current
+`build_block_mask_and_pos` already derives packed-document positions from EOS markers.
+Do not store `(token_id, pos_id)` pairs in the token stream. Store token IDs plus
+document boundaries—or compact `(document_id, start_offset, length)` metadata—and
+derive position IDs when batching. Absolute source-document offsets would only be
+needed for a future architecture whose inference positions continue beyond 8,192.
+
+The fixed, non-overlapping flat-stream `TokenDataset` is sufficient for the current
+base runs but not the final context curriculum. Add a document-aware window dataset
+that resamples contiguous offsets each epoch and returns `context_length + 1` tokens
+for shifted next-token targets. Maintain approximately the same effective token batch
+through physical batches of 8–16 plus gradient accumulation.
+
+Validate every phase separately by length band—for example `val/bpb_0_512`,
+`val/bpb_512_2k`, `val/bpb_2k_4k`, and `val/bpb_4k_8k`—and retain the short benchmark
+suite to detect regression before advancing to the next context length.
+
 ## TODO
 
 - **Expand the continued-pretraining sources for the assistant target.** Add filtered
@@ -138,9 +182,9 @@ the ~13% eval overhead. Run log:
   rendered as full-token ChatML; SFT remains responsible for assistant-only behavior.
   Mix by tokens, audit overlap with evaluation data, and retain per-source validation
   metrics. See the project-level [training roadmap](../README.md#training-roadmap).
-- **Add an 8192-token context-extension stage.** Length-bucket long FineWeb/reference
-  documents and complete grounded conversations, train with batches of roughly 8–16,
-  and retain short-context examples to measure and prevent capability regression.
+- **Implement the context-expansion route.** Add the document-aware randomized window
+  dataset, length-bucket validation, and the progressive 2k → 4k → 8k stages described
+  in [Context expansion route](#context-expansion-route).
 - **Broaden the zero-shot benchmark suite.** Add `hellaswag` (`acc_norm`) for
   contextual continuation/commonsense, `boolq` for passage comprehension, and
   `winogrande` for coreference/commonsense. These are all loglikelihood-ranking tasks
