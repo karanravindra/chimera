@@ -107,7 +107,7 @@ LOGIT_SOFTCAP = 30.0
 # ~1.2x tok/s over CCE at k=1024 but the objective is biased low (see
 # bench_sampled_ce.py); train loss values are not comparable to CE. Off by
 # default — CCE remains the reference loss.
-SAMPLED_CE = False
+SAMPLED_CE = os.environ.get("TINYLM_SAMPLED_CE", "0") == "1"
 SAMPLED_CE_K = 1024
 ADAMW_LR = 1e-3
 ADAMW_WEIGHT_DECAY = 0.0
@@ -115,8 +115,8 @@ ADAMW_WEIGHT_DECAY = 0.0
 # Virtual Width Networks: residual state runs at (VWN_N/VWN_M)*dim while
 # attention/MLP stay at dim. (2, 3) = the paper's 1.5x; (1, 1) recovers the
 # plain model. Static routing matrices are excluded from weight decay.
-VWN_M = 2
-VWN_N = 3
+VWN_M = int(os.environ.get("TINYLM_VWN_M", "2"))
+VWN_N = int(os.environ.get("TINYLM_VWN_N", "3"))
 BATCH_SIZE = 128
 # The VWN state at batch 128 hits VRAM pressure on the 16GB card (-31% tok/s vs
 # 2x64); split each global batch into microbatches with gradient accumulation.
@@ -130,7 +130,10 @@ N_EPOCHS = 1
 RUN_DIR = Path("/mnt/ai/runs/tinylm/pretrain")
 # Looped runs save under their own name so the baseline checkpoint survives.
 _LOOP_TAG = "" if N_LOOPS == 1 else f"_loop{N_LAYERS}x{N_LOOPS}"
-CHECKPOINT_PATH = RUN_DIR / f"chimera_gpt6m{_LOOP_TAG}.pt"
+# Ablation runs save under their own tag so named checkpoints survive.
+_RUN_TAG = os.environ.get("TINYLM_RUN_TAG", "")
+_RUN_TAG = f"_{_RUN_TAG}" if _RUN_TAG else ""
+CHECKPOINT_PATH = RUN_DIR / f"chimera_gpt6m{_LOOP_TAG}{_RUN_TAG}.pt"
 
 
 def make_datamodule() -> ConcatTextDataModule:
