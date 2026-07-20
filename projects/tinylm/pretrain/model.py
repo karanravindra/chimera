@@ -1,7 +1,9 @@
-"""tinylm GPT with Virtual Width Networks (VWN).
+"""tinylm GPT with Virtual Width Networks (VWN) and optional mHC-Lite carry routing.
 
 Pre-norm Transformer with RoPE, QK-norm, ReLU^2 MLP, tied base
-embeddings, and Generalized Hyper-Connections (GHC).
+embeddings, and Generalized Hyper-Connections (GHC). The default constrains only the
+square virtual-slot carry map using mHC Lite; read and write maps remain
+the rectangular dynamic maps defined by VWN.
 
 The persistent residual state has virtual width::
 
@@ -17,6 +19,10 @@ This model resets RoPE positions per packed document (via ``pos_ids`` from
 invariance. It has no muP parameterization and deliberately stays separate
 from ``chimera.models.gpt``.
 """
+
+import itertools
+import math
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -109,20 +115,231 @@ def safe_tanh(x: torch.Tensor) -> torch.Tensor:
     return torch.tanh(x.float()).to(dtype=x.dtype)
 
 
-class GeneralizedHyperConnection(nn.Module):
-    """Dynamic Generalized Hyper-Connection from the VWN paper.
+# The routing maps are tiny (n, m <= a handful), so expressing their application
+# as batched matmuls dispatches cuBLAS gemv kernels per token — launch/bandwidth
+# bound and unfusable. Broadcast multiply + sum keeps the same math but lets
+# torch.compile fuse routing into one Triton kernel with the surrounding ops.
 
-    The external state is ``[..., virtual_dim]`` with ``n`` slots, each of
-    width ``dim / m``. A width connection mixes that state into:
 
-    - ``m`` slots flattened to the ordinary backbone width ``dim``;
-    - ``n`` carried slots that bypass the backbone sublayer.
+def apply_map(slots: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``out[..., j, :] = sum_i weight[..., i, j] * slots[..., i, :]``.
 
-    The depth connection splits the sublayer output back into ``m`` slots,
-    writes them into the ``n`` virtual slots using beta, and adds the carry.
+    Fusable equivalent of ``(slots^T @ weight)^T`` for [..., n, d] slots and
+    [..., n, j] weights.
+    """
+    return (weight.unsqueeze(-1) * slots.unsqueeze(-2)).sum(-3)
+
+
+def project_slots(slots: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``out[..., m] = sum_d slots[..., d] * weight[d, m]``.
+
+    Fusable equivalent of ``slots @ weight`` for a static [d, m] weight with a
+    tiny output dim ``m``.
+    """
+    return (slots.unsqueeze(-1) * weight).sum(-2)
+
+
+def _all_permutation_indices(n: int) -> torch.Tensor:
+    """Return every permutation of ``range(n)`` as a [n!, n] tensor."""
+    return torch.tensor(list(itertools.permutations(range(n))), dtype=torch.long)
+
+
+def _sample_permutation_indices(
+    n: int,
+    count: int,
+    seed: int,
+) -> torch.Tensor:
+    """Build a deterministic permutation subset with identity at index zero."""
+    if count < 1:
+        raise ValueError(f"count must be positive, got {count}")
+
+    max_unique = math.factorial(n)
+    if count > max_unique:
+        raise ValueError(
+            f"requested {count} unique permutations for n={n}, but only "
+            f"{max_unique} exist"
+        )
+
+    identity = torch.arange(n, dtype=torch.long)
+    permutations = [identity]
+    seen = {tuple(identity.tolist())}
+
+    # Add cyclic shifts first so a small subset has predictable global mixing.
+    for shift in range(1, n):
+        if len(permutations) >= count:
+            break
+        permutation = identity.roll(-shift)
+        key = tuple(permutation.tolist())
+        if key not in seen:
+            permutations.append(permutation)
+            seen.add(key)
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+
+    while len(permutations) < count:
+        permutation = torch.randperm(n, generator=generator)
+        key = tuple(permutation.tolist())
+        if key in seen:
+            continue
+        permutations.append(permutation)
+        seen.add(key)
+
+    return torch.stack(permutations)
+
+
+def make_permutation_indices(
+    n: int,
+    count: int | None = None,
+    seed: int = 0,
+    full_basis_max_slots: int = 4,
+) -> torch.Tensor:
+    """Create the fixed permutation basis used by mHC Lite.
+
+    With ``count=None``, all n! permutations are used for n <= 4. For larger
+    slot counts, a deterministic 32-permutation subset is used by default to
+    avoid factorial growth. Any convex combination of the subset is still
+    exactly doubly stochastic, but it spans only part of the Birkhoff polytope.
+    """
+    if n < 1:
+        raise ValueError(f"n must be positive, got {n}")
+
+    total = math.factorial(n)
+    if count is None:
+        count = total if n <= full_basis_max_slots else min(32, total)
+
+    if count == total and n <= full_basis_max_slots:
+        return _all_permutation_indices(n)
+
+    return _sample_permutation_indices(n=n, count=count, seed=seed)
+
+
+class MHCLiteCarry(nn.Module):
+    """Exactly doubly stochastic mixing over the VWN virtual slots.
+
+    The token-dependent carry matrix is represented as a convex combination
+    of fixed permutation matrices. One global mixture vector is produced for
+    each token from its complete virtual-width state; using independent
+    row-wise mixture weights would preserve row sums but not column sums.
     """
 
-    def __init__(self, dim: int, m: int, n: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        n_slots: int,
+        block_dim: int,
+        num_permutations: int | None = None,
+        permutation_seed: int = 0,
+        dynamic_scale_init: float = 1e-2,
+        non_identity_logit: float = -8.0,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+
+        self.n_slots = n_slots
+        self.block_dim = block_dim
+        self.virtual_dim = n_slots * block_dim
+
+        permutation_indices = make_permutation_indices(
+            n=n_slots,
+            count=num_permutations,
+            seed=permutation_seed,
+        )
+
+        identity = torch.arange(n_slots)
+        identity_matches = (permutation_indices == identity).all(dim=-1)
+        if not identity_matches.any():
+            permutation_indices = torch.cat(
+                [identity.unsqueeze(0), permutation_indices], dim=0
+            )
+            identity_index = 0
+        else:
+            identity_index = int(identity_matches.nonzero(as_tuple=False)[0, 0])
+
+        # If P = eye[permutation], VWN's carry is P^T @ slots. Indexing slots
+        # by inverse_permutation produces the same result without materializing
+        # a dense [K, n, n] basis in the forward pass.
+        inverse_permutations = permutation_indices.argsort(dim=-1)
+        self.register_buffer("permutation_indices", permutation_indices)
+        self.register_buffer("inverse_permutations", inverse_permutations)
+        # Dense [K, n, n] basis. n is small, so mixing via the dense matrix is
+        # cheaper (and fusable) versus gathering K permuted copies of the slots.
+        self.register_buffer(
+            "permutation_basis", torch.eye(n_slots)[permutation_indices]
+        )
+
+        num_basis = permutation_indices.shape[0]
+        self.norm = nn.RMSNorm(self.virtual_dim, eps=eps)
+
+        # Kept as a raw parameter so GPT._init_weights does not overwrite the
+        # required zero initialization.
+        self.dynamic_logits_fn = nn.Parameter(
+            torch.zeros(self.virtual_dim, num_basis)
+        )
+        self.dynamic_scale = nn.Parameter(torch.tensor(dynamic_scale_init))
+
+        static_logits = torch.full((num_basis,), non_identity_logit)
+        static_logits[identity_index] = 0.0
+        self.static_logits = nn.Parameter(static_logits)
+
+    @property
+    def num_permutations(self) -> int:
+        return self.permutation_indices.shape[0]
+
+    def coefficients(self, slots: torch.Tensor) -> torch.Tensor:
+        """Return token-wise convex-mixture coefficients [..., K]."""
+        if slots.shape[-2:] != (self.n_slots, self.block_dim):
+            raise ValueError(
+                "expected slots ending in "
+                f"({self.n_slots}, {self.block_dim}), got {slots.shape[-2:]}"
+            )
+
+        flat = slots.flatten(start_dim=-2)
+        normed = self.norm(flat)
+        dynamic_logits = project_slots(
+            normed,
+            self.dynamic_logits_fn.to(dtype=normed.dtype),
+        )
+        logits = self.static_logits.to(dtype=normed.dtype) + (
+            self.dynamic_scale.to(dtype=normed.dtype) * dynamic_logits
+        )
+        return F.softmax(logits.float(), dim=-1).to(dtype=slots.dtype)
+
+    def mixing_matrix(self, slots: torch.Tensor) -> torch.Tensor:
+        """Materialize the exactly doubly stochastic matrix for diagnostics."""
+        coefficients = self.coefficients(slots)
+        basis = self.permutation_basis.to(dtype=slots.dtype)
+        return (coefficients[..., None, None] * basis).sum(-3)
+
+    def forward(self, slots: torch.Tensor) -> torch.Tensor:
+        """Mix slots as ``R^T @ slots`` via the dense [n, n] mixing matrix.
+
+        R is a convex combination of K small permutation matrices; forming it
+        per token ([..., n, n]) and applying with a broadcast sum is far less
+        memory traffic than gathering K permuted copies of the slots, and it
+        fuses under torch.compile.
+        """
+        return apply_map(slots, self.mixing_matrix(slots))
+
+
+class GeneralizedHyperConnection(nn.Module):
+    """Dynamic GHC with either unrestricted or mHC-Lite carry routing.
+
+    The external state is ``[..., virtual_dim]`` with ``n`` slots, each of
+    width ``dim / m``. The rectangular VWN read and write maps remain ordinary
+    dynamic GHC maps. Only the square n x n persistent carry map is optionally
+    constrained with mHC Lite.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        m: int,
+        n: int,
+        eps: float = 1e-6,
+        carry_mode: Literal["ghc", "mhc_lite"] = "mhc_lite",
+        mhc_lite_num_permutations: int | None = None,
+        mhc_lite_permutation_seed: int = 0,
+    ):
         super().__init__()
 
         if m < 1:
@@ -131,6 +348,11 @@ class GeneralizedHyperConnection(nn.Module):
             raise ValueError(f"n must be >= m, got m={m}, n={n}")
         if dim % m != 0:
             raise ValueError(f"dim={dim} must be divisible by m={m}")
+        if carry_mode not in {"ghc", "mhc_lite"}:
+            raise ValueError(
+                "carry_mode must be 'ghc' or 'mhc_lite', "
+                f"got {carry_mode!r}"
+            )
 
         self.dim = dim
         self.m = m
@@ -138,34 +360,45 @@ class GeneralizedHyperConnection(nn.Module):
         self.block_dim = dim // m
         self.virtual_dim = n * self.block_dim
         self.factor = self.block_dim**-0.5
+        self.carry_mode = carry_mode
 
-        # B^T in the paper, represented as [n, m]. Each virtual slot receives
-        # the backbone output block matching j mod m at initialization.
+        # Rectangular read map [n, m]. Initially, the first m slots are the
+        # m blocks consumed by the D-wide Transformer branch.
+        static_read = torch.zeros(n, m)
+        static_read[:m, :m] = torch.eye(m)
+        self.static_read = nn.Parameter(static_read)
+        self.dynamic_read_fn = nn.Parameter(torch.zeros(self.block_dim, m))
+        self.dynamic_read_scale = nn.Parameter(torch.ones(n, m))
+
+        # Rectangular write map beta [n, m]. At initialization, virtual slot j
+        # receives branch output block j mod m.
         static_beta = torch.zeros(n, m)
         slot_ids = torch.arange(n)
         static_beta[slot_ids, slot_ids.remainder(m)] = 1.0
         self.static_beta = nn.Parameter(static_beta)
-
-        # [A | A_hat] in the paper, represented as [n, m + n]. The first m
-        # slots are read by the backbone and all n slots have an identity carry.
-        static_alpha = torch.zeros(n, m + n)
-        static_alpha[:m, :m] = torch.eye(m)
-        static_alpha[:, m:] = torch.eye(n)
-        self.static_alpha = nn.Parameter(static_alpha)
-
-        # Token-conditioned routing. Zero initialization makes the first
-        # forward pass use only the stable static routing above.
-        self.dynamic_alpha_fn = nn.Parameter(torch.zeros(self.block_dim, m + n))
         self.dynamic_beta_fn = nn.Parameter(torch.zeros(self.block_dim, m))
-        self.dynamic_alpha_scale = nn.Parameter(torch.ones(n, m + n))
         self.dynamic_beta_scale = nn.Parameter(torch.ones(n, m))
 
         self.routing_norm = nn.RMSNorm(self.block_dim, eps=eps)
 
+        if carry_mode == "mhc_lite":
+            self.carry_router = MHCLiteCarry(
+                n_slots=n,
+                block_dim=self.block_dim,
+                num_permutations=mhc_lite_num_permutations,
+                permutation_seed=mhc_lite_permutation_seed,
+                eps=eps,
+            )
+        else:
+            self.carry_router = None
+            self.static_carry = nn.Parameter(torch.eye(n))
+            self.dynamic_carry_fn = nn.Parameter(torch.zeros(self.block_dim, n))
+            self.dynamic_carry_scale = nn.Parameter(torch.ones(n, n))
+
     def width_connection(
         self, h: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compress virtual width to backbone width and return the carry path."""
+        """Read a D-wide branch input and construct the persistent carry."""
         if h.shape[-1] != self.virtual_dim:
             raise ValueError(
                 f"expected hidden width {self.virtual_dim}, got {h.shape[-1]}"
@@ -175,32 +408,49 @@ class GeneralizedHyperConnection(nn.Module):
         slots = h.reshape(prefix + (self.n, self.block_dim))
         norm_slots = self.routing_norm(slots)
 
-        dynamic_alpha = safe_tanh(
-            torch.matmul(
+        dynamic_read = safe_tanh(
+            project_slots(
                 norm_slots,
-                self.dynamic_alpha_fn.to(dtype=norm_slots.dtype),
+                self.dynamic_read_fn.to(dtype=norm_slots.dtype),
             )
             * self.factor
         )
+        read = self.static_read.to(dtype=slots.dtype) + (
+            dynamic_read * self.dynamic_read_scale.to(dtype=slots.dtype)
+        )
+
+        # (slots^T @ read)^T -> [..., m, block_dim]
+        branch_blocks = apply_map(slots, read)
+        branch_input = branch_blocks.reshape(prefix + (self.dim,))
+
+        if self.carry_mode == "mhc_lite":
+            assert self.carry_router is not None
+            carry = self.carry_router(slots)
+        else:
+            dynamic_carry = safe_tanh(
+                project_slots(
+                    norm_slots,
+                    self.dynamic_carry_fn.to(dtype=norm_slots.dtype),
+                )
+                * self.factor
+            )
+            carry_matrix = self.static_carry.to(dtype=slots.dtype) + (
+                dynamic_carry
+                * self.dynamic_carry_scale.to(dtype=slots.dtype)
+            )
+            carry = apply_map(slots, carry_matrix)
+
         dynamic_beta = safe_tanh(
-            torch.matmul(
+            project_slots(
                 norm_slots,
                 self.dynamic_beta_fn.to(dtype=norm_slots.dtype),
             )
             * self.factor
         )
-
-        alpha = self.static_alpha.to(dtype=slots.dtype) + (
-            dynamic_alpha * self.dynamic_alpha_scale.to(dtype=slots.dtype)
-        )
         beta = self.static_beta.to(dtype=slots.dtype) + (
             dynamic_beta * self.dynamic_beta_scale.to(dtype=slots.dtype)
         )
 
-        # slots^T @ alpha: [..., block_dim, n] @ [..., n, m+n]
-        mixed = torch.matmul(slots.transpose(-2, -1), alpha).transpose(-2, -1)
-        branch_input = mixed[..., : self.m, :].reshape(prefix + (self.dim,))
-        carry = mixed[..., self.m :, :]
         return branch_input, carry, beta
 
     def depth_connection(
@@ -209,7 +459,7 @@ class GeneralizedHyperConnection(nn.Module):
         branch_output: torch.Tensor,
         beta: torch.Tensor,
     ) -> torch.Tensor:
-        """Expand a backbone-width output and update the virtual state."""
+        """Split a D-wide branch output and write it to the virtual state."""
         if branch_output.shape[-1] != self.dim:
             raise ValueError(
                 f"expected branch width {self.dim}, got {branch_output.shape[-1]}"
@@ -217,7 +467,11 @@ class GeneralizedHyperConnection(nn.Module):
 
         prefix = branch_output.shape[:-1]
         output_blocks = branch_output.reshape(prefix + (self.m, self.block_dim))
-        written = torch.matmul(beta.to(dtype=output_blocks.dtype), output_blocks)
+        # beta @ output_blocks -> [..., n, block_dim], as a fusable broadcast sum.
+        written = (
+            beta.to(dtype=output_blocks.dtype).unsqueeze(-1)
+            * output_blocks.unsqueeze(-3)
+        ).sum(-2)
         slots = carry + written
         return slots.reshape(prefix + (self.virtual_dim,)).contiguous()
 
@@ -254,15 +508,32 @@ class TransformerBlock(nn.Module):
         mlp_mult: int,
         vwn_m: int,
         vwn_n: int,
+        vwn_carry_mode: Literal["ghc", "mhc_lite"],
+        mhc_lite_num_permutations: int | None,
+        mhc_lite_permutation_seed: int,
     ):
         super().__init__()
         self.attn_norm = nn.RMSNorm(dim)
         self.attn = MultiHeadAttention(dim, n_heads)
-        self.attn_connection = GeneralizedHyperConnection(dim, vwn_m, vwn_n)
+        self.attn_connection = GeneralizedHyperConnection(
+            dim,
+            vwn_m,
+            vwn_n,
+            carry_mode=vwn_carry_mode,
+            mhc_lite_num_permutations=mhc_lite_num_permutations,
+            mhc_lite_permutation_seed=mhc_lite_permutation_seed,
+        )
 
         self.mlp_norm = nn.RMSNorm(dim)
         self.mlp = MLP(dim, mlp_mult)
-        self.mlp_connection = GeneralizedHyperConnection(dim, vwn_m, vwn_n)
+        self.mlp_connection = GeneralizedHyperConnection(
+            dim,
+            vwn_m,
+            vwn_n,
+            carry_mode=vwn_carry_mode,
+            mhc_lite_num_permutations=mhc_lite_num_permutations,
+            mhc_lite_permutation_seed=mhc_lite_permutation_seed,
+        )
 
     def forward(
         self,
@@ -304,15 +575,25 @@ class GPT(nn.Module):
         vwn_m: int = 2,
         vwn_n: int = 3,
         vwn_group_norm: bool | None = None,
+        vwn_carry_mode: Literal["ghc", "mhc_lite"] = "mhc_lite",
+        mhc_lite_num_permutations: int | None = None,
+        mhc_lite_permutation_seed: int = 0,
     ):
         super().__init__()
 
         if vwn_m < 1:
             raise ValueError(f"vwn_m must be positive, got {vwn_m}")
         if vwn_n < vwn_m:
-            raise ValueError(f"vwn_n must be >= vwn_m, got m={vwn_m}, n={vwn_n}")
+            raise ValueError(
+                f"vwn_n must be >= vwn_m, got m={vwn_m}, n={vwn_n}"
+            )
         if dim % vwn_m != 0:
             raise ValueError(f"dim={dim} must be divisible by vwn_m={vwn_m}")
+        if vwn_carry_mode not in {"ghc", "mhc_lite"}:
+            raise ValueError(
+                "vwn_carry_mode must be 'ghc' or 'mhc_lite', "
+                f"got {vwn_carry_mode!r}"
+            )
 
         self.seq_len = seq_len
         self.eos_id = eos_id
@@ -322,6 +603,9 @@ class GPT(nn.Module):
         self.block_dim = dim // vwn_m
         self.virtual_dim = vwn_n * self.block_dim
         self.virtual_width_ratio = vwn_n / vwn_m
+        self.vwn_carry_mode = vwn_carry_mode
+        self.mhc_lite_num_permutations = mhc_lite_num_permutations
+        self.mhc_lite_permutation_seed = mhc_lite_permutation_seed
 
         # Gemma-2-style final-logit soft-capping.
         self.logit_softcap = logit_softcap
@@ -343,6 +627,9 @@ class GPT(nn.Module):
                     mlp_mult=mlp_mult,
                     vwn_m=vwn_m,
                     vwn_n=vwn_n,
+                    vwn_carry_mode=vwn_carry_mode,
+                    mhc_lite_num_permutations=mhc_lite_num_permutations,
+                    mhc_lite_permutation_seed=mhc_lite_permutation_seed,
                 )
                 for _ in range(n_layers)
             ]
@@ -387,10 +674,16 @@ class GPT(nn.Module):
         Merge this set into any existing no-weight-decay policy used by the
         trainer. Dynamic routing matrices and scales should still receive decay.
         """
+        static_routing_suffixes = (
+            "static_read",
+            "static_carry",
+            "static_beta",
+            "static_logits",
+        )
         return {
             name
             for name, _ in self.named_parameters()
-            if name.endswith("static_alpha") or name.endswith("static_beta")
+            if name.endswith(static_routing_suffixes)
         }
 
     def forward(
@@ -434,9 +727,9 @@ class GPT(nn.Module):
             if logits.requires_grad:
                 logits = cap * torch.tanh(logits / cap)
             else:
-                # in-place: eval logits are (B, L, V) and huge (lm-eval scores
-                # in big batches); an out-of-place tanh doubles the peak and OOMs
+                # Eval logits are huge; avoid doubling memory with out-of-place tanh.
                 logits = logits.div_(cap).tanh_().mul_(cap)
+
         return (logits, new_past_kv) if use_cache else logits
 
     @torch.no_grad()

@@ -22,6 +22,8 @@ from pathlib import Path
 
 os.environ.setdefault("CCE_AUTOTUNE", "1")
 os.environ.setdefault("HF_HOME", "/mnt/ai/data/hf")  # datasets cache
+# Persist inductor/autotune artifacts: cold max-autotune costs ~4 min, warm ~seconds.
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/mnt/ai/data/torchinductor_cache")
 
 import torch
 import torch.nn as nn
@@ -105,9 +107,13 @@ ADAMW_WEIGHT_DECAY = 0.0
 VWN_M = 2
 VWN_N = 3
 BATCH_SIZE = 128
+# The VWN state at batch 128 hits VRAM pressure on the 16GB card (-31% tok/s vs
+# 2x64); split each global batch into microbatches with gradient accumulation.
+# Same global batch / identical gradients up to fp rounding.
+GRAD_ACCUM_STEPS = 2
 MAX_TRAIN_STEPS = 5000
-VALIDATE_EVERY_N_STEPS = 500
-BENCH_EVERY_N_STEPS = 1500  # in-training benchmark curve (0/None to disable)
+VALIDATE_EVERY_N_STEPS = 1000
+BENCH_EVERY_N_STEPS = 2500  # in-training benchmark curve (0/None to disable)
 N_EPOCHS = 1
 
 RUN_DIR = Path("/mnt/ai/runs/tinylm/pretrain")
@@ -533,9 +539,11 @@ def train():
 
     model.to(DEVICE, dtype=DTYPE)
     if DEVICE == "cuda":
-        model = torch.compile(
-            model
-        )  # fuse rope/act/residuals around FlexAttention
+        # max-autotune is REQUIRED with the fused GHC routing: default-mode
+        # inductor picks pathological backward reduction kernels for the
+        # broadcast-sum maps (bwd 174ms vs 52ms at batch 64). cudagraphs add
+        # nothing here (per-batch block mask defeats capture), so skip them.
+        model = torch.compile(model, mode="max-autotune-no-cudagraphs")
 
     # tokenizer-agnostic BPB yardstick (fixed held-out, tokenized once for this run)
     bpb_X, bpb_Y, bpb_bytes = prepare_bpb(dm.tokenizer)
@@ -567,11 +575,21 @@ def train():
             for g, base in zip(optimizer.param_groups, base_lrs):
                 g["lr"] = base * lr_factor(global_step)
             optimizer.zero_grad()
-            loss = compute_loss(model, x, y, dm.eos_id, dm.vocab_size)
-            loss.backward()
+            # Microbatches are equal-sized, so the mean of half-losses equals the
+            # global-batch mean loss and gradients match the unsplit batch.
+            micro = x.shape[0] // GRAD_ACCUM_STEPS
+            loss = torch.zeros((), device=DEVICE)
+            for mb in range(GRAD_ACCUM_STEPS):
+                sl = slice(mb * micro, (mb + 1) * micro)
+                mb_loss = (
+                    compute_loss(model, x[sl], y[sl], dm.eos_id, dm.vocab_size)
+                    / GRAD_ACCUM_STEPS
+                )
+                mb_loss.backward()
+                loss += mb_loss.detach()
             optimizer.step()
 
-            step_loss = loss.detach().item()
+            step_loss = loss.item()
             step_perplexity = math.exp(min(step_loss, 10))
 
             global_step += 1

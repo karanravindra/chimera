@@ -55,10 +55,11 @@ source `id`s are defined in Datasets above.
 
 | run    | steps | mix                               | blimp     | lambada   | piqa      | sciq      | arc_easy  |
 |--------|-------|-----------------------------------|-----------|-----------|-----------|-----------|-----------|
-| curric | 5k    | qa-mix, sc30, cosine LR, cos20→40 | 69.86     | **17.47** | 56.47     | **68.10** | **35.23** |
+| vwn+mhc| 5k    | curric + VWN(2,3) 1.5× + mHC-Lite | **71.01** | **18.36** | 56.31     | 67.80     | **35.35** |
+| curric | 5k    | qa-mix, sc30, cosine LR, cos20→40 | 69.86     | 17.47     | 56.47     | **68.10** | 35.23     |
 | sc30   | 5k    | qa-mix + logit softcap 30         | 69.18     | 16.86     | 55.93     | 67.70     | 34.93     |
 | qa-mix | 5k    | cos30 fw34 ts30 gq5 sq1 +doc      | 69.53     | 17.27     | 57.24     | 67.40     | 34.76     |
-| cos    | 5k    | cos30 fw40 ts30                   | **70.09** | 16.94     | 55.44     | 54.50     | 33.96     |
+| cos    | 5k    | cos30 fw40 ts30                   | 70.09     | 16.94     | 55.44     | 54.50     | 33.96     |
 | 3-way  | 5k    | str30 fw40 ts30                   | 68.66     | 15.54     | 56.37     | 54.80     | 34.55     |
 | 4-way  | 5k    | tt30 str30 fw25 ts15              | 67.63     | 16.01     | **57.29** | 55.80     | 34.34     |
 | 5-way  | 5k    | tt30 str25 fw20 ts15 wt10         | 67.94     | 16.11     | 56.42     | 55.30     | 34.89     |
@@ -109,6 +110,25 @@ recall), QA format intact. Confounded pair (schedule + curriculum changed togeth
 isolate before crediting either alone. Trained-doc coverage audit (sciq/arc wrong
 answers vs training text): 96% of missed sciq facts WERE in training (cosmopedia
 provides ~90% of coverage) — misses are capacity, not data absence.
+
+vwn+mhc (2026-07-20): curric config + Virtual Width Networks (residual state at 1.5×
+virtual width, `VWN_M=2 VWN_N=3`; attn/MLP stay at dim 384) with mHC-Lite carry routing
+(`carry_mode="mhc_lite"`, the model default — the square n×n persistent carry map is a
+convex combination over a fixed permutation basis; read/write maps stay the rectangular
+dynamic GHC maps). Best model to date: best-in-table blimp 71.01 (+1.2 over curric),
+lambada 18.36 (+0.9), arc 35.35, and best val_bpb 0.830 (curric 0.844); piqa/sciq tie
+within noise. BPB descent is clean and monotone (1.024→0.916→0.857→0.836→0.830, no
+forgetting). So the ~1.5× effective width buys real grammar/long-range gains even at 6M.
+Not yet isolated: plain VWN (`carry_mode="ghc"`) has NOT been run as a baseline, so
+mHC-Lite's contribution vs plain VWN is unmeasured — this row credits the pair. Cost:
+the virtual-width machinery (VWN + routing) is a flat +16% step time (profiled 141→168
+ms/step single-microbatch, VWN(2,3) vs no-VWN(1,1), both on the mHC-Lite model). Kept —
+the quality pays for it. Optimization pass (see below) confirmed the step is otherwise
+compute-bound: CCE is 31% of the step and mandatory (plain materialized CE OOMs on the
+16GB card; CCE peaks 6.4GB), and `.item()` sync / CUDA graphs / block-mask caching are
+all ≤3% dead ends. Eval cadence trimmed this run (val 500→1000, bench 1500→2500) to cut
+the ~13% eval overhead. Run log:
+`/mnt/ai/runs/tinylm/pretrain/train_vwn_2026-07-20_0008.log`.
 
 ## TODO
 
