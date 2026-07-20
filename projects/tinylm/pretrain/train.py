@@ -484,7 +484,10 @@ def run_benchmarks(model, dm, step=None):
     metrics = {}  # task -> (metric_name, value as %)
     for task in TASKS:
         name, val, _ = headline(results[task])
-        metrics[task] = (name, val if ("perplex" in name or "bits_per_byte" in name) else val * 100)
+        metrics[task] = (
+            name,
+            val if ("perplex" in name or "bits_per_byte" in name) else val * 100,
+        )
     row = " | ".join(f"{t}={metrics[t][1]:.2f}" for t in order if t in metrics)
 
     if step is not None:
@@ -570,6 +573,7 @@ def train():
             return (step + 1) / WARMUP_STEPS
         t = (step - WARMUP_STEPS) / max(1, MAX_TRAIN_STEPS - WARMUP_STEPS)
         return FINAL_LR_FRAC + (1 - FINAL_LR_FRAC) * 0.5 * (1 + math.cos(math.pi * t))
+
     print_model_stats(model, global_batch_size)
 
     model.to(DEVICE, dtype=DTYPE)
@@ -618,7 +622,11 @@ def train():
                 sl = slice(mb * micro, (mb + 1) * micro)
                 mb_loss = (
                     compute_loss(
-                        model, x[sl], y[sl], dm.eos_id, dm.vocab_size,
+                        model,
+                        x[sl],
+                        y[sl],
+                        dm.eos_id,
+                        dm.vocab_size,
                         sampled=SAMPLED_CE,
                     )
                     / GRAD_ACCUM_STEPS

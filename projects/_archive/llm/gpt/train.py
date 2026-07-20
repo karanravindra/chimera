@@ -43,8 +43,8 @@ from bench import DEFAULT_TASKS, flatten_for_wandb, print_table, run_benchmarks
 # Ladder doubles width; the swept muP LR (muon 0.013 / adamw 0.006) transfers to all.
 # Sizes: small 20.5M / base 48.9M / large 150M (tied embedding; vocab 64402).
 ARCH_PRESETS = {
-    "small": "256-8-1-6",    # 20.5M — smallest verified point off the loss floor
-    "base": "512-16-1-6",    # 48.9M — Pareto winner; near the loss floor, below depth-12's wall
+    "small": "256-8-1-6",  # 20.5M — smallest verified point off the loss floor
+    "base": "512-16-1-6",  # 48.9M — Pareto winner; near the loss floor, below depth-12's wall
     "large": "1024-32-1-8",  # 150M — width ladder + a touch of depth (aspect 128) for long horizons
 }
 
@@ -75,8 +75,10 @@ class DynamicUntie(Callback):
         if forked is not None:
             emb_w, head_w = forked
             trainer.optimizers[0].add_adamw_param(head_w, copy_state_from=emb_w)
-            print(f"[untie] forked lm_head from tied embedding at step "
-                  f"{trainer.global_step} (split_step={self.split_step})")
+            print(
+                f"[untie] forked lm_head from tied embedding at step "
+                f"{trainer.global_step} (split_step={self.split_step})"
+            )
         self._done = True
 
 
@@ -86,9 +88,12 @@ def parse_args():
     p.add_argument("--run-dir", default="/mnt/ai/runs/llm/gpt")
     # which pre-packed mixture to train on (built by build_mixture.py)
     p.add_argument("--mix", default="mix_1B", help="mixture name under llm-mix/mix/")
-    p.add_argument("--tokenizer", default="LiquidAI/LFM2.5-230M",
-                   help="tokenizer: HF hub id or local path (train_tokenizer.py output). "
-                        "Must match the one the mix was tokenized with.")
+    p.add_argument(
+        "--tokenizer",
+        default="LiquidAI/LFM2.5-230M",
+        help="tokenizer: HF hub id or local path (train_tokenizer.py output). "
+        "Must match the one the mix was tokenized with.",
+    )
     p.add_argument("--epochs", type=int, default=1)
     # Effective tokens per optimizer step; the micro-batch size is derived as
     # global_token_count // seq_len (must divide evenly). Exposed instead of a
@@ -110,8 +115,12 @@ def parse_args():
     # schedule anneals it back down by the end of the run. gpt-no-bias-48emb-
     # a0.004 (this default) has no such hump — monotonically decreasing the
     # whole run. Keep the scheduler on and its period = run length regardless.
-    p.add_argument("--muon-lr", type=float, default=0.013)   # swept optimum (muP LR sweep 60lc74lr, 9M proxy/200M tok): 0.0133
-    p.add_argument("--adamw-lr", type=float, default=6e-3)    # swept optimum: 0.00603 (broad basin muon 8e-3..1.8e-2 x adamw 3e-3..6e-3)
+    p.add_argument(
+        "--muon-lr", type=float, default=0.013
+    )  # swept optimum (muP LR sweep 60lc74lr, 9M proxy/200M tok): 0.0133
+    p.add_argument(
+        "--adamw-lr", type=float, default=6e-3
+    )  # swept optimum: 0.00603 (broad basin muon 8e-3..1.8e-2 x adamw 3e-3..6e-3)
     p.add_argument("--adamw-weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-steps", type=int, default=100)
     p.add_argument("--eta-min", type=float, default=1e-5)
@@ -122,8 +131,12 @@ def parse_args():
     p.add_argument("--val-check-interval", type=int, default=500)
     p.add_argument("--limit-val-batches", type=int, default=250)
     # stdout progress cadence (throughput + metrics); per-stage timing is always on
-    p.add_argument("--print-every", type=int, default=500,
-                   help="print step/throughput/metrics every N steps (0 disables)")
+    p.add_argument(
+        "--print-every",
+        type=int,
+        default=500,
+        help="print step/throughput/metrics every N steps (0 disables)",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--wandb-project", default="llm-pretrain")
     # Explicit wandb run name; left unset, wandb assigns a random one. Useful to
@@ -159,23 +172,37 @@ def parse_args():
     # learned softmax attention over depth. --attn-res-n-blocks == --n-layer is
     # "Full AttnRes" (attends over every layer's output); smaller values are
     # "Block AttnRes" (attends over block-level summaries, O(N*d) memory).
-    p.add_argument("--use-attn-res", action="store_true",
+    p.add_argument(
+        "--use-attn-res",
+        action="store_true",
         help="Enable (Block) Attention Residuals in place of plain additive "
-             "residual connections (MoonshotAI AttnRes). Default off.")
-    p.add_argument("--attn-res-n-blocks", type=int, default=8,
+        "residual connections (MoonshotAI AttnRes). Default off.",
+    )
+    p.add_argument(
+        "--attn-res-n-blocks",
+        type=int,
+        default=8,
         help="Number of blocks to partition the network into for Block AttnRes "
-             "(must evenly divide --n-layer). Set equal to --n-layer for Full "
-             "AttnRes (attention over every individual layer's output).")
+        "(must evenly divide --n-layer). Set equal to --n-layer for Full "
+        "AttnRes (attention over every individual layer's output).",
+    )
     # DeepSeek-V3 Multi-head Latent Attention: compresses K/V (and optionally Q)
     # into a low-rank latent, shrinking the KV cache. --n-kv-head is ignored
     # when this is on.
-    p.add_argument("--use-mla", action="store_true",
+    p.add_argument(
+        "--use-mla",
+        action="store_true",
         help="Replace grouped-query attention with Multi-head Latent Attention "
-             "(DeepSeek-V3). Default off.")
+        "(DeepSeek-V3). Default off.",
+    )
     p.add_argument("--kv-lora-rank", type=int, default=128)
-    p.add_argument("--q-lora-rank", type=int, default=0,
+    p.add_argument(
+        "--q-lora-rank",
+        type=int,
+        default=0,
         help="0 disables Q compression (direct q_proj); only pays off at much "
-             "larger width than this repo trains at.")
+        "larger width than this repo trains at.",
+    )
     p.add_argument("--qk-nope-head-dim", type=int, default=64)
     p.add_argument("--qk-rope-head-dim", type=int, default=32)
     p.add_argument("--v-head-dim", type=int, default=64)
@@ -183,26 +210,39 @@ def parse_args():
     # expert(s), aux-loss-free load balancing (bias buffer, no gradient-based
     # balance loss). Expert FFN compute uses torch.nn.functional.grouped_mm on
     # CUDA+bf16 (falls back to an eager per-expert loop otherwise).
-    p.add_argument("--use-moe", action="store_true",
-        help="Replace the dense MLP with DeepSeek MoE (aux-loss-free). Default off.")
+    p.add_argument(
+        "--use-moe",
+        action="store_true",
+        help="Replace the dense MLP with DeepSeek MoE (aux-loss-free). Default off.",
+    )
     p.add_argument("--n-routed-experts", type=int, default=8)
     p.add_argument("--n-shared-experts", type=int, default=1)
     p.add_argument("--n-activated-experts", type=int, default=2)
-    p.add_argument("--moe-inter-dim", type=int, default=None,
+    p.add_argument(
+        "--moe-inter-dim",
+        type=int,
+        default=None,
         help="Per-expert FFN hidden dim; defaults to n_embd // 2 (fine-grained: "
-             "much narrower than the dense 4x FFN) when unset.")
+        "much narrower than the dense 4x FFN) when unset.",
+    )
     p.add_argument("--route-scale", type=float, default=1.0)
-    p.add_argument("--bias-update-speed", type=float, default=0.001,
+    p.add_argument(
+        "--bias-update-speed",
+        type=float,
+        default=0.001,
         help="Step size for the aux-loss-free per-expert routing bias. Note: "
-             "double-applies under --grad-checkpoint (the gate runs twice per "
-             "step under activation-checkpoint recompute) -- halve this or avoid "
-             "combining the two flags until a call-count guard is added.")
+        "double-applies under --grad-checkpoint (the gate runs twice per "
+        "step under activation-checkpoint recompute) -- halve this or avoid "
+        "combining the two flags until a call-count guard is added.",
+    )
     # Disable the LR scheduler entirely -> constant LR (no warmup/cosine). Cleaner
     # for muP LR sweeps, where a schedule would confound which LR value matters.
     p.add_argument("--no-scheduler", dest="use_scheduler", action="store_false")
     # Recompute block activations in backward instead of storing them: lets wide
     # models fit on limited VRAM without shrinking tokens/step (~1 extra fwd cost).
-    p.add_argument("--grad-checkpoint", dest="gradient_checkpointing", action="store_true")
+    p.add_argument(
+        "--grad-checkpoint", dest="gradient_checkpointing", action="store_true"
+    )
     # Pure-causal attention uses SDPA/FlashAttention by default (faster than
     # flex_attention at small head_dim); flex is still used for decode and any
     # custom/sparse mask. This disables the SDPA fast path (always flex).
@@ -210,17 +250,29 @@ def parse_args():
     # Sparse attention: causal sliding window + always-visible global prefix
     # tokens (attention sinks), via flex_attention block masks that prune
     # fully-masked KV blocks. Unset = dense causal.
-    p.add_argument("--attn-window", type=int, default=None,
+    p.add_argument(
+        "--attn-window",
+        type=int,
+        default=None,
         help="Sliding-window size in tokens (e.g. 256). Unset or 0 = dense "
-             "causal (0 lets a wandb sweep grid include the dense baseline).")
-    p.add_argument("--attn-global-tokens", type=int, default=16,
+        "causal (0 lets a wandb sweep grid include the dense baseline).",
+    )
+    p.add_argument(
+        "--attn-global-tokens",
+        type=int,
+        default=16,
         help="Number of prefix tokens every query may attend to regardless of "
-             "the window (only used with --attn-window).")
+        "the window (only used with --attn-window).",
+    )
     p.add_argument("--no-tie-embedding", dest="tie_embedding", action="store_false")
-    p.add_argument("--untie-at-frac", type=float, default=None,
-                   help="modded-nanogpt dynamic untie: start tied, fork lm_head "
-                        "into a separate param at this fraction of --max-steps "
-                        "(e.g. 0.667). Requires tied embedding; None disables it.")
+    p.add_argument(
+        "--untie-at-frac",
+        type=float,
+        default=None,
+        help="modded-nanogpt dynamic untie: start tied, fork lm_head "
+        "into a separate param at this fraction of --max-steps "
+        "(e.g. 0.667). Requires tied embedding; None disables it.",
+    )
     p.add_argument("--no-compile", dest="compile", action="store_false")
     p.add_argument("--no-cce", dest="use_cce", action="store_false")
     # Skip the final trainer.test() pass (redundant with periodic validation when
@@ -288,8 +340,10 @@ def main():
         # clear win, so keep it on. The data-dependent expert offs are handled
         # without per-step recompiles in steady state; only drop to --no-compile if
         # you actually hit compile errors.
-        print("[info] --compile with --use-moe: keeping compile on (measured "
-              "~+14 MFU points over eager).")
+        print(
+            "[info] --compile with --use-moe: keeping compile on (measured "
+            "~+14 MFU points over eager)."
+        )
 
     dm = MixtureDataModule(
         data_dir=args.data_dir,
@@ -303,10 +357,14 @@ def main():
     dm.setup("fit")
     train_loader = dm.train_dataloader()
     val_loader = dm.val_dataloader()
-    print(f"mixture={args.mix}  tokenizer={dm.pretrained_id}  vocab_size={dm.vocab_size}")
+    print(
+        f"mixture={args.mix}  tokenizer={dm.pretrained_id}  vocab_size={dm.vocab_size}"
+    )
     print(f"eos_token={dm.eos_token!r}  eos_id={dm.eos_id}")
     if dm.manifest:
-        srcs = ", ".join(f"{r['key']}:{r['renorm_weight']:.2f}" for r in dm.manifest["sources"])
+        srcs = ", ".join(
+            f"{r['key']}:{r['renorm_weight']:.2f}" for r in dm.manifest["sources"]
+        )
         print(f"mix sources -> {srcs}")
 
     model = GPT(
@@ -385,7 +443,10 @@ def main():
     print(f"bytes/token={bytes_per_token:.4f} (val/*bpb = bpt / bytes_per_token)")
     # use_cce: fuse lm_head + cross-entropy (apple/ml-cross-entropy), no logits materialized
     lm_module = LanguageModelModule(
-        model, optimizer, scheduler, use_cce=args.use_cce,
+        model,
+        optimizer,
+        scheduler,
+        use_cce=args.use_cce,
         bytes_per_token=bytes_per_token,
     )
 
@@ -428,8 +489,10 @@ def main():
         ),
     )
     if args.untie_at_frac and not args.tie_embedding:
-        print("[warn] --untie-at-frac ignored: embedding is already untied "
-              "(--no-tie-embedding). Dynamic untie needs a tied start.")
+        print(
+            "[warn] --untie-at-frac ignored: embedding is already untied "
+            "(--no-tie-embedding). Dynamic untie needs a tied start."
+        )
     # FineWebEduDataModule exposes only train/val loaders (no test split), so the
     # loaders are passed explicitly; validation reuses the val loader as in the
     # notebook (logged under train/*, val/*, and test/* respectively).

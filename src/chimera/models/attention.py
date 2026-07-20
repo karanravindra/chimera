@@ -76,9 +76,9 @@ def build_block_mask_and_pos(x: torch.Tensor, eos_id: int):
 
 def make_causal_mask(seq_len: int, device: str = "cpu") -> torch.Tensor:
     """Make a causal attention mask for a sequence of length `seq_len`."""
-    return torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=device)).view(
-        1, 1, seq_len, seq_len
-    )
+    return torch.tril(
+        torch.ones((seq_len, seq_len), dtype=torch.bool, device=device)
+    ).view(1, 1, seq_len, seq_len)
 
 
 def make_document_mask(x: torch.Tensor, eos_id: int = 0) -> torch.Tensor:

@@ -120,8 +120,9 @@ class BPETokenizer:
         if self.backend == "scratch":
             self._train_scratch(text, vocab_size)
         else:
-            self._train_hf(text, vocab_size, special_tokens, min_frequency,
-                           split_digits)
+            self._train_hf(
+                text, vocab_size, special_tokens, min_frequency, split_digits
+            )
         return self
 
     def _train_scratch(self, text: Union[str, Iterable[str]], vocab_size: int):

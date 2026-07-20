@@ -19,14 +19,17 @@ class LoRALinear(nn.Module):
         self.scale = alpha / r
         self.lora_A = nn.Parameter(torch.zeros(r, base.in_features))
         self.lora_B = nn.Parameter(torch.zeros(base.out_features, r))
-        nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)  # B stays zero => delta starts at 0
+        nn.init.kaiming_uniform_(
+            self.lora_A, a=5**0.5
+        )  # B stays zero => delta starts at 0
 
     def forward(self, x):
         return self.base(x) + (x @ self.lora_A.T @ self.lora_B.T) * self.scale
 
     def merged(self) -> nn.Linear:
         lin = nn.Linear(
-            self.base.in_features, self.base.out_features,
+            self.base.in_features,
+            self.base.out_features,
             bias=self.base.bias is not None,
         )
         with torch.no_grad():
@@ -37,7 +40,9 @@ class LoRALinear(nn.Module):
         return lin.to(self.base.weight.device, self.base.weight.dtype)
 
 
-def apply_lora(model: nn.Module, r: int = 16, alpha: float = 32.0) -> list[nn.Parameter]:
+def apply_lora(
+    model: nn.Module, r: int = 16, alpha: float = 32.0
+) -> list[nn.Parameter]:
     """Wrap every nn.Linear in LoRA; returns the LoRA (A/B) params to optimize.
 
     Base weights are NOT requires_grad_(False)-frozen: the compiled

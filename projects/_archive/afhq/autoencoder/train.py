@@ -268,9 +268,13 @@ def main():
 
     # ---- Phase 3: L1 + LPIPS + PatchGAN @ 64x64, output head only ----
     if args.phase3_epochs > 0:
-        dm64_p3 = make_dm(args.data_dir, 64, args.phase3_batch_size, args.seed, args.augment)
+        dm64_p3 = make_dm(
+            args.data_dir, 64, args.phase3_batch_size, args.seed, args.augment
+        )
         train_loader = dm64_p3.train_dataloader()
-        discriminator = PatchGANDiscriminator(in_channels=3, base_channels=64, n_layers=3)
+        discriminator = PatchGANDiscriminator(
+            in_channels=3, base_channels=64, n_layers=3
+        )
         g_params = AdversarialAutoencoderModule.trainable_params(model, TRAIN_ONLY_P3)
         opt_g = torch.optim.AdamW(g_params, lr=args.phase3_lr, betas=(0.5, 0.9))
         opt_d = torch.optim.AdamW(

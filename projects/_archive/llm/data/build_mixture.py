@@ -40,7 +40,9 @@ def _mix_dir(sft: bool) -> Path:
     return Path("/mnt/ai/data/llm-mix") / ("mix_sft" if sft else "mix")
 
 
-def available_sources(sft: bool, weights: dict | None = None) -> list[tuple[str, float, int]]:
+def available_sources(
+    sft: bool, weights: dict | None = None
+) -> list[tuple[str, float, int]]:
     """Return (key, weight, n_tokens) for every source with a complete cache.
 
     When ``weights`` is given (key -> weight), restrict the mix to exactly those
@@ -62,20 +64,29 @@ def available_sources(sft: bool, weights: dict | None = None) -> list[tuple[str,
             else:
                 # SFT uses a distinct composition (chat-led): prefer sft_weight when
                 # set, else fall back to the pretrain weight.
-                w = src.sft_weight if (sft and src.sft_weight is not None) else src.weight
+                w = (
+                    src.sft_weight
+                    if (sft and src.sft_weight is not None)
+                    else src.weight
+                )
             out.append((src.key, w, meta["n_tokens"]))
     return out
 
 
-def build(name: str, total: int, val_frac: float, seed: int, sft: bool = False,
-          weights: dict | None = None):
+def build(
+    name: str,
+    total: int,
+    val_frac: float,
+    seed: int,
+    sft: bool = False,
+    weights: dict | None = None,
+):
     TOK = _tok_dir(sft)
     MIX = _mix_dir(sft)
     avail = available_sources(sft, weights)
     if not avail:
         raise SystemExit(
-            "no tokenized sources found under "
-            f"{TOK} — run tokenize_source.py first"
+            f"no tokenized sources found under {TOK} — run tokenize_source.py first"
         )
     wsum = sum(w for _, w, _ in avail)
     rng = np.random.default_rng(seed)
@@ -122,8 +133,10 @@ def build(name: str, total: int, val_frac: float, seed: int, sft: bool = False,
 
     # shuffle blocks across sources, then stream them out in that order
     order = rng.permutation(len(train_blocks))
-    caches = {key: np.memmap(TOK / key / "ids.bin", dtype=DTYPE, mode="r")
-              for key, _, _ in avail}
+    caches = {
+        key: np.memmap(TOK / key / "ids.bin", dtype=DTYPE, mode="r")
+        for key, _, _ in avail
+    }
     mcaches = {key: _mask(key) for key, _, _ in avail} if sft else {}
     n_train_tokens = 0
     for i in order:
@@ -153,7 +166,8 @@ def build(name: str, total: int, val_frac: float, seed: int, sft: bool = False,
     print(f"[{name}] train={n_train_tokens:,} tokens from {len(avail)} sources")
     for r in plan_rows:
         flag = "  (CAPPED)" if r["capped"] else ""
-        print(f"   {r['key']:<16} {r['renorm_weight']:.3f} -> "
-              f"{r['train_tokens'] / 1e6:.1f}M train  ({r['repeat']}x){flag}")
+        print(
+            f"   {r['key']:<16} {r['renorm_weight']:.3f} -> "
+            f"{r['train_tokens'] / 1e6:.1f}M train  ({r['repeat']}x){flag}"
+        )
     print(f"   manifest: {out_dir / 'manifest.json'}")
-

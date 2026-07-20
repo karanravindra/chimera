@@ -85,9 +85,7 @@ def _smallest_shard(repo: str, prefix: str) -> Shard:
         return getattr(p, "size", None) or getattr(getattr(p, "lfs", None), "size", 0)
 
     best = min(infos, key=_size)
-    cached = (
-        try_to_load_from_cache(repo, best.path, repo_type="dataset") is not None
-    )
+    cached = try_to_load_from_cache(repo, best.path, repo_type="dataset") is not None
     return Shard(path=best.path, size=_size(best), cached=cached)
 
 
@@ -175,9 +173,7 @@ def _swh_content(blob_id: str, src_encoding: str = "utf-8") -> str:
     Stack v2 rows are gzip-compressed blobs keyed by ``blob_id``; ``src_encoding``
     is the file's original text encoding (a column on every row).
     """
-    obj = _s3_client().get_object(
-        Bucket="softwareheritage", Key=f"content/{blob_id}"
-    )
+    obj = _s3_client().get_object(Bucket="softwareheritage", Key=f"content/{blob_id}")
     raw = gzip.decompress(obj["Body"].read())
     return raw.decode(src_encoding, errors="replace")
 
@@ -332,7 +328,15 @@ def _sample_toolcall(src: Source, n: int) -> Iterator[Sample]:
     Handles the common column names (`conversations` / `messages`), lists stored
     as JSON/py-repr strings, and an optional `tools` schema block.
     """
-    cols = ["conversations", "messages", "tools", "system", "type", "domain", "subset_name"]
+    cols = [
+        "conversations",
+        "messages",
+        "tools",
+        "system",
+        "type",
+        "domain",
+        "subset_name",
+    ]
     rows, shard = _peek_slice(src, n, columns=cols)
     src.last_shard = shard
     for row in rows:
@@ -483,7 +487,8 @@ SOURCES: list[Source] = [
         config=None,
         split="train",
         file_prefix="result.parquet",
-        avail_tokens=51 * _M,  # measured; single-turn; UNGATED mirror of Salesforce xLAM
+        avail_tokens=51
+        * _M,  # measured; single-turn; UNGATED mirror of Salesforce xLAM
         notes="Single-turn FC; ungated ChatML mirror of the gated Salesforce/xlam-60k.",
         kind="chat",
         sft_weight=0.03,  # format-diversity tool sets in the chat-led SFT mix
@@ -528,7 +533,8 @@ SOURCES: list[Source] = [
         config=None,
         split="train",
         file_prefix="apigen-mt_5k.json",
-        avail_tokens=30 * _M,  # measured; avg 18.5 msgs/conv, function_call→observation loops
+        avail_tokens=30
+        * _M,  # measured; avg 18.5 msgs/conv, function_call→observation loops
         notes="Deepest multi-turn agentic trajectories, BUT license is CC-BY-NC (non-commercial).",
         kind="chat",
         sft_weight=0.03,  # format-diversity tool sets in the chat-led SFT mix
@@ -562,7 +568,8 @@ SOURCES: list[Source] = [
         config=None,
         split="train_sft",
         file_prefix="data/train_sft-",
-        avail_tokens=0.256 * _B,  # measured: 255.7M tok (207.9k convs), 77.5% supervised
+        avail_tokens=0.256
+        * _B,  # measured: 255.7M tok (207.9k convs), 77.5% supervised
         notes="General open-domain chat (no tools); anchors the chat-led SFT mix. MIT.",
         kind="chat",
         sft_weight=0.50,  # chat-dominant: general chat leads the SFT mix
@@ -622,7 +629,8 @@ SOURCES: list[Source] = [
         config="sample-10BT",
         split="train",
         file_prefix="sample/10BT/",
-        avail_tokens=10 * _B,  # the sample IS 10B tokens (GPT-2 tok); larger dumps available
+        avail_tokens=10
+        * _B,  # the sample IS 10B tokens (GPT-2 tok); larger dumps available
         notes="Plain FineWeb (NOT fineweb-edu) — broader, less-filtered web prose; 'text' column. ODC-By.",
         _sampler=_sample_plain_text,
     ),
@@ -651,9 +659,7 @@ SOURCES_BY_KEY: dict[str, Source] = {s.key: s for s in SOURCES}
 
 def get(key: str) -> Source:
     if key not in SOURCES_BY_KEY:
-        raise KeyError(
-            f"unknown source {key!r}; options: {', '.join(SOURCES_BY_KEY)}"
-        )
+        raise KeyError(f"unknown source {key!r}; options: {', '.join(SOURCES_BY_KEY)}")
     return SOURCES_BY_KEY[key]
 
 

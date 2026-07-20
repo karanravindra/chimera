@@ -67,7 +67,9 @@ WARMUP_STEPS = 50
 FINAL_LR_FRAC = 0.1
 
 # the pretrain vocab (chat specials already reserved); SFT never retrains it
-TOKENIZER_PATH = "/mnt/ai/data/mixture_tokenizers/tok_hf_v16384_c1000000000_371c2bf05f53.json"
+TOKENIZER_PATH = (
+    "/mnt/ai/data/mixture_tokenizers/tok_hf_v16384_c1000000000_371c2bf05f53.json"
+)
 BASE_CHECKPOINT = "/mnt/ai/runs/tinylm/pretrain/chimera_gpt6m.pt"
 
 RUN_DIR = Path("/mnt/ai/runs/tinylm/sft")
@@ -175,7 +177,9 @@ def print_generations(model, tokenizer, bos_id: int, eos_id: int, im_end_id: int
                 break
             out.append(nxt)
             x = torch.cat([x, torch.tensor([[nxt]], device=device)], dim=1)
-        print(f"\n>>> {messages[-1]['content'][:80]}\n{tokenizer._tok.decode(out).strip()!r}")
+        print(
+            f"\n>>> {messages[-1]['content'][:80]}\n{tokenizer._tok.decode(out).strip()!r}"
+        )
     net.train()
 
 
@@ -187,14 +191,22 @@ def train():
 
     train_ds, val_ds, mix = concat_streams(dms)
     total = sum(mix.values())
-    print("sft mix: " + "  ".join(f"{k}={v:,} ({v / total:.0%})" for k, v in mix.items()))
-    print(f"train tokens={total:,}  supervised={int((train_ds.labels != -100).sum()):,}")
+    print(
+        "sft mix: " + "  ".join(f"{k}={v:,} ({v / total:.0%})" for k, v in mix.items())
+    )
+    print(
+        f"train tokens={total:,}  supervised={int((train_ds.labels != -100).sum()):,}"
+    )
 
     from torch.utils.data import DataLoader
 
     train_loader = DataLoader(
-        train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4,
-        pin_memory=True, drop_last=True,
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True
@@ -211,7 +223,9 @@ def train():
         lora_params = apply_lora(model, r=LORA_R, alpha=LORA_ALPHA)
         n_lora = sum(p.numel() for p in lora_params)
         n_total = sum(p.numel() for p in model.parameters())
-        print(f"LoRA r={LORA_R}: {n_lora:,} trainable / {n_total:,} ({n_lora / n_total:.1%})")
+        print(
+            f"LoRA r={LORA_R}: {n_lora:,} trainable / {n_total:,} ({n_lora / n_total:.1%})"
+        )
 
     model.to(DEVICE, dtype=DTYPE)
     if DEVICE == "cuda":

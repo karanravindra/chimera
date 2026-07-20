@@ -35,7 +35,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 os.environ.setdefault("HF_HOME", "/mnt/ai/data/hf")
 
-import sources as S  # noqa: E402
 from chimera.data.chat_template import SPECIAL_TOKENS as DEFAULT_SPECIALS  # noqa: E402
 from tokenize_source import COLUMNS, _iter_rows, _safe_content, render  # noqa: E402
 
@@ -65,7 +64,10 @@ def _iter_source_texts(src, char_cap: int, s3_workers: int, batch: int = 512):
             for _, row in _iter_rows(src, cols):
                 buf.append(row)
                 if len(buf) >= batch:
-                    blobs = [(r.get("blob_id"), r.get("src_encoding") or "utf-8") for r in buf]
+                    blobs = [
+                        (r.get("blob_id"), r.get("src_encoding") or "utf-8")
+                        for r in buf
+                    ]
                     for t in pool.map(lambda b: _safe_content(*b), blobs):
                         if t:
                             yield t
@@ -99,15 +101,21 @@ class Corpus:
         t0 = time.time()
         for src in self.targets:
             cap = int(self.total_chars * src.weight / self.wsum)
-            print(f"[{src.key}] sampling up to {cap / 1e6:.0f}M chars "
-                  f"(weight {src.weight / self.wsum:.3f})", flush=True)
+            print(
+                f"[{src.key}] sampling up to {cap / 1e6:.0f}M chars "
+                f"(weight {src.weight / self.wsum:.3f})",
+                flush=True,
+            )
             got = 0
             next_mark = 50_000_000
             for text in _iter_source_texts(src, cap, self.s3_workers):
                 got += len(text)
                 if got >= next_mark:
-                    print(f"[{src.key}]   {got / 1e6:.0f}M chars "
-                          f"({(time.time() - t0) / 60:.1f}min elapsed)", flush=True)
+                    print(
+                        f"[{src.key}]   {got / 1e6:.0f}M chars "
+                        f"({(time.time() - t0) / 60:.1f}min elapsed)",
+                        flush=True,
+                    )
                     next_mark += 50_000_000
                 yield text
             self.realized[src.key] = got
@@ -128,7 +136,11 @@ def _materialize_corpus(corpus: "Corpus", path: Path) -> dict:
             f.write(json.dumps(text) + "\n")
             n_docs += 1
             n_chars += len(text)
-    return {"n_docs": n_docs, "n_chars": n_chars, "realized_chars": dict(corpus.realized)}
+    return {
+        "n_docs": n_docs,
+        "n_chars": n_chars,
+        "realized_chars": dict(corpus.realized),
+    }
 
 
 def _read_corpus(path: Path):
@@ -156,8 +168,10 @@ def _eval_compression(tok_path: Path, targets, baseline_id: str, sample_chars: i
         n_base = len(base._tok.encode(text, add_special_tokens=False).ids)
         cr_new = len(text) / max(n_new, 1)
         cr_base = len(text) / max(n_base, 1)
-        print(f"  {src.key:<16} {cr_new:>8.3f} {cr_base:>8.3f} "
-              f"{(cr_new - cr_base):>+8.3f}")
+        print(
+            f"  {src.key:<16} {cr_new:>8.3f} {cr_base:>8.3f} "
+            f"{(cr_new - cr_base):>+8.3f}"
+        )
 
 
 def _vocab_tag(v: int) -> str:
@@ -165,16 +179,21 @@ def _vocab_tag(v: int) -> str:
     return f"{v // 1024}k" if v % 1024 == 0 else str(v)
 
 
-def _train_one(vocab: int, corpus_src, min_frequency: int, out_dir: Path,
-               provenance: dict) -> dict:
+def _train_one(
+    vocab: int, corpus_src, min_frequency: int, out_dir: Path, provenance: dict
+) -> dict:
     """Train + save one vocab size from an already-sampled corpus. corpus_src is a
     zero-arg callable returning a fresh iterator over the corpus documents."""
     out_dir.mkdir(parents=True, exist_ok=True)
     tok_path = out_dir / "tokenizer.json"
     t0 = time.time()
     tok = BPETokenizer(backend="hf")
-    tok.train(corpus_src(), vocab_size=vocab,
-              special_tokens=DEFAULT_SPECIALS, min_frequency=min_frequency)
+    tok.train(
+        corpus_src(),
+        vocab_size=vocab,
+        special_tokens=DEFAULT_SPECIALS,
+        min_frequency=min_frequency,
+    )
     tok.save(tok_path)
     secs = round(time.time() - t0, 1)
     meta = {
@@ -192,4 +211,3 @@ def _train_one(vocab: int, corpus_src, min_frequency: int, out_dir: Path,
 
 
 # --------------------------------------------------------------------------- #
-

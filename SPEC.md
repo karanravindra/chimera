@@ -2,6 +2,12 @@
 
 Status: **draft — pending approval** (2026-07-18)
 
+> **Superseded cleanup decision (2026-07-19):** archive-only data, model, Lightning
+> module, and scheduler implementations have been removed from `src/chimera` rather
+> than retained for future ports. The exact deletion and dependency manifest, archived
+> consumers, and recovery procedure live in [`projects/_archive/README.md`](projects/_archive/README.md).
+> This supersedes the relevant library-retention non-goal and vision redo steps below.
+
 ## 1. Goals
 
 - Archive every existing project at a recoverable point; the working tree starts clean.

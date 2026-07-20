@@ -16,8 +16,8 @@ connections and the original model width.
 
 This model resets RoPE positions per packed document (via ``pos_ids`` from
 ``build_block_mask_and_pos``) instead of relying on RoPE's relative-offset
-invariance. It has no muP parameterization and deliberately stays separate
-from ``chimera.models.gpt``.
+invariance. It has no muP parameterization and is project-local so this experiment
+remains the single source of truth for its architecture.
 """
 
 import itertools
@@ -76,7 +76,11 @@ class MultiHeadAttention(nn.Module):
     ):
         B, N, C = x.shape
 
-        qkv = self.qkv(x).reshape(B, N, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        qkv = (
+            self.qkv(x)
+            .reshape(B, N, 3, self.n_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+        )
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         past_len = past_kv[0].shape[2] if past_kv is not None else 0
@@ -272,9 +276,7 @@ class MHCLiteCarry(nn.Module):
 
         # Kept as a raw parameter so GPT._init_weights does not overwrite the
         # required zero initialization.
-        self.dynamic_logits_fn = nn.Parameter(
-            torch.zeros(self.virtual_dim, num_basis)
-        )
+        self.dynamic_logits_fn = nn.Parameter(torch.zeros(self.virtual_dim, num_basis))
         self.dynamic_scale = nn.Parameter(torch.tensor(dynamic_scale_init))
 
         static_logits = torch.full((num_basis,), non_identity_logit)
@@ -350,8 +352,7 @@ class GeneralizedHyperConnection(nn.Module):
             raise ValueError(f"dim={dim} must be divisible by m={m}")
         if carry_mode not in {"ghc", "mhc_lite"}:
             raise ValueError(
-                "carry_mode must be 'ghc' or 'mhc_lite', "
-                f"got {carry_mode!r}"
+                f"carry_mode must be 'ghc' or 'mhc_lite', got {carry_mode!r}"
             )
 
         self.dim = dim
@@ -435,8 +436,7 @@ class GeneralizedHyperConnection(nn.Module):
                 * self.factor
             )
             carry_matrix = self.static_carry.to(dtype=slots.dtype) + (
-                dynamic_carry
-                * self.dynamic_carry_scale.to(dtype=slots.dtype)
+                dynamic_carry * self.dynamic_carry_scale.to(dtype=slots.dtype)
             )
             carry = apply_map(slots, carry_matrix)
 
@@ -584,15 +584,12 @@ class GPT(nn.Module):
         if vwn_m < 1:
             raise ValueError(f"vwn_m must be positive, got {vwn_m}")
         if vwn_n < vwn_m:
-            raise ValueError(
-                f"vwn_n must be >= vwn_m, got m={vwn_m}, n={vwn_n}"
-            )
+            raise ValueError(f"vwn_n must be >= vwn_m, got m={vwn_m}, n={vwn_n}")
         if dim % vwn_m != 0:
             raise ValueError(f"dim={dim} must be divisible by vwn_m={vwn_m}")
         if vwn_carry_mode not in {"ghc", "mhc_lite"}:
             raise ValueError(
-                "vwn_carry_mode must be 'ghc' or 'mhc_lite', "
-                f"got {vwn_carry_mode!r}"
+                f"vwn_carry_mode must be 'ghc' or 'mhc_lite', got {vwn_carry_mode!r}"
             )
 
         self.seq_len = seq_len
@@ -844,11 +841,15 @@ class GPT(nn.Module):
                         next_token_logits, descending=True, dim=-1
                     )
                     sorted_probabilities = F.softmax(sorted_logits, dim=-1)
-                    cumulative_probabilities = torch.cumsum(sorted_probabilities, dim=-1)
+                    cumulative_probabilities = torch.cumsum(
+                        sorted_probabilities, dim=-1
+                    )
                     remove_mask = cumulative_probabilities > top_p
                     remove_mask[:, 1:] = remove_mask[:, :-1].clone()
                     remove_mask[:, 0] = False
-                    sorted_logits = sorted_logits.masked_fill(remove_mask, float("-inf"))
+                    sorted_logits = sorted_logits.masked_fill(
+                        remove_mask, float("-inf")
+                    )
                     filtered_logits = torch.full_like(next_token_logits, float("-inf"))
                     next_token_logits = filtered_logits.scatter(
                         dim=-1, index=sorted_indices, src=sorted_logits

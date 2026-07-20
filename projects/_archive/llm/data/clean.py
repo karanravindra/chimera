@@ -28,9 +28,9 @@ import unicodedata
 _ZERO_WIDTH = re.compile(r"[​‌‍⁠﻿]")
 # non-breaking / thin / figure spaces -> regular space
 _NBSP = re.compile(r"[    ]")
-_CRLF = re.compile(r"\r\n?")           # \r\n or lone \r -> \n
+_CRLF = re.compile(r"\r\n?")  # \r\n or lone \r -> \n
 _TRAILING_WS = re.compile(r"[ \t]+(?=\n)")  # trailing spaces at line ends
-_BLANKRUN = re.compile(r"\n{3,}")      # 3+ newlines -> paragraph break (\n\n)
+_BLANKRUN = re.compile(r"\n{3,}")  # 3+ newlines -> paragraph break (\n\n)
 
 
 def normalize(text: str) -> str:
@@ -110,10 +110,14 @@ if __name__ == "__main__":
         rt = len(tok._tok.encode(raw, add_special_tokens=False).ids)
         ct = len(tok._tok.encode(clean, add_special_tokens=False).ids)
         print("=" * 25, key, "=" * 25)
-        print(f"  chars {len(raw):>6} -> {len(clean):>6}   "
-              f"tokens {rt:>5} -> {ct:>5}  ({100*(rt-ct)/max(rt,1):+.1f}% tokens)")
-        print(f"  CRLF {raw.count(chr(13)):>4} -> {clean.count(chr(13)):>3}   "
-              f"blankruns {len(_BLANKRUN.findall(raw)):>3} -> {len(_BLANKRUN.findall(clean)):>3}")
+        print(
+            f"  chars {len(raw):>6} -> {len(clean):>6}   "
+            f"tokens {rt:>5} -> {ct:>5}  ({100 * (rt - ct) / max(rt, 1):+.1f}% tokens)"
+        )
+        print(
+            f"  CRLF {raw.count(chr(13)):>4} -> {clean.count(chr(13)):>3}   "
+            f"blankruns {len(_BLANKRUN.findall(raw)):>3} -> {len(_BLANKRUN.findall(clean)):>3}"
+        )
         print("  --- after (first 400 chars) ---")
         print("  " + repr(clean[:400]))
         print()

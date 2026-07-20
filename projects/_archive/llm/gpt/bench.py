@@ -30,7 +30,15 @@ from lm_eval.api.model import TemplateLM
 from chimera.models import GPT
 from chimera.tokenizers import BPETokenizer
 
-DEFAULT_TASKS = ["hellaswag", "piqa", "lambada_openai", "arc_easy", "arc_challenge", "sciq", "winogrande"]
+DEFAULT_TASKS = [
+    "hellaswag",
+    "piqa",
+    "lambada_openai",
+    "arc_easy",
+    "arc_challenge",
+    "sciq",
+    "winogrande",
+]
 
 # Random-chance baselines (percent) for the accuracy-style metrics of each task,
 # so a raw number can be read against "better than guessing" at a glance.
@@ -48,7 +56,9 @@ PPL_METRICS = {"perplexity", "word_perplexity", "byte_perplexity", "bits_per_byt
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--ckpt", default="/mnt/ai/runs/fineweb-edu/gpt/checkpoints/gpt.ckpt")
+    p.add_argument(
+        "--ckpt", default="/mnt/ai/runs/fineweb-edu/gpt/checkpoints/gpt.ckpt"
+    )
     p.add_argument("--out-dir", default="/mnt/ai/runs/fineweb-edu/gpt/eval")
     p.add_argument("--tasks", default=",".join(DEFAULT_TASKS))
     p.add_argument("--tokenizer-id", default="LiquidAI/LFM2.5-230M")
@@ -105,7 +115,9 @@ def load_model(args, vocab_size: int) -> GPT:
     # Lightning + torch.compile prefixes every key with "model._orig_mod.".
     prefix = "model._orig_mod."
     state_dict = {
-        k[len(prefix) :]: v for k, v in ckpt["state_dict"].items() if k.startswith(prefix)
+        k[len(prefix) :]: v
+        for k, v in ckpt["state_dict"].items()
+        if k.startswith(prefix)
     }
     model.load_state_dict(state_dict)
     model.to(args.device).eval()
@@ -115,7 +127,14 @@ def load_model(args, vocab_size: int) -> GPT:
 class ChimeraLM(TemplateLM):
     """Minimal lm-eval adapter around ``chimera.models.GPT`` for loglikelihood tasks."""
 
-    def __init__(self, model: GPT, tokenizer: BPETokenizer, block_size: int, batch_tokens: int, device: str):
+    def __init__(
+        self,
+        model: GPT,
+        tokenizer: BPETokenizer,
+        block_size: int,
+        batch_tokens: int,
+        device: str,
+    ):
         super().__init__()
         self.model = model
         self.tokenizer = tokenizer
@@ -155,13 +174,20 @@ class ChimeraLM(TemplateLM):
 
         version = "v1"  # bump if the encoding logic below changes
         # fingerprint the tokenizer so a different tokenizer can't hit a stale key.
-        fp = tuple(self.tokenizer._tok.encode(
-            "The quick brown fox", add_special_tokens=False).ids)
+        fp = tuple(
+            self.tokenizer._tok.encode(
+                "The quick brown fox", add_special_tokens=False
+            ).ids
+        )
         h = hashlib.md5(f"{version}|{fp}|{len(pairs)}".encode())
         for ctx, cont in pairs:
-            h.update(ctx.encode("utf-8")); h.update(b"\x00")
-            h.update(cont.encode("utf-8")); h.update(b"\x01")
-        cache_dir = Path(os.environ.get("LM_HARNESS_CACHE_PATH", "/mnt/ai/data/lm_eval_cache"))
+            h.update(ctx.encode("utf-8"))
+            h.update(b"\x00")
+            h.update(cont.encode("utf-8"))
+            h.update(b"\x01")
+        cache_dir = Path(
+            os.environ.get("LM_HARNESS_CACHE_PATH", "/mnt/ai/data/lm_eval_cache")
+        )
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_file = cache_dir / f"chimera-tokcache-{h.hexdigest()}.pkl"
         if cache_file.exists():
@@ -169,7 +195,9 @@ class ChimeraLM(TemplateLM):
             return pickle.loads(cache_file.read_bytes())
         new_reqs = self._encode_pairs_batched(pairs)
         cache_file.write_bytes(pickle.dumps(new_reqs))
-        print(f"[bench] pretokenized + cached {len(pairs)} eval inputs -> {cache_file.name}")
+        print(
+            f"[bench] pretokenized + cached {len(pairs)} eval inputs -> {cache_file.name}"
+        )
         return new_reqs
 
     def _encode_pairs_batched(self, pairs):
@@ -195,8 +223,16 @@ class ChimeraLM(TemplateLM):
             shifted.append((context, continuation, False))
             ctxs.append(context)
             wholes.append(context + continuation)
-        whole_encs = [e.ids for e in enc.encode_batch(wholes, add_special_tokens=False)] if wholes else []
-        ctx_encs = [e.ids for e in enc.encode_batch(ctxs, add_special_tokens=False)] if ctxs else []
+        whole_encs = (
+            [e.ids for e in enc.encode_batch(wholes, add_special_tokens=False)]
+            if wholes
+            else []
+        )
+        ctx_encs = (
+            [e.ids for e in enc.encode_batch(ctxs, add_special_tokens=False)]
+            if ctxs
+            else []
+        )
 
         new_reqs = []
         j = 0  # index into the non-empty-context batches
@@ -211,7 +247,7 @@ class ChimeraLM(TemplateLM):
                 new_reqs.append((("", continuation), context_enc, continuation_enc))
                 continue
             context_enc = ctx_encs[j]
-            continuation_enc = whole_encs[j][len(context_enc):]
+            continuation_enc = whole_encs[j][len(context_enc) :]
             new_reqs.append(((context, continuation), context_enc, continuation_enc))
             j += 1
         return new_reqs
@@ -257,13 +293,17 @@ class ChimeraLM(TemplateLM):
     @torch.inference_mode()
     def _score_batch(self, batch, results):
         max_len = max(len(inp) for _, inp, _ in batch)
-        input_ids = torch.full((len(batch), max_len), self.eot_token_id, dtype=torch.long)
+        input_ids = torch.full(
+            (len(batch), max_len), self.eot_token_id, dtype=torch.long
+        )
         for i, (_, inp, _) in enumerate(batch):
             input_ids[i, : len(inp)] = torch.tensor(inp, dtype=torch.long)
         input_ids = input_ids.to(self._device)
 
         autocast_enabled = self._device.startswith("cuda")
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled
+        ):
             hidden = self.model(input_ids, return_hidden=True)  # (B, L, C)
             slices, meta = [], []
             for i, (idx, inp, continuation_enc) in enumerate(batch):
@@ -271,7 +311,9 @@ class ChimeraLM(TemplateLM):
                 cont_start = len(inp) - cont_len
                 slices.append(hidden[i, cont_start : cont_start + cont_len, :])
                 meta.append((idx, continuation_enc))
-            flat_hidden = torch.cat(slices, dim=0)  # (total_cont, C) — never materializes full (B,L,V) logits
+            flat_hidden = torch.cat(
+                slices, dim=0
+            )  # (total_cont, C) — never materializes full (B,L,V) logits
             logits = self.model.project(flat_hidden)  # (total_cont, V)
 
         log_probs = F.log_softmax(logits.float(), dim=-1)
@@ -329,7 +371,11 @@ def iter_metrics(results_by_task: dict):
     for task, metrics in sorted(results_by_task.items()):
         for key, val in metrics.items():
             metric_name = key.split(",")[0]
-            if metric_name in skip_metrics or not isinstance(val, (int, float)) or "_stderr" in key:
+            if (
+                metric_name in skip_metrics
+                or not isinstance(val, (int, float))
+                or "_stderr" in key
+            ):
                 continue
             filt = key.split(",", 1)[1] if "," in key else "none"
             stderr = metrics.get(f"{metric_name}_stderr,{filt}")
@@ -344,9 +390,15 @@ def print_table(results_by_task: dict):
         is_ppl = metric_name in PPL_METRICS
         chance = None if is_ppl else CHANCE.get(task)
         val_s = f"{val:.2f}" if is_ppl else f"{val * 100:.2f}"
-        stderr_s = "-" if stderr is None else (f"{stderr:.2f}" if is_ppl else f"{stderr * 100:.2f}")
+        stderr_s = (
+            "-"
+            if stderr is None
+            else (f"{stderr:.2f}" if is_ppl else f"{stderr * 100:.2f}")
+        )
         chance_s = "-" if chance is None else f"{chance:.1f}"
-        print(f"| {task:<16} | {metric_name:<12} | {val_s:>7} | {stderr_s:>7} | {chance_s:>7} |")
+        print(
+            f"| {task:<16} | {metric_name:<12} | {val_s:>7} | {stderr_s:>7} | {chance_s:>7} |"
+        )
 
 
 def flatten_for_wandb(results_by_task: dict, prefix: str = "test") -> dict[str, float]:
@@ -371,7 +423,13 @@ def main():
     tokenizer = BPETokenizer.from_pretrained(args.tokenizer_id)
     model = load_model(args, vocab_size=tokenizer.vocab_size)
     results = run_benchmarks(
-        model, tokenizer, tasks, args.block_size, args.batch_tokens, args.device, args.limit
+        model,
+        tokenizer,
+        tasks,
+        args.block_size,
+        args.batch_tokens,
+        args.device,
+        args.limit,
     )
 
     out_dir = Path(args.out_dir)

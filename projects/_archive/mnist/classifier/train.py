@@ -55,14 +55,18 @@ def main():
     args = parse_args()
     seed_everything(args.seed, workers=True)
 
-    dm = MNISTDataModule(data_dir=args.data_dir, batch_size=args.batch_size, num_workers=4)
+    dm = MNISTDataModule(
+        data_dir=args.data_dir, batch_size=args.batch_size, num_workers=4
+    )
     dm.prepare_data()
     dm.setup("fit")
     dm.setup("test")
 
     class_weights = class_weights_from(dm.train_dataloader())
 
-    model = DigitNet.from_variant(args.model_variant, in_channels=1, num_classes=NUM_CLASSES)
+    model = DigitNet.from_variant(
+        args.model_variant, in_channels=1, num_classes=NUM_CLASSES
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = LinearWarmupCosineAnnealingLR(
         optimizer,

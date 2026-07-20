@@ -50,7 +50,9 @@ def parse_args():
 
 
 def load_autoencoder(ckpt_path, latent_channels, model_variant, device):
-    ae = DigitDreamerAE.from_variant(model_variant, in_channels=1, latent_dim=latent_channels)
+    ae = DigitDreamerAE.from_variant(
+        model_variant, in_channels=1, latent_dim=latent_channels
+    )
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     ae_state = {
         k.removeprefix("model."): v
@@ -66,8 +68,12 @@ def main():
     seed_everything(args.seed, workers=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    ae = load_autoencoder(args.ae_ckpt, args.latent_channels, args.ae_model_variant, device)
-    print(f"loaded AE from {args.ae_ckpt} ({sum(p.numel() for p in ae.parameters()):,} params)")
+    ae = load_autoencoder(
+        args.ae_ckpt, args.latent_channels, args.ae_model_variant, device
+    )
+    print(
+        f"loaded AE from {args.ae_ckpt} ({sum(p.numel() for p in ae.parameters()):,} params)"
+    )
 
     latent_dm = MNISTLatentDataModule(
         autoencoder=ae,

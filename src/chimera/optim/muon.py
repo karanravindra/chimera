@@ -21,9 +21,7 @@ per-param loop. ndim>=3 params (e.g. DeepSeek MoE's packed per-expert
 weights) are already batched and form their own single-param buckets.
 
 Everything is wrapped under one ``.step()``/``.zero_grad()``/``.param_groups``
-so :class:`chimera.modules.LanguageModelModule` and every project's
-``train.py`` are unaffected — they still just do
-``Muon(muon_param_groups(model, ...))``.
+so training loops still just do ``Muon(muon_param_groups(model, ...))``.
 
 Usage:
     from chimera.optim import Muon, muon_param_groups

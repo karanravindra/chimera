@@ -202,7 +202,9 @@ class UltraChatDataModule(pl.LightningDataModule):
         if max_tokens is not None and len(ids) > max_tokens:
             del ids[max_tokens:]
             del labels[max_tokens:]
-        return torch.tensor(ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
+        return torch.tensor(ids, dtype=torch.long), torch.tensor(
+            labels, dtype=torch.long
+        )
 
     def _load_or_build_streams(self, split: str, max_tokens: Optional[int]):
         path = self._cache_path(split)

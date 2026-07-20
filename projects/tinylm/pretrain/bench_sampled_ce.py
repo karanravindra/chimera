@@ -47,9 +47,7 @@ def make_batch(generator: torch.Generator) -> tuple[torch.Tensor, torch.Tensor]:
     )
     # Sprinkle EOS at the training data's typical doc granularity so the
     # block mask has realistic document structure.
-    doc_break = (
-        torch.rand(x.shape, device=DEVICE, generator=generator) < (1 / 192)
-    )
+    doc_break = torch.rand(x.shape, device=DEVICE, generator=generator) < (1 / 192)
     x[doc_break] = EOS_ID
     y = torch.roll(x, -1, dims=1)
     return x, y
@@ -80,7 +78,11 @@ def make_sampled_loss(num_samples: int, compile_loss: bool = False):
         hidden = model(x, return_hidden=True, block_mask=block_mask, pos_ids=pos_ids)
         weight = getattr(model, "_orig_mod", model).token_emb.weight
         return sampled_cross_entropy(
-            hidden, weight, y, num_samples=num_samples, softcap=LOGIT_SOFTCAP,
+            hidden,
+            weight,
+            y,
+            num_samples=num_samples,
+            softcap=LOGIT_SOFTCAP,
             core=core,
         )
 

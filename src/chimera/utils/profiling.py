@@ -52,7 +52,9 @@ def profile_train_step(
         if is_cuda:
             torch.cuda.synchronize()
 
-    for _ in range(n_warmup):  # absorb torch.compile tracing + autotune + allocator warmup
+    for _ in range(
+        n_warmup
+    ):  # absorb torch.compile tracing + autotune + allocator warmup
         popt.zero_grad(set_to_none=True)
         loss_fn(pmodel, x, y).backward()
         popt.step()

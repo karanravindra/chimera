@@ -55,17 +55,24 @@ def parse_args():
     p.add_argument("--global-token-count", type=int, default=65536)
     p.add_argument("--warmup-steps", type=int, default=10)
     p.add_argument("--timed-steps", type=int, default=30)
-    p.add_argument("--peak-tflops", type=float, default=None,
-                   help="spec-sheet bf16 dense TFLOPS; defaults to the measured GEMM ceiling")
-    p.add_argument("--modes", default="flex-compile,compile,fp8-compile",
-                   help="comma-separated; each mode is dash-joined tokens: "
-                        "eager|compile|compile-ro (execution), flex (flex_attention "
-                        "instead of the default SDPA/flash causal path), fp8 "
-                        "(torchao float8 on the body Linears), sparse (sliding-"
-                        "window + global-prefix attention via flex block masks; "
-                        "see --attn-window), mla, moe, attnres (architecture "
-                        "variants at train.py-default dims). "
-                        "e.g. 'eager', 'sparse-fp8-compile', 'mla-moe-compile'")
+    p.add_argument(
+        "--peak-tflops",
+        type=float,
+        default=None,
+        help="spec-sheet bf16 dense TFLOPS; defaults to the measured GEMM ceiling",
+    )
+    p.add_argument(
+        "--modes",
+        default="flex-compile,compile,fp8-compile",
+        help="comma-separated; each mode is dash-joined tokens: "
+        "eager|compile|compile-ro (execution), flex (flex_attention "
+        "instead of the default SDPA/flash causal path), fp8 "
+        "(torchao float8 on the body Linears), sparse (sliding-"
+        "window + global-prefix attention via flex block masks; "
+        "see --attn-window), mla, moe, attnres (architecture "
+        "variants at train.py-default dims). "
+        "e.g. 'eager', 'sparse-fp8-compile', 'mla-moe-compile'",
+    )
     p.add_argument("--attn-window", type=int, default=256)
     p.add_argument("--attn-global-tokens", type=int, default=16)
     # MLA dims (train.py defaults)
@@ -81,12 +88,18 @@ def parse_args():
     # AttnRes: full attention-over-depth (n_blocks == n_layer) by default,
     # since train.py's default 8 doesn't divide the default n_layer 6.
     p.add_argument("--attn-res-n-blocks", type=int, default=None)
-    p.add_argument("--profile", action="store_true",
-                   help="after timing each mode, profile 3 steps of it and print "
-                        "the top kernels by self CUDA time")
-    p.add_argument("--trace-dir", default=None,
-                   help="with --profile: also export a chrome trace per mode "
-                        "(<trace-dir>/<mode>.json, viewable in ui.perfetto.dev)")
+    p.add_argument(
+        "--profile",
+        action="store_true",
+        help="after timing each mode, profile 3 steps of it and print "
+        "the top kernels by self CUDA time",
+    )
+    p.add_argument(
+        "--trace-dir",
+        default=None,
+        help="with --profile: also export a chrome trace per mode "
+        "(<trace-dir>/<mode>.json, viewable in ui.perfetto.dev)",
+    )
     return p.parse_args()
 
 
@@ -106,26 +119,26 @@ def model_flops_per_token(args, mla: bool = False, moe: bool = False) -> float:
         qk_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
         v_dim = args.v_head_dim
         attn_proj = (
-            d * H * qk_dim                                    # q_proj (q_lora_rank=0)
+            d * H * qk_dim  # q_proj (q_lora_rank=0)
             + d * (args.kv_lora_rank + args.qk_rope_head_dim)  # w_dkv
-            + args.kv_lora_rank * H * args.qk_nope_head_dim    # w_uk
-            + args.kv_lora_rank * H * v_dim                    # w_uv
-            + H * v_dim * d                                    # out proj
+            + args.kv_lora_rank * H * args.qk_nope_head_dim  # w_uk
+            + args.kv_lora_rank * H * v_dim  # w_uv
+            + H * v_dim * d  # out proj
         )
     else:
         qk_dim = v_dim = hd
         attn_proj = (
-            d * H * hd                  # q_proj
+            d * H * hd  # q_proj
             + d * args.n_kv_head * hd * 2  # kv_proj
-            + H * hd * d                # out proj
+            + H * hd * d  # out proj
         )
 
     if moe:
         inter = args.moe_inter_dim if args.moe_inter_dim else d // 2
         mlp = (
-            3 * d * inter * args.n_shared_experts      # shared expert (SwiGLU)
+            3 * d * inter * args.n_shared_experts  # shared expert (SwiGLU)
             + 3 * d * inter * args.n_activated_experts  # top-k routed experts
-            + d * args.n_routed_experts                 # gate
+            + d * args.n_routed_experts  # gate
         )
     else:
         mlp = d * 4 * d * 2  # dense fc1 + fc2
@@ -158,29 +171,33 @@ def build(
     moe: bool = False,
     attnres: bool = False,
 ):
-    model = GPT(
-        vocab_size=args.vocab_size,
-        block_size=args.seq_len,
-        n_embd=args.n_embd,
-        n_head=args.n_head,
-        n_kv_head=args.n_kv_head,
-        n_layer=args.n_layer,
-        use_flash_attn=flash,
-        attn_window=args.attn_window if sparse else None,
-        attn_global_tokens=args.attn_global_tokens,
-        use_mla=mla,
-        kv_lora_rank=args.kv_lora_rank,
-        qk_nope_head_dim=args.qk_nope_head_dim,
-        qk_rope_head_dim=args.qk_rope_head_dim,
-        v_head_dim=args.v_head_dim,
-        use_moe=moe,
-        n_routed_experts=args.n_routed_experts,
-        n_shared_experts=args.n_shared_experts,
-        n_activated_experts=args.n_activated_experts,
-        moe_inter_dim=args.moe_inter_dim,
-        use_attn_res=attnres,
-        attn_res_n_blocks=args.attn_res_n_blocks or args.n_layer,
-    ).cuda().to(torch.bfloat16)  # bf16-true: bf16 weights, no autocast
+    model = (
+        GPT(
+            vocab_size=args.vocab_size,
+            block_size=args.seq_len,
+            n_embd=args.n_embd,
+            n_head=args.n_head,
+            n_kv_head=args.n_kv_head,
+            n_layer=args.n_layer,
+            use_flash_attn=flash,
+            attn_window=args.attn_window if sparse else None,
+            attn_global_tokens=args.attn_global_tokens,
+            use_mla=mla,
+            kv_lora_rank=args.kv_lora_rank,
+            qk_nope_head_dim=args.qk_nope_head_dim,
+            qk_rope_head_dim=args.qk_rope_head_dim,
+            v_head_dim=args.v_head_dim,
+            use_moe=moe,
+            n_routed_experts=args.n_routed_experts,
+            n_shared_experts=args.n_shared_experts,
+            n_activated_experts=args.n_activated_experts,
+            moe_inter_dim=args.moe_inter_dim,
+            use_attn_res=attnres,
+            attn_res_n_blocks=args.attn_res_n_blocks or args.n_layer,
+        )
+        .cuda()
+        .to(torch.bfloat16)
+    )  # bf16-true: bf16 weights, no autocast
     if fp8:
         # torchao float8 training (dynamic tensorwise scaling): swaps the
         # transformer-body Linears for Float8Linear, which casts weight and
@@ -320,20 +337,27 @@ def profile_kernels(args, mode: str, step, ms_per_step: float, steps: int = 3):
     that dominate GPU time (self CUDA time -- actual device execution, not
     op-tree attribution). Optionally exports a chrome trace for perfetto."""
     with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
     ) as prof:
         for _ in range(steps):
             step()
         torch.cuda.synchronize()
 
     kernels = [
-        e for e in prof.key_averages()
-        if e.device_type == torch.autograd.DeviceType.CUDA and e.self_device_time_total > 0
+        e
+        for e in prof.key_averages()
+        if e.device_type == torch.autograd.DeviceType.CUDA
+        and e.self_device_time_total > 0
     ]
     kernels.sort(key=lambda e: -e.self_device_time_total)
     total_us = sum(e.self_device_time_total for e in kernels)
-    print(f"\n--- {mode}: top kernels by self CUDA time "
-          f"({total_us / steps / 1000:.1f} ms/step GPU-busy of {ms_per_step:.1f} ms wall) ---")
+    print(
+        f"\n--- {mode}: top kernels by self CUDA time "
+        f"({total_us / steps / 1000:.1f} ms/step GPU-busy of {ms_per_step:.1f} ms wall) ---"
+    )
     print(f"{'ms/step':>8}  {'%':>5}  {'x/step':>6}  kernel")
     for e in kernels[:15]:
         print(
@@ -360,15 +384,19 @@ def main():
     spec_tflops = args.peak_tflops or gemm_tflops
 
     print(f"device: {torch.cuda.get_device_name(0)}  torch {torch.__version__}")
-    print(f"measured bf16 GEMM ceiling: {gemm_tflops:.1f} TFLOPS"
-          + (f"  (spec: {spec_tflops:.1f})" if args.peak_tflops else ""))
+    print(
+        f"measured bf16 GEMM ceiling: {gemm_tflops:.1f} TFLOPS"
+        + (f"  (spec: {spec_tflops:.1f})" if args.peak_tflops else "")
+    )
     print(
         f"arch: {args.n_embd}-{args.n_head}-{args.n_kv_head}-{args.n_layer} "
         f"vocab={args.vocab_size}  "
         f"seq={args.seq_len} batch={B} ({args.global_token_count} tok/step)"
     )
-    print(f"dense model FLOPs: {model_flops_per_token(args) / 1e6:.1f} MFLOPs/token "
-          f"(variant modes use variant-aware FLOPs)\n")
+    print(
+        f"dense model FLOPs: {model_flops_per_token(args) / 1e6:.1f} MFLOPs/token "
+        f"(variant modes use variant-aware FLOPs)\n"
+    )
 
     for mode in args.modes.split(","):
         time_mode(args, mode.strip(), gemm_tflops, spec_tflops)

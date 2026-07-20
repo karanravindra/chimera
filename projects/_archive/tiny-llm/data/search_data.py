@@ -76,7 +76,7 @@ def _decode_range(job):
     arr = np.memmap(split_path, dtype=DTYPE, mode="r")
     with open(shard_path, "w", encoding="utf-8") as f:
         for s in range(start, end, SUB_CHUNK):
-            ids = np.asarray(arr[s:min(s + SUB_CHUNK, end)]).tolist()
+            ids = np.asarray(arr[s : min(s + SUB_CHUNK, end)]).tolist()
             text = _TOK._tok.decode(ids, skip_special_tokens=False)
             for sp in SPECIALS:
                 text = text.replace(sp, "\n")
@@ -86,13 +86,19 @@ def _decode_range(job):
 
 def build_cache(split_path: Path, cache_path: Path, tok_path: str, workers: int):
     total = len(np.memmap(split_path, dtype=DTYPE, mode="r"))
-    print(f"building text cache: decoding {total:,} tokens with {workers} workers "
-          f"-> {cache_path}  (one-time)", file=sys.stderr)
+    print(
+        f"building text cache: decoding {total:,} tokens with {workers} workers "
+        f"-> {cache_path}  (one-time)",
+        file=sys.stderr,
+    )
     per = -(-total // workers)  # ceil
     bounds = [(i * per, min((i + 1) * per, total)) for i in range(workers)]
     tmp = Path(tempfile.mkdtemp(prefix="decode_", dir=cache_path.parent))
-    jobs = [(str(split_path), a, b, str(tmp / f"shard_{i:03d}.txt"))
-            for i, (a, b) in enumerate(bounds) if a < b]
+    jobs = [
+        (str(split_path), a, b, str(tmp / f"shard_{i:03d}.txt"))
+        for i, (a, b) in enumerate(bounds)
+        if a < b
+    ]
     t0 = time.time()
     with Pool(workers, initializer=_worker_init, initargs=(tok_path,)) as pool:
         shards = pool.map(_decode_range, jobs)
@@ -103,43 +109,82 @@ def build_cache(split_path: Path, cache_path: Path, tok_path: str, workers: int)
     shutil.rmtree(tmp, ignore_errors=True)
     nbytes = cache_path.stat().st_size
     # sidecar: token/byte totals for the --max-tokens -> byte-prefix mapping
-    cache_path.with_suffix(".meta.json").write_text(json.dumps(
-        {"tokens": total, "bytes": nbytes, "split_mtime": split_path.stat().st_mtime}))
-    print(f"cache built: {nbytes/1e9:.2f} GB in {time.time()-t0:.0f}s "
-          f"({total/1e6/(time.time()-t0):.0f}M tok/s aggregate)", file=sys.stderr)
+    cache_path.with_suffix(".meta.json").write_text(
+        json.dumps(
+            {
+                "tokens": total,
+                "bytes": nbytes,
+                "split_mtime": split_path.stat().st_mtime,
+            }
+        )
+    )
+    print(
+        f"cache built: {nbytes / 1e9:.2f} GB in {time.time() - t0:.0f}s "
+        f"({total / 1e6 / (time.time() - t0):.0f}M tok/s aggregate)",
+        file=sys.stderr,
+    )
 
 
-def ensure_cache(split_path: Path, cache_path: Path, tok_path: str,
-                 workers: int, rebuild: bool):
+def ensure_cache(
+    split_path: Path, cache_path: Path, tok_path: str, workers: int, rebuild: bool
+):
     meta_p = cache_path.with_suffix(".meta.json")
-    fresh = (cache_path.exists() and meta_p.exists()
-             and json.loads(meta_p.read_text())["split_mtime"] == split_path.stat().st_mtime)
+    fresh = (
+        cache_path.exists()
+        and meta_p.exists()
+        and json.loads(meta_p.read_text())["split_mtime"] == split_path.stat().st_mtime
+    )
     if rebuild or not fresh:
         build_cache(split_path, cache_path, tok_path, workers)
     return json.loads(meta_p.read_text())
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("query", nargs="+", help="substring(s) to search for")
     ap.add_argument("--data-dir", default="/mnt/ai/data")
     ap.add_argument("--mix", default="tiny_2B_8k", help="mixture under tiny-llm/mix/")
     ap.add_argument("--split", default="train", choices=["train", "val"])
-    ap.add_argument("--tokenizer", default=None, help="tokenizer dir (default: mix manifest)")
-    ap.add_argument("--max-tokens", type=int, default=-1,
-                    help="cap search to the first N tokens' worth of text (-1 = whole split)")
-    ap.add_argument("-m", "--max-matches", type=int, default=20,
-                    help="max snippets per query (-1 = all); ignored with --count-only")
-    ap.add_argument("--context", type=int, default=90, help="chars of context each side")
+    ap.add_argument(
+        "--tokenizer", default=None, help="tokenizer dir (default: mix manifest)"
+    )
+    ap.add_argument(
+        "--max-tokens",
+        type=int,
+        default=-1,
+        help="cap search to the first N tokens' worth of text (-1 = whole split)",
+    )
+    ap.add_argument(
+        "-m",
+        "--max-matches",
+        type=int,
+        default=20,
+        help="max snippets per query (-1 = all); ignored with --count-only",
+    )
+    ap.add_argument(
+        "--context", type=int, default=90, help="chars of context each side"
+    )
     ap.add_argument("-i", "--ignore-case", action="store_true")
     ap.add_argument("--regex", action="store_true", help="treat queries as regex")
-    ap.add_argument("--count-only", action="store_true", help="report match counts only")
-    ap.add_argument("--docs", action="store_true",
-                    help="print the whole matching document line, not a windowed snippet")
-    ap.add_argument("--workers", type=int, default=max(1, os.cpu_count() // 2),
-                    help="parallel decode workers for the one-time cache build")
-    ap.add_argument("--rebuild", action="store_true", help="force rebuild the text cache")
+    ap.add_argument(
+        "--count-only", action="store_true", help="report match counts only"
+    )
+    ap.add_argument(
+        "--docs",
+        action="store_true",
+        help="print the whole matching document line, not a windowed snippet",
+    )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, os.cpu_count() // 2),
+        help="parallel decode workers for the one-time cache build",
+    )
+    ap.add_argument(
+        "--rebuild", action="store_true", help="force rebuild the text cache"
+    )
     args = ap.parse_args()
 
     split_path = _mix_dir(args.data_dir, args.mix) / f"{args.split}.bin"
@@ -153,10 +198,14 @@ def main():
     hi = meta["bytes"]
     if 0 <= args.max_tokens < meta["tokens"]:
         hi = int(meta["bytes"] * args.max_tokens / meta["tokens"])
-    scanned = f"{meta['tokens']:,}" if hi == meta["bytes"] else f"~first {args.max_tokens:,}"
+    scanned = (
+        f"{meta['tokens']:,}" if hi == meta["bytes"] else f"~first {args.max_tokens:,}"
+    )
     denom_tok = meta["tokens"] if hi == meta["bytes"] else max(args.max_tokens, 1)
-    print(f"mix={args.mix} split={args.split} cache={cache_path.name} "
-          f"({meta['bytes']/1e9:.2f}GB, {meta['tokens']:,} tok)  scanning {scanned} tokens")
+    print(
+        f"mix={args.mix} split={args.split} cache={cache_path.name} "
+        f"({meta['bytes'] / 1e9:.2f}GB, {meta['tokens']:,} tok)  scanning {scanned} tokens"
+    )
     print(f"queries: {args.query}\n" + "-" * 90)
 
     fd = os.open(cache_path, os.O_RDONLY)
@@ -165,8 +214,10 @@ def main():
     def matches(q):
         """Yield match-start byte offsets for query q within [0, hi)."""
         if args.regex or args.ignore_case:
-            pat = re.compile(q.encode() if args.regex else re.escape(q.encode()),
-                             re.IGNORECASE if args.ignore_case else 0)
+            pat = re.compile(
+                q.encode() if args.regex else re.escape(q.encode()),
+                re.IGNORECASE if args.ignore_case else 0,
+            )
             for m in pat.finditer(mm):
                 if m.start() >= hi:
                     return
@@ -194,10 +245,16 @@ def main():
         count = shown = 0
         for i, qlen in matches(q):
             count += 1
-            if not args.count_only and (args.max_matches < 0 or shown < args.max_matches):
-                print(f"[{q!r} #{shown+1}] {snippet(i, qlen)}")
+            if not args.count_only and (
+                args.max_matches < 0 or shown < args.max_matches
+            ):
+                print(f"[{q!r} #{shown + 1}] {snippet(i, qlen)}")
                 shown += 1
-            if not args.count_only and args.max_matches >= 0 and shown >= args.max_matches:
+            if (
+                not args.count_only
+                and args.max_matches >= 0
+                and shown >= args.max_matches
+            ):
                 break  # snippet mode: stop this query once we have enough
         if args.count_only:
             per_m = count / denom_tok * 1e6
@@ -205,7 +262,7 @@ def main():
         print("-" * 90)
     mm.close()
     os.close(fd)
-    print(f"(searched in {time.time()-t0:.1f}s)", file=sys.stderr)
+    print(f"(searched in {time.time() - t0:.1f}s)", file=sys.stderr)
 
 
 if __name__ == "__main__":

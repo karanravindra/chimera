@@ -40,15 +40,24 @@ class TinyLMModule(LanguageModelModule):
         # both the plain next-token path and the MTP auxiliary path via the base
         # class hook, so MTP targets inherit the same boundary masking.
         if self.doc_boundary_eos_id is not None:
-            y = y.masked_fill(x == self.doc_boundary_eos_id, -100)  # CE/CCE ignore_index
+            y = y.masked_fill(
+                x == self.doc_boundary_eos_id, -100
+            )  # CE/CCE ignore_index
         return y
 
     def _log_stage(self, stage, loss, bpt, on_step):
         # train on-step: loss + aggregate bpb (mix-wide normalizer). No bpt.
-        self.log(f"{stage}/loss", loss, on_step=on_step, on_epoch=not on_step, prog_bar=True)
+        self.log(
+            f"{stage}/loss", loss, on_step=on_step, on_epoch=not on_step, prog_bar=True
+        )
         if self.bytes_per_token:
-            self.log(f"{stage}/bpb", bpt / self.bytes_per_token,
-                     on_step=on_step, on_epoch=not on_step, prog_bar=True)
+            self.log(
+                f"{stage}/bpb",
+                bpt / self.bytes_per_token,
+                on_step=on_step,
+                on_epoch=not on_step,
+                prog_bar=True,
+            )
 
     def _log_eval(self, stage, loss, bpt, src, acc):
         # accumulate for the cross-source aggregate (mean at epoch end)
@@ -57,8 +66,12 @@ class TinyLMModule(LanguageModelModule):
         if src is not None:
             b = self.source_bpt.get(src)
             if b:
-                self.log(f"{stage}/{src}/bpb", bpt / b,
-                         on_epoch=True, add_dataloader_idx=False)
+                self.log(
+                    f"{stage}/{src}/bpb",
+                    bpt / b,
+                    on_epoch=True,
+                    add_dataloader_idx=False,
+                )
 
     def _log_aggregate(self, stage, acc):
         if not acc:

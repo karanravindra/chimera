@@ -87,7 +87,9 @@ def results_table(results, tasks=TASKS):
                 "task": task,
                 "metric": name,
                 "this model": val if is_ppl else val * 100,
-                "stderr": (stderr if stderr is None else (stderr if is_ppl else stderr * 100)),
+                "stderr": (
+                    stderr if stderr is None else (stderr if is_ppl else stderr * 100)
+                ),
                 "chance": CHANCE.get(task),
                 "GPT-2 small (124M)": GPT2_SMALL.get(task),
             }
@@ -102,7 +104,11 @@ def results_table(results, tasks=TASKS):
         vals = {c: row[c] for c in cols if pd.notna(row[c])}
         if len(vals) < 2:
             return ["" for _ in row.index]
-        best = min(vals, key=vals.get) if "perplex" in row["metric"] else max(vals, key=vals.get)
+        best = (
+            min(vals, key=vals.get)
+            if "perplex" in row["metric"]
+            else max(vals, key=vals.get)
+        )
         return ["font-weight: bold" if c == best else "" for c in row.index]
 
     return df.style.apply(_bold_best, axis=1).format(

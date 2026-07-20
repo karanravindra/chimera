@@ -95,7 +95,9 @@ def main():
         callbacks=[checkpoint],
     )
     trainer.fit(autoencoder_module, datamodule=dm)
-    trainer.test(autoencoder_module, datamodule=dm, ckpt_path=checkpoint.best_model_path)
+    trainer.test(
+        autoencoder_module, datamodule=dm, ckpt_path=checkpoint.best_model_path
+    )
     print("best checkpoint:", checkpoint.best_model_path)
 
 

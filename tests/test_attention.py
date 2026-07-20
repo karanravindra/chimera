@@ -7,7 +7,11 @@ brute-force per-token walk covers the masking rule itself.
 
 import torch
 
-from chimera.models.attention import doc_ids_and_pos, make_causal_mask, make_document_mask
+from chimera.models.attention import (
+    doc_ids_and_pos,
+    make_causal_mask,
+    make_document_mask,
+)
 
 EOS = 0
 

@@ -95,9 +95,7 @@ def main():
         mode="max",
         enable_version_counter=False,
     )
-    loggers = build_run_loggers(
-        run_dir, args.wandb_project, None, args.wandb_offline
-    )
+    loggers = build_run_loggers(run_dir, args.wandb_project, None, args.wandb_offline)
 
     trainer = Trainer(
         max_epochs=args.epochs,

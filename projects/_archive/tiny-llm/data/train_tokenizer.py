@@ -42,7 +42,9 @@ from chimera.tokenizers import BPETokenizer  # noqa: E402
 OUT_ROOT = Path("/mnt/ai/data/tiny-llm/tokenizer")
 SPECIALS = [EOS, BOS, PAD, IM_START, IM_END]  # minimal chat set (ids 0..4)
 VOCAB_SIZES = [4096, 8192, 16384]
-DEFAULT_CHARS = 1_000_000_000  # ~1GB weighted sample — BPE merges saturate well before this
+DEFAULT_CHARS = (
+    1_000_000_000  # ~1GB weighted sample — BPE merges saturate well before this
+)
 
 
 def _pretrain_sources():
@@ -89,12 +91,18 @@ def sample_corpus(total_chars: int, path: Path) -> dict:
                 if got >= cap:
                     break
             realized[src.key] = got
-            print(f"[{src.key}] {got/1e6:.0f}M chars "
-                  f"(target {cap/1e6:.0f}M, weight {src.weight/wsum:.3f})  "
-                  f"{(time.time()-t0)/60:.1f}min", flush=True)
-    meta = {"total_chars": sum(realized.values()), "n_docs": n_docs,
-            "realized_chars": realized}
-    print(f"corpus: {meta['total_chars']/1e6:.0f}M chars / {n_docs:,} docs -> {path}")
+            print(
+                f"[{src.key}] {got / 1e6:.0f}M chars "
+                f"(target {cap / 1e6:.0f}M, weight {src.weight / wsum:.3f})  "
+                f"{(time.time() - t0) / 60:.1f}min",
+                flush=True,
+            )
+    meta = {
+        "total_chars": sum(realized.values()),
+        "n_docs": n_docs,
+        "realized_chars": realized,
+    }
+    print(f"corpus: {meta['total_chars'] / 1e6:.0f}M chars / {n_docs:,} docs -> {path}")
     return meta
 
 
@@ -126,7 +134,7 @@ def eval_compression(tok_paths: dict[int, Path]) -> dict:
     toks = {v: BPETokenizer.from_pretrained(str(p)) for v, p in tok_paths.items()}
     heldout = {s.key: _heldout_text(s) for s in _pretrain_sources()}
     rows = {}
-    print(f"\ncompression — chars/token (higher = better):")
+    print("\ncompression — chars/token (higher = better):")
     hdr = "  ".join(f"{_vocab_tag(v):>7}" for v in VOCAB_SIZES)
     print(f"  {'source':<24} {hdr}")
     for key, text in heldout.items():
@@ -157,27 +165,43 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
         t0 = time.time()
         tok = BPETokenizer(backend="hf")
-        tok.train(_read_corpus(corpus_path), vocab_size=v, special_tokens=SPECIALS,
-                  min_frequency=args.min_frequency, split_digits=True)
+        tok.train(
+            _read_corpus(corpus_path),
+            vocab_size=v,
+            special_tokens=SPECIALS,
+            min_frequency=args.min_frequency,
+            split_digits=True,
+        )
         tok_path = out_dir / "tokenizer.json"
         tok.save(tok_path)
         secs = round(time.time() - t0, 1)
         meta = {
-            "vocab_size": tok.vocab_size, "requested_vocab_size": v,
+            "vocab_size": tok.vocab_size,
+            "requested_vocab_size": v,
             "special_tokens": SPECIALS,
             "special_ids": {t: tok._tok.token_to_id(t) for t in SPECIALS},
-            "split_digits": True, "min_frequency": args.min_frequency,
-            "seconds": secs, "corpus": corpus_meta,
+            "split_digits": True,
+            "min_frequency": args.min_frequency,
+            "seconds": secs,
+            "corpus": corpus_meta,
         }
         (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
         print(f"[{_vocab_tag(v)}] vocab={tok.vocab_size} in {secs}s -> {tok_path}")
         tok_paths[v] = tok_path
 
     compression = eval_compression(tok_paths)
-    (OUT_ROOT / "summary.json").write_text(json.dumps({
-        "vocab_sizes": VOCAB_SIZES, "specials": SPECIALS, "split_digits": True,
-        "corpus": corpus_meta, "compression_chars_per_token": compression,
-    }, indent=2))
+    (OUT_ROOT / "summary.json").write_text(
+        json.dumps(
+            {
+                "vocab_sizes": VOCAB_SIZES,
+                "specials": SPECIALS,
+                "split_digits": True,
+                "corpus": corpus_meta,
+                "compression_chars_per_token": compression,
+            },
+            indent=2,
+        )
+    )
     print(f"\nsummary -> {OUT_ROOT / 'summary.json'}")
 
 

@@ -30,8 +30,10 @@ import sources as S  # noqa: E402
 
 def _shard_files(repo: str, prefix: str, n: int | None) -> list[str]:
     from huggingface_hub import HfApi
+
     files = sorted(
-        f for f in HfApi().list_repo_files(repo, repo_type="dataset")
+        f
+        for f in HfApi().list_repo_files(repo, repo_type="dataset")
         if f.startswith(prefix) and f.endswith(".parquet")
     )
     if not files:
@@ -49,7 +51,9 @@ def stage(src: S.Source) -> dict:
     patterns = _shard_files(src.hf_repo, src.file_prefix, src.n_shards)
     print(f"\n[{src.key}] {src.hf_repo} :: {len(patterns)} shard(s) -> {out}")
     snapshot_download(
-        src.hf_repo, repo_type="dataset", local_dir=str(out),
+        src.hf_repo,
+        repo_type="dataset",
+        local_dir=str(out),
         allow_patterns=patterns,
     )
 
@@ -84,9 +88,15 @@ def stage(src: S.Source) -> dict:
         "shards": patterns,
     }
     (out / "manifest.json").write_text(json.dumps(meta, indent=2))
-    have_col = "OK" if (cols and src.text_column in cols) else f"!! missing {src.text_column!r}"
-    print(f"   rows={n_rows:,}  size={n_bytes/1e9:.2f}GB  ~{est_tok/1e6:.0f}M tok"
-          f"  cols={cols}  [{have_col}]")
+    have_col = (
+        "OK"
+        if (cols and src.text_column in cols)
+        else f"!! missing {src.text_column!r}"
+    )
+    print(
+        f"   rows={n_rows:,}  size={n_bytes / 1e9:.2f}GB  ~{est_tok / 1e6:.0f}M tok"
+        f"  cols={cols}  [{have_col}]"
+    )
     return meta
 
 
@@ -98,11 +108,15 @@ def main(keys: list[str]):
     pre_tok = sum(m["est_tokens"] for m in metas if m["weight"] > 0)
     for m in metas:
         tag = "SFT" if m["weight"] == 0 else f"{m['weight']:.2f}"
-        print(f"  {m['key']:<24} {tag:>5}  {m['n_rows']:>10,} rows  "
-              f"{m['bytes']/1e9:>6.2f}GB  ~{m['est_tokens']/1e6:>6.0f}M tok  "
-              f"(target {m['target_tokens']/1e6:.0f}M)")
-    print(f"  pretrain staged (est): ~{pre_tok/1e9:.2f}B unique tokens "
-          f"for a {S.TARGET_TOKENS/1e9:.1f}B budget")
+        print(
+            f"  {m['key']:<24} {tag:>5}  {m['n_rows']:>10,} rows  "
+            f"{m['bytes'] / 1e9:>6.2f}GB  ~{m['est_tokens'] / 1e6:>6.0f}M tok  "
+            f"(target {m['target_tokens'] / 1e6:.0f}M)"
+        )
+    print(
+        f"  pretrain staged (est): ~{pre_tok / 1e9:.2f}B unique tokens "
+        f"for a {S.TARGET_TOKENS / 1e9:.1f}B budget"
+    )
     print(f"  raw root: {S.RAW_ROOT}")
 
 

@@ -45,8 +45,13 @@ class EMACallback(pl.Callback):
         update_every: update the shadow every k optimizer steps (1 = every step).
     """
 
-    def __init__(self, decay: float = 0.999, warmup_steps: int = 100,
-                 eval_with_ema: bool = True, update_every: int = 1):
+    def __init__(
+        self,
+        decay: float = 0.999,
+        warmup_steps: int = 100,
+        eval_with_ema: bool = True,
+        update_every: int = 1,
+    ):
         super().__init__()
         self.decay = float(decay)
         self.warmup_steps = max(1, int(warmup_steps))
@@ -68,8 +73,9 @@ class EMACallback(pl.Callback):
     def on_fit_start(self, trainer, pl_module):
         # Build the fp32 shadow after the model is on-device (before sanity val).
         if not self.shadow:
-            self.shadow = {n: p.detach().float().clone()
-                           for n, p in self._params(pl_module)}
+            self.shadow = {
+                n: p.detach().float().clone() for n, p in self._params(pl_module)
+            }
         if self._pending_state is not None:  # resumed from checkpoint
             self.n_updates = int(self._pending_state.get("n_updates", 0))
             saved = self._pending_state.get("shadow", {})
@@ -79,7 +85,9 @@ class EMACallback(pl.Callback):
             self._pending_state = None
 
     def _decay(self) -> float:
-        return min(self.decay, (1 + self.n_updates) / (self.warmup_steps + self.n_updates))
+        return min(
+            self.decay, (1 + self.n_updates) / (self.warmup_steps + self.n_updates)
+        )
 
     # -- update ------------------------------------------------------------
     def on_train_batch_end(self, trainer, pl_module, *args, **kwargs):

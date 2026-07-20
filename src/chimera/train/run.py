@@ -15,7 +15,12 @@ from lightning import LightningDataModule, LightningModule, Trainer, seed_everyt
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 
-from chimera.utils import EMACallback, ProgressPrinter, TokenAxisCallback, build_run_loggers
+from chimera.utils import (
+    EMACallback,
+    ProgressPrinter,
+    TokenAxisCallback,
+    build_run_loggers,
+)
 
 from .config import TrainConfig
 
@@ -69,11 +74,16 @@ def run(
         run_dir, cfg.wandb_project, cfg.run_name, cfg.wandb_offline, tags=list(cfg.tags)
     )
 
-    all_callbacks: list[Callback] = [checkpoint, ProgressPrinter(tokens_per_step=tokens_per_step)]
+    all_callbacks: list[Callback] = [
+        checkpoint,
+        ProgressPrinter(tokens_per_step=tokens_per_step),
+    ]
     if tokens_per_step > 0:
         all_callbacks.append(TokenAxisCallback(tokens_per_step))
     if cfg.ema_decay is not None:
-        all_callbacks.append(EMACallback(decay=cfg.ema_decay, warmup_steps=cfg.warmup_steps))
+        all_callbacks.append(
+            EMACallback(decay=cfg.ema_decay, warmup_steps=cfg.warmup_steps)
+        )
     all_callbacks.extend(callbacks)
 
     kwargs = dict(
@@ -101,4 +111,6 @@ def run(
     )
     if best:
         print("best checkpoint:", best)
-    return RunResult(best_ckpt=Path(best) if best else None, wandb_id=wandb_id, metrics=metrics)
+    return RunResult(
+        best_ckpt=Path(best) if best else None, wandb_id=wandb_id, metrics=metrics
+    )

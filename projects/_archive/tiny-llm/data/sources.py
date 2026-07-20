@@ -30,7 +30,7 @@ tokenizer exists and we can measure exactly.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 # Datasets/models/caches live on the big volume (see project memory).
@@ -47,16 +47,16 @@ _M = 1_000_000
 
 @dataclass
 class Source:
-    key: str                       # cli handle / raw-dir name, e.g. "tinystories"
-    title: str                     # human label
-    category: str                  # prose | textbook | synthetic-web | web | chat
-    weight: float                  # PRETRAIN fraction of the blend (sum ~1.0)
-    hf_repo: str                   # backing HF dataset
-    file_prefix: str               # repo path prefix selecting this slice's parquet
-    text_column: str               # column holding the training text
-    avail_tokens: float            # est. UNIQUE tokens available (bytes/≈4)
-    role: str                      # one-line role in the mixture
-    notes: str = ""                # gating / licensing / schema quirks
+    key: str  # cli handle / raw-dir name, e.g. "tinystories"
+    title: str  # human label
+    category: str  # prose | textbook | synthetic-web | web | chat
+    weight: float  # PRETRAIN fraction of the blend (sum ~1.0)
+    hf_repo: str  # backing HF dataset
+    file_prefix: str  # repo path prefix selecting this slice's parquet
+    text_column: str  # column holding the training text
+    avail_tokens: float  # est. UNIQUE tokens available (bytes/≈4)
+    role: str  # one-line role in the mixture
+    notes: str = ""  # gating / licensing / schema quirks
     # How much to physically stage. n_shards=None -> stage the whole slice; else
     # the first N parquet shards under file_prefix (sorted). Sized to cover the
     # source's target unique tokens (weight x TARGET_TOKENS) with headroom.
@@ -77,10 +77,10 @@ SOURCES: list[Source] = [
         hf_repo="karanravindra/tinystories-v2",  # our repackaging of roneneldan V2-GPT4
         file_prefix="data/train-",
         text_column="text",
-        avail_tokens=0.54 * _B,     # measured previously (~542M tok, 2.72M stories)
+        avail_tokens=0.54 * _B,  # measured previously (~542M tok, 2.72M stories)
         role="fluency backbone — narrow, clean, coherent English",
         notes="id+text schema. Public. cdla-sharing-1.0 upstream.",
-        n_shards=None,              # small — stage the whole thing
+        n_shards=None,  # small — stage the whole thing
         license="cdla-sharing-1.0",
     ),
     # ---- knowledge / expository : 22% -------------------------------------
@@ -92,10 +92,10 @@ SOURCES: list[Source] = [
         hf_repo="nampdn-ai/tiny-strange-textbooks",
         file_prefix="data_part_",
         text_column="text",
-        avail_tokens=4.0 * _B,      # 16GB raw / ~4 chars/tok
+        avail_tokens=4.0 * _B,  # 16GB raw / ~4 chars/tok
         role="knowledge / expository style (downweighted — higher complexity)",
         notes="Gated upstream (accept terms); accessible with HF_TOKEN. apache-2.0.",
-        n_shards=3,                 # ~0.85B unique staged vs 0.44B target
+        n_shards=3,  # ~0.85B unique staged vs 0.44B target
         license="apache-2.0",
     ),
     # ---- explanatory + QA register (chat-adjacent) : 18% ------------------
@@ -107,10 +107,10 @@ SOURCES: list[Source] = [
         hf_repo="HuggingFaceFW/finephrase",
         file_prefix="tutorial/",
         text_column="text",
-        avail_tokens=160.0 * _B,    # whole config; we stage a bounded slice
+        avail_tokens=160.0 * _B,  # whole config; we stage a bounded slice
         role="explanatory register — bridge toward chat",
         notes="Config is >1TB — MUST slice. ODC-BY. text column verified at stage time.",
-        n_shards=12,                # ~0.28B staged vs 0.18B target
+        n_shards=12,  # ~0.28B staged vs 0.18B target
         license="odc-by",
     ),
     Source(
@@ -136,10 +136,10 @@ SOURCES: list[Source] = [
         hf_repo="HuggingFaceFW/fineweb-edu",
         file_prefix="sample/10BT/",
         text_column="text",
-        avail_tokens=10.0 * _B,     # the sample IS 10B; stage 1 shard for our budget
+        avail_tokens=10.0 * _B,  # the sample IS 10B; stage 1 shard for our budget
         role="natural-web grounding (keep small — broad web hurts coherence here)",
         notes="Educational web; 'text' column. ODC-BY. NOT small-model-specific.",
-        n_shards=1,                 # ~0.7B staged vs 0.20B target
+        n_shards=1,  # ~0.7B staged vs 0.20B target
         license="odc-by",
     ),
     # ---- chat SFT : SFT-only (weight=0.0 keeps it out of pretrain) --------
@@ -147,14 +147,14 @@ SOURCES: list[Source] = [
         key="smol-smoltalk",
         title="smol-smoltalk (SmolTalk trimmed for <1B models)",
         category="chat",
-        weight=0.0,                 # SFT-only
+        weight=0.0,  # SFT-only
         hf_repo="HuggingFaceTB/smol-smoltalk",
         file_prefix="data/train-",
-        text_column="messages",     # conversation list -> rendered at SFT time
+        text_column="messages",  # conversation list -> rendered at SFT time
         avail_tokens=0.20 * _B,
         role="chat SFT — trimmed SmolTalk (no advanced math / long FC)",
         notes="484,570 rows / 971MB. apache-2.0. Separate SFT phase, not pretrain.",
-        n_shards=None,              # small — stage whole
+        n_shards=None,  # small — stage whole
         sft_weight=1.0,
         license="apache-2.0",
     ),
@@ -184,17 +184,25 @@ def plan(target_tokens: int = TARGET_TOKENS) -> list[dict]:
             continue
         tgt = s.weight * target_tokens
         repeat = (tgt / s.avail_tokens) if s.avail_tokens else float("inf")
-        rows.append({
-            "key": s.key, "category": s.category, "weight": s.weight,
-            "target_tokens": tgt, "avail_tokens": s.avail_tokens, "repeat": repeat,
-        })
+        rows.append(
+            {
+                "key": s.key,
+                "category": s.category,
+                "weight": s.weight,
+                "target_tokens": tgt,
+                "avail_tokens": s.avail_tokens,
+                "repeat": repeat,
+            }
+        )
     return rows
 
 
 if __name__ == "__main__":
-    print(f"pretrain budget: {TARGET_TOKENS/1e9:.1f}B tokens")
+    print(f"pretrain budget: {TARGET_TOKENS / 1e9:.1f}B tokens")
     print("category weights:", {k: round(v, 3) for k, v in category_weights().items()})
     print(f"{'key':<24}{'wt':>6}{'target':>10}{'avail':>10}{'repeat':>8}")
     for r in plan():
-        print(f"{r['key']:<24}{r['weight']:>6.2f}{r['target_tokens']/1e6:>9.0f}M"
-              f"{r['avail_tokens']/1e6:>9.0f}M{r['repeat']:>8.2f}x")
+        print(
+            f"{r['key']:<24}{r['weight']:>6.2f}{r['target_tokens'] / 1e6:>9.0f}M"
+            f"{r['avail_tokens'] / 1e6:>9.0f}M{r['repeat']:>8.2f}x"
+        )

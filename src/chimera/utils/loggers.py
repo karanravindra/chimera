@@ -24,8 +24,9 @@ class ProgressPrinter(pl.Callback):
     ETA is training-only — it doesn't budget for remaining validation passes.
     """
 
-    def __init__(self, print_every: int = 500, tokens_per_step: int = 0,
-                 rate_window: int = 50):
+    def __init__(
+        self, print_every: int = 500, tokens_per_step: int = 0, rate_window: int = 50
+    ):
         super().__init__()
         self.print_every = int(print_every)
         self.tokens_per_step = int(tokens_per_step)
@@ -62,8 +63,11 @@ class ProgressPrinter(pl.Callback):
         # discard the first interval (compile warmup / setup) — not a real step rate
         self._skip_dur = True
         total = self._total_steps(trainer)
-        print(f"[progress] train start: target {total or '?'} steps, "
-              f"{self.tokens_per_step} tokens/step", flush=True)
+        print(
+            f"[progress] train start: target {total or '?'} steps, "
+            f"{self.tokens_per_step} tokens/step",
+            flush=True,
+        )
 
     def on_train_epoch_start(self, trainer, pl_module):
         self._epoch_t = time.monotonic()
@@ -82,7 +86,9 @@ class ProgressPrinter(pl.Callback):
             if self._skip_dur:
                 self._skip_dur = False
             else:
-                self._recent.append((now - self._prev_batch_t) / (step - self._last_step))
+                self._recent.append(
+                    (now - self._prev_batch_t) / (step - self._last_step)
+                )
             self._prev_batch_t = now
             self._last_step = step
 
@@ -93,15 +99,19 @@ class ProgressPrinter(pl.Callback):
         total = self._total_steps(trainer)
         eta = self._fmt_dt((total - step) / sps) if (total and sps > 0) else "?"
         tok = step * self.tokens_per_step
-        print(f"[progress] step {step}/{total or '?'}  {tok/1e6:.0f}M tok  "
-              f"{self._metrics(trainer, 'train')}  |  {sps:.2f} step/s  "
-              f"{tps/1e3:.0f}k tok/s  elapsed {self._fmt_dt(now - self._t0)}  eta {eta}",
-              flush=True)
+        print(
+            f"[progress] step {step}/{total or '?'}  {tok / 1e6:.0f}M tok  "
+            f"{self._metrics(trainer, 'train')}  |  {sps:.2f} step/s  "
+            f"{tps / 1e3:.0f}k tok/s  elapsed {self._fmt_dt(now - self._t0)}  eta {eta}",
+            flush=True,
+        )
 
     def on_train_epoch_end(self, trainer, pl_module):
         if hasattr(self, "_epoch_t"):
-            print(f"[progress] train epoch done in {self._fmt_dt(time.monotonic() - self._epoch_t)}",
-                  flush=True)
+            print(
+                f"[progress] train epoch done in {self._fmt_dt(time.monotonic() - self._epoch_t)}",
+                flush=True,
+            )
 
     def on_validation_start(self, trainer, pl_module):
         self._val_t = time.monotonic()
@@ -110,8 +120,11 @@ class ProgressPrinter(pl.Callback):
         if trainer.sanity_checking or not hasattr(self, "_val_t"):
             return
         m = self._metrics(trainer, "val")
-        print(f"[progress] val done in {self._fmt_dt(time.monotonic() - self._val_t)}"
-              + (f"  |  {m}" if m else ""), flush=True)
+        print(
+            f"[progress] val done in {self._fmt_dt(time.monotonic() - self._val_t)}"
+            + (f"  |  {m}" if m else ""),
+            flush=True,
+        )
         # The next train interval straddles this val pass — discard it from the
         # step-rate estimate so ETA doesn't spike (mirrors the compile-warmup skip).
         if hasattr(self, "_recent"):
@@ -124,8 +137,10 @@ class ProgressPrinter(pl.Callback):
 
     def on_test_end(self, trainer, pl_module):
         if hasattr(self, "_test_t"):
-            print(f"[progress] test/eval done in {self._fmt_dt(time.monotonic() - self._test_t)}",
-                  flush=True)
+            print(
+                f"[progress] test/eval done in {self._fmt_dt(time.monotonic() - self._test_t)}",
+                flush=True,
+            )
 
 
 class TokenAxisCallback(pl.Callback):

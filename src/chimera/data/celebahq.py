@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from torch.utils.data import DataLoader, Dataset, Subset, random_split
+from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import transforms
 
 import lightning as pl
@@ -55,10 +55,12 @@ class CelebAHQDataModule(pl.LightningDataModule):
 
         # Cached uint8 CHW -> float [0, 1] (ConvertImageDtype) -> [-1, 1] (Normalize).
         # The cache is already at image_size, so no Resize is needed.
-        self.transform = transforms.Compose([
-            transforms.ConvertImageDtype(torch.float),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-        ])
+        self.transform = transforms.Compose(
+            [
+                transforms.ConvertImageDtype(torch.float),
+                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+            ]
+        )
         self.classes: list[str] = []
 
         self.celeba_train: Optional[Dataset] = None
@@ -86,7 +88,8 @@ class CelebAHQDataModule(pl.LightningDataModule):
     def _cached(self, split: str) -> CachedImageDataset:
         c = self._cache_dir
         return CachedImageDataset(
-            c / f"{split}.images.npy", c / f"{split}.labels.npy",
+            c / f"{split}.images.npy",
+            c / f"{split}.labels.npy",
             transform=self.transform,
         )
 
@@ -152,5 +155,7 @@ if __name__ == "__main__":
     dm.setup("fit")
     x, y = next(iter(dm.train_dataloader()))
     print(f"classes={dm.classes}")
-    print(f"train batch: x={x.shape}, y={y.shape}, dtype={x.dtype}, "
-          f"range=[{x.min():.2f},{x.max():.2f}]")
+    print(
+        f"train batch: x={x.shape}, y={y.shape}, dtype={x.dtype}, "
+        f"range=[{x.min():.2f},{x.max():.2f}]"
+    )

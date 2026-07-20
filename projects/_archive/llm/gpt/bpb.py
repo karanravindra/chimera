@@ -42,6 +42,7 @@ LN2 = math.log(2.0)
 
 # -- pure conversions ---------------------------------------------------------
 
+
 def nats_to_bpb(loss_nats: float, bytes_per_token: float) -> float:
     """Per-token cross-entropy (nats) -> bits-per-byte."""
     return loss_nats / (LN2 * bytes_per_token)
@@ -54,6 +55,7 @@ def bpb_to_nats(bpb: float, bytes_per_token: float) -> float:
 
 
 # -- measurement --------------------------------------------------------------
+
 
 def measure_bytes_per_token(
     tokenizer,
@@ -103,6 +105,7 @@ def measure_bytes_per_token(
 
 
 # -- cache --------------------------------------------------------------------
+
 
 def _load_cache(cache_path: Path) -> dict:
     if cache_path.exists():
@@ -179,26 +182,37 @@ def main():
     args = p.parse_args()
 
     bpt = bytes_per_token_cached(
-        args.tokenizer, args.mix, data_dir=args.data_dir, sft=args.sft,
-        split=args.split, force=args.force, max_tokens=args.max_tokens,
+        args.tokenizer,
+        args.mix,
+        data_dir=args.data_dir,
+        sft=args.sft,
+        split=args.split,
+        force=args.force,
+        max_tokens=args.max_tokens,
     )
     entry = _load_cache(CACHE_PATH)[args.tokenizer][args.mix]
     print(f"tokenizer={args.tokenizer}  mix={args.mix}  split={entry.get('split')}")
-    print(f"total_tokens={entry['total_tokens']:,}  total_bytes={entry['total_bytes']:,}")
+    print(
+        f"total_tokens={entry['total_tokens']:,}  total_bytes={entry['total_bytes']:,}"
+    )
     print(f"bytes/token = {bpt:.4f}")
     print(f"(cached in {CACHE_PATH})")
 
     if args.loss is not None:
         b = nats_to_bpb(args.loss, bpt)
-        print(f"\nval/loss {args.loss} nats = {args.loss / LN2:.3f} bits/token"
-              f"  ->  BPB = {b:.4f}")
+        print(
+            f"\nval/loss {args.loss} nats = {args.loss / LN2:.3f} bits/token"
+            f"  ->  BPB = {b:.4f}"
+        )
 
     targets = [float(x) for x in args.bpb_targets.split(",") if x.strip()]
     if targets:
         print("\nBPB target -> val/loss (nats) to aim for:")
         for t in targets:
-            print(f"  BPB {t:>4}  ->  {bpb_to_nats(t, bpt):.3f} nats"
-                  f"  ({bpb_to_nats(t, bpt) / LN2:.3f} bits/token)")
+            print(
+                f"  BPB {t:>4}  ->  {bpb_to_nats(t, bpt):.3f} nats"
+                f"  ({bpb_to_nats(t, bpt) / LN2:.3f} bits/token)"
+            )
 
 
 if __name__ == "__main__":

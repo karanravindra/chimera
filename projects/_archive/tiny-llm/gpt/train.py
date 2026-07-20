@@ -35,7 +35,12 @@ from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from chimera.data import MixtureDataModule
 from chimera.models import GPT
 from chimera.optim import LinearWarmupCosineAnnealingLR, Muon, muon_param_groups
-from chimera.utils import EMACallback, ProgressPrinter, TokenAxisCallback, build_run_loggers
+from chimera.utils import (
+    EMACallback,
+    ProgressPrinter,
+    TokenAxisCallback,
+    build_run_loggers,
+)
 
 from module import TinyLMModule
 from bpb import measure as measure_bpb
@@ -47,9 +52,9 @@ from bench import DEFAULT_TASKS, flatten_for_wandb, print_table, run_benchmarks
 # transfers. Param counts below are for the 8k vocab (tied embedding); they scale
 # with vocab (4k smaller, 16k larger) — actual count is printed at startup.
 ARCH_PRESETS = {
-    "tiny": "256-8-2-6",    # ~6M  @ 8k
+    "tiny": "256-8-2-6",  # ~6M  @ 8k
     "small": "320-10-2-6",  # ~9M  @ 8k  (default — the ~10M / 8k first config)
-    "base": "448-14-2-6",   # ~18M @ 8k
+    "base": "448-14-2-6",  # ~18M @ 8k
 }
 
 
@@ -64,9 +69,17 @@ SAMPLE_PROMPTS = [
 ]
 
 
-def log_generations(model, tokenizer, device, wandb_logger,
-                    prompts=SAMPLE_PROMPTS, max_new_tokens=80, temperature=0.8,
-                    repetition_penalty=1.3, min_p=0.05):
+def log_generations(
+    model,
+    tokenizer,
+    device,
+    wandb_logger,
+    prompts=SAMPLE_PROMPTS,
+    max_new_tokens=80,
+    temperature=0.8,
+    repetition_penalty=1.3,
+    min_p=0.05,
+):
     """Sample from fixed prompts and log a wandb table (+ print).
 
     Uses repetition_penalty + min_p by default: plain temperature sampling on a
@@ -79,9 +92,14 @@ def log_generations(model, tokenizer, device, wandb_logger,
     for p in prompts:
         ids = tokenizer._tok.encode(p, add_special_tokens=False).ids
         x = torch.tensor([ids], dtype=torch.long, device=device)
-        out = model.generate(x, max_new_tokens=max_new_tokens, temperature=temperature,
-                             repetition_penalty=repetition_penalty, min_p=min_p)
-        cont = tokenizer.decode(out[0].tolist()[len(ids):])
+        out = model.generate(
+            x,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
+            min_p=min_p,
+        )
+        cont = tokenizer.decode(out[0].tolist()[len(ids) :])
         rows.append([p, cont])
     wandb_logger.experiment.log(
         {"test/generations": wandb.Table(columns=["prompt", "generation"], data=rows)}
@@ -95,14 +113,22 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data-dir", default="/mnt/ai/data")
     p.add_argument("--run-dir", default="/mnt/ai/runs/tiny-llm/gpt")
-    p.add_argument("--mix", default="tiny_2B_8k", help="mixture name under tiny-llm/mix/")
-    p.add_argument("--tokenizer", default="/mnt/ai/data/tiny-llm/tokenizer/8k",
-                   help="local tokenizer dir (4k/8k/16k) or HF id; MUST match the "
-                        "tokenizer the mix was packed with.")
-    p.add_argument("--vocab-tag", default=None,
-                   help="4k/8k/16k: convenience that sets BOTH --tokenizer and --mix "
-                        "to the matched pair (tokenizer/<tag> + tiny_2B_<tag>), so a "
-                        "vocab sweep can't desync them. Overrides --tokenizer/--mix.")
+    p.add_argument(
+        "--mix", default="tiny_2B_8k", help="mixture name under tiny-llm/mix/"
+    )
+    p.add_argument(
+        "--tokenizer",
+        default="/mnt/ai/data/tiny-llm/tokenizer/8k",
+        help="local tokenizer dir (4k/8k/16k) or HF id; MUST match the "
+        "tokenizer the mix was packed with.",
+    )
+    p.add_argument(
+        "--vocab-tag",
+        default=None,
+        help="4k/8k/16k: convenience that sets BOTH --tokenizer and --mix "
+        "to the matched pair (tokenizer/<tag> + tiny_2B_<tag>), so a "
+        "vocab sweep can't desync them. Overrides --tokenizer/--mix.",
+    )
     p.add_argument("--epochs", type=int, default=1)
     # Effective tokens per optimizer step; micro-batch = global_token_count // seq_len.
     p.add_argument("--global-token-count", type=int, default=65536 // 32)
@@ -133,7 +159,9 @@ def parse_args():
     p.add_argument("--n-head", type=int, default=10)
     p.add_argument("--n-kv-head", type=int, default=1)
     p.add_argument("--n-layer", type=int, default=6)
-    p.add_argument("--arch", default="tiny", help="preset (tiny/small/base) or 'W-H-K-L'")
+    p.add_argument(
+        "--arch", default="tiny", help="preset (tiny/small/base) or 'W-H-K-L'"
+    )
     # muP: base width 256 (keep head_dim fixed when scaling width to transfer LRs).
     p.add_argument("--mup-base-width", type=int, default=256)
     p.add_argument("--mup-base-std", type=float, default=0.02)
@@ -149,8 +177,12 @@ def parse_args():
     # EMA of the weights (warmed-up decay); val/test + downstream eval run on the
     # averaged model. On by default; --no-ema to train/eval on raw weights only.
     p.add_argument("--ema-decay", type=float, default=0.999)
-    p.add_argument("--ema-warmup-steps", type=int, default=100,
-                   help="decay-ramp constant: d = min(decay, (1+n)/(warmup+n))")
+    p.add_argument(
+        "--ema-warmup-steps",
+        type=int,
+        default=100,
+        help="decay-ramp constant: d = min(decay, (1+n)/(warmup+n))",
+    )
     p.add_argument("--no-ema", dest="use_ema", action="store_false")
     p.add_argument("--no-scheduler", dest="use_scheduler", action="store_false")
     p.add_argument("--no-compile", dest="compile", action="store_false")
@@ -167,23 +199,42 @@ def parse_args():
     # inference. OFF by default (depth 0). NB: published evidence shows MTP does
     # not help — and can hurt local benchmarks (BLiMP) — below ~130M params, so
     # at this 5-20M scale treat it as an experiment vs the NTP baseline.
-    p.add_argument("--mtp-depth", type=int, default=0,
-                   help="number of DeepSeek-style MTP modules (0=off)")
-    p.add_argument("--mtp-weight", type=float, default=0.1,
-                   help="MTP auxiliary loss weight lambda (DeepSeek used 0.3->0.1)")
+    p.add_argument(
+        "--mtp-depth",
+        type=int,
+        default=0,
+        help="number of DeepSeek-style MTP modules (0=off)",
+    )
+    p.add_argument(
+        "--mtp-weight",
+        type=float,
+        default=0.1,
+        help="MTP auxiliary loss weight lambda (DeepSeek used 0.3->0.1)",
+    )
     # NextLat (arXiv:2511.05963): next-latent prediction. A latent-dynamics MLP
     # predicts the model's own next hidden state; aux losses shape the trunk in
     # latent space (SmoothL1 + KL), leaving the token objective/inference intact.
     # Designed to PRESERVE next-token quality (unlike MTP, which degrades it at
     # small scale). Defaults from the paper's ~100M config.
-    p.add_argument("--nextlat", action="store_true",
-                   help="enable NextLat next-latent prediction auxiliary loss")
+    p.add_argument(
+        "--nextlat",
+        action="store_true",
+        help="enable NextLat next-latent prediction auxiliary loss",
+    )
     p.add_argument("--nextlat-lambda-mse", type=float, default=1.0)
     p.add_argument("--nextlat-lambda-kl", type=float, default=1.0)
-    p.add_argument("--nextlat-horizon", type=int, default=1,
-                   help="multi-step latent rollout horizon d")
-    p.add_argument("--nextlat-proj-factor", type=float, default=1.3,
-                   help="dynamics MLP hidden = round(proj_factor*2C/128)*128")
+    p.add_argument(
+        "--nextlat-horizon",
+        type=int,
+        default=1,
+        help="multi-step latent rollout horizon d",
+    )
+    p.add_argument(
+        "--nextlat-proj-factor",
+        type=float,
+        default=1.3,
+        help="dynamics MLP hidden = round(proj_factor*2C/128)*128",
+    )
     # Final trainer.test() pass -> test/<src>/bpb on the held-out val windows.
     p.add_argument("--no-test", dest="run_test", action="store_false")
     # Zero-shot downstream benchmarks (bench.py, lm-eval-harness) run after
@@ -191,8 +242,12 @@ def parse_args():
     # tuned for 5-20M (BLiMP is the signal-bearing one; PIQA/SciQ/ARC near-chance).
     p.add_argument("--eval-tasks", default=",".join(DEFAULT_TASKS))
     p.add_argument("--eval-batch-tokens", type=int, default=32768)
-    p.add_argument("--eval-limit", type=int, default=None,
-                   help="cap examples per benchmark task (smoke); None = full")
+    p.add_argument(
+        "--eval-limit",
+        type=int,
+        default=None,
+        help="cap examples per benchmark task (smoke); None = full",
+    )
     p.add_argument("--no-eval", dest="run_eval", action="store_false")
     # Log sample generations (test/generations table) at the end of the test phase.
     p.add_argument("--no-gen", dest="gen_samples", action="store_false")
@@ -200,8 +255,12 @@ def parse_args():
     # bench/<task>/<metric>, to chart downstream progression over training (not just
     # the final point). Uses a small per-task cap for speed.
     p.add_argument("--bench-every-val", type=int, default=0)
-    p.add_argument("--bench-progress-limit", type=int, default=200,
-                   help="examples/task cap for the in-training benchmark passes")
+    p.add_argument(
+        "--bench-progress-limit",
+        type=int,
+        default=200,
+        help="examples/task cap for the in-training benchmark passes",
+    )
     return p.parse_args()
 
 
@@ -216,8 +275,16 @@ class BenchmarkProgressCallback(Callback):
     same (EMA-swapped) weights validation used.
     """
 
-    def __init__(self, tokenizer, tasks, block_size, batch_tokens, limit,
-                 every_n_vals=1, prefix="bench"):
+    def __init__(
+        self,
+        tokenizer,
+        tasks,
+        block_size,
+        batch_tokens,
+        limit,
+        every_n_vals=1,
+        prefix="bench",
+    ):
         super().__init__()
         self.tokenizer = tokenizer
         self.tasks = tasks
@@ -237,14 +304,20 @@ class BenchmarkProgressCallback(Callback):
         model = getattr(pl_module.model, "_orig_mod", pl_module.model)
         with torch.no_grad():
             results = run_benchmarks(
-                model, self.tokenizer, self.tasks, block_size=self.block_size,
-                batch_tokens=self.batch_tokens, device=str(pl_module.device),
+                model,
+                self.tokenizer,
+                self.tasks,
+                block_size=self.block_size,
+                batch_tokens=self.batch_tokens,
+                device=str(pl_module.device),
                 limit=self.limit,
             )
         metrics = flatten_for_wandb(results, tasks=self.tasks, prefix=self.prefix)
         for lg in trainer.loggers:
             lg.log_metrics(metrics, step=trainer.global_step)
-        msg = "  ".join(f"{k.split('/')[1]} {v:.2f}" for k, v in sorted(metrics.items()))
+        msg = "  ".join(
+            f"{k.split('/')[1]} {v:.2f}" for k, v in sorted(metrics.items())
+        )
         print(f"[bench@step{trainer.global_step}] {msg}", flush=True)
 
 
@@ -258,10 +331,18 @@ def default_run_name(args) -> str:
     tok = Path(args.tokenizer).name  # e.g. "8k"
     ema = f"ema{args.ema_decay}" if use_ema(args) else "noema"
     mtp = f"-mtp{args.mtp_depth}w{args.mtp_weight}" if args.mtp_depth else ""
-    nl = (f"-nextlat-mse{args.nextlat_lambda_mse}kl{args.nextlat_lambda_kl}"
-          f"h{args.nextlat_horizon}") if args.nextlat else ""
-    return (f"gpt-{args.n_embd}-{args.n_head}-{args.n_kv_head}-{args.n_layer}"
-            f"-{tok}-seq{args.seq_len}-{ema}{mtp}{nl}-{args.mix}-muon{args.muon_lr}-steps{args.max_steps}")
+    nl = (
+        (
+            f"-nextlat-mse{args.nextlat_lambda_mse}kl{args.nextlat_lambda_kl}"
+            f"h{args.nextlat_horizon}"
+        )
+        if args.nextlat
+        else ""
+    )
+    return (
+        f"gpt-{args.n_embd}-{args.n_head}-{args.n_kv_head}-{args.n_layer}"
+        f"-{tok}-seq{args.seq_len}-{ema}{mtp}{nl}-{args.mix}-muon{args.muon_lr}-steps{args.max_steps}"
+    )
 
 
 def main():
@@ -284,8 +365,10 @@ def main():
             f"by --seq-len ({args.seq_len})"
         )
     batch_size = args.global_token_count // args.seq_len
-    print(f"global tokens/step={args.global_token_count}  seq_len={args.seq_len}"
-          f"  -> batch_size={batch_size}")
+    print(
+        f"global tokens/step={args.global_token_count}  seq_len={args.seq_len}"
+        f"  -> batch_size={batch_size}"
+    )
 
     dm = MixtureDataModule(
         data_dir=args.data_dir,
@@ -302,8 +385,9 @@ def main():
     val_loader = dm.val_dataloader()
     print(f"mix={args.mix}  tokenizer={dm.pretrained_id}  vocab_size={dm.vocab_size}")
     if dm.manifest:
-        srcs = ", ".join(f"{r['key']}:{r['renorm_weight']:.2f}"
-                         for r in dm.manifest["sources"])
+        srcs = ", ".join(
+            f"{r['key']}:{r['renorm_weight']:.2f}" for r in dm.manifest["sources"]
+        )
         print(f"mix sources -> {srcs}")
 
     model = GPT(
@@ -324,18 +408,26 @@ def main():
         nextlat_proj_factor=args.nextlat_proj_factor,
     )
     if args.mtp_depth:
-        print(f"MTP ON: depth={args.mtp_depth} weight={args.mtp_weight} "
-              f"(DeepSeek-style, training-only; discarded at inference)")
+        print(
+            f"MTP ON: depth={args.mtp_depth} weight={args.mtp_weight} "
+            f"(DeepSeek-style, training-only; discarded at inference)"
+        )
     if args.nextlat:
-        print(f"NextLat ON: lambda_mse={args.nextlat_lambda_mse} "
-              f"lambda_kl={args.nextlat_lambda_kl} horizon={args.nextlat_horizon} "
-              f"proj_factor={args.nextlat_proj_factor} (training-only; discarded at inference)")
+        print(
+            f"NextLat ON: lambda_mse={args.nextlat_lambda_mse} "
+            f"lambda_kl={args.nextlat_lambda_kl} horizon={args.nextlat_horizon} "
+            f"proj_factor={args.nextlat_proj_factor} (training-only; discarded at inference)"
+        )
     if args.doc_masking:
-        print(f"document masking ON (eos_id={dm.eos_id}): intra-doc attention + boundary loss mask")
+        print(
+            f"document masking ON (eos_id={dm.eos_id}): intra-doc attention + boundary loss mask"
+        )
     n_params = sum(p.numel() for p in model.parameters())
     emb = dm.vocab_size * args.n_embd
-    print(f"GPT parameters: {n_params/1e6:.2f}M  "
-          f"(embedding {emb/1e6:.2f}M = {100*emb/n_params:.0f}%)")
+    print(
+        f"GPT parameters: {n_params / 1e6:.2f}M  "
+        f"(embedding {emb / 1e6:.2f}M = {100 * emb / n_params:.0f}%)"
+    )
 
     optimizer = Muon(
         muon_param_groups(
@@ -348,11 +440,15 @@ def main():
     )
     scheduler = (
         LinearWarmupCosineAnnealingLR(
-            optimizer, warmup_steps=args.warmup_steps, n_epochs=args.epochs,
-            train_loader_length=len(train_loader), eta_min=args.eta_min,
+            optimizer,
+            warmup_steps=args.warmup_steps,
+            n_epochs=args.epochs,
+            train_loader_length=len(train_loader),
+            eta_min=args.eta_min,
             max_steps=args.max_steps,
         )
-        if args.use_scheduler else None
+        if args.use_scheduler
+        else None
     )
 
     if args.compile:
@@ -369,8 +465,12 @@ def main():
     agg_bpt, src_bpt = measure_bpb(args.tokenizer, args.mix, data_dir=args.data_dir)
     print(f"bytes/token: aggregate={agg_bpt:.4f}  per-source={src_bpt}")
     lm_module = TinyLMModule(
-        model, optimizer, scheduler, use_cce=args.use_cce,
-        bytes_per_token=agg_bpt, source_bpt=src_bpt,
+        model,
+        optimizer,
+        scheduler,
+        use_cce=args.use_cce,
+        bytes_per_token=agg_bpt,
+        source_bpt=src_bpt,
         doc_boundary_eos_id=dm.eos_id if args.doc_masking else None,
         mtp_weight=args.mtp_weight,
         nextlat_lambda_mse=args.nextlat_lambda_mse if args.nextlat else 0.0,
@@ -381,7 +481,9 @@ def main():
     run_dir = Path(args.run_dir)
     checkpoint = ModelCheckpoint(
         dirpath=run_dir / args.run_name / "checkpoints",
-        filename="gpt", monitor="val/loss", enable_version_counter=False,
+        filename="gpt",
+        monitor="val/loss",
+        enable_version_counter=False,
     )
     tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None
     loggers = build_run_loggers(
@@ -396,18 +498,28 @@ def main():
     ]
     if args.bench_every_val > 0:
         bench_tasks = [t.strip() for t in args.eval_tasks.split(",") if t.strip()]
-        print(f"in-training benchmarks ON: every {args.bench_every_val} val phase(s), "
-              f"limit {args.bench_progress_limit}/task -> bench/<task>/<metric>")
-        callbacks.append(BenchmarkProgressCallback(
-            dm.tokenizer, bench_tasks, block_size=args.seq_len,
-            batch_tokens=args.eval_batch_tokens, limit=args.bench_progress_limit,
-            every_n_vals=args.bench_every_val,
-        ))
+        print(
+            f"in-training benchmarks ON: every {args.bench_every_val} val phase(s), "
+            f"limit {args.bench_progress_limit}/task -> bench/<task>/<metric>"
+        )
+        callbacks.append(
+            BenchmarkProgressCallback(
+                dm.tokenizer,
+                bench_tasks,
+                block_size=args.seq_len,
+                batch_tokens=args.eval_batch_tokens,
+                limit=args.bench_progress_limit,
+                every_n_vals=args.bench_every_val,
+            )
+        )
     if use_ema(args):
-        print(f"EMA ON: decay={args.ema_decay}  warmup_steps={args.ema_warmup_steps} "
-              f"(val/test + downstream eval use the averaged weights)")
-        callbacks.append(EMACallback(decay=args.ema_decay,
-                                     warmup_steps=args.ema_warmup_steps))
+        print(
+            f"EMA ON: decay={args.ema_decay}  warmup_steps={args.ema_warmup_steps} "
+            f"(val/test + downstream eval use the averaged weights)"
+        )
+        callbacks.append(
+            EMACallback(decay=args.ema_decay, warmup_steps=args.ema_warmup_steps)
+        )
     else:
         print("EMA OFF")
 
@@ -440,6 +552,7 @@ def main():
         # dynamo + empty_cache so eval's larger batches don't OOM against dead
         # memory (see chimera cudagraph-eval memory).
         import gc
+
         eval_model = getattr(model, "_orig_mod", model)
         # Free the training CUDA-graph pool before eval. The reduce-overhead pool is
         # sized for the train fwd/bwd (incl. the vocab-sized logits) and can be
@@ -464,15 +577,20 @@ def main():
             eval_tasks = [t.strip() for t in args.eval_tasks.split(",") if t.strip()]
             if eval_tasks:
                 results = run_benchmarks(
-                    eval_model, dm.tokenizer, eval_tasks,
-                    block_size=args.seq_len, batch_tokens=eval_bt,
-                    device=eval_device, limit=args.eval_limit,
+                    eval_model,
+                    dm.tokenizer,
+                    eval_tasks,
+                    block_size=args.seq_len,
+                    batch_tokens=eval_bt,
+                    device=eval_device,
+                    limit=args.eval_limit,
                 )
                 # headline metric per task only (BLiMP aggregate, not its 67
                 # subtasks; one metric each) — keeps the wandb test/ namespace small.
                 print_table(results, tasks=eval_tasks)
                 loggers[1].log_metrics(
-                    flatten_for_wandb(results, tasks=eval_tasks), step=trainer.global_step
+                    flatten_for_wandb(results, tasks=eval_tasks),
+                    step=trainer.global_step,
                 )
 
 

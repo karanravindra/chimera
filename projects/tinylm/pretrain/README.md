@@ -8,9 +8,8 @@ positions, Cut Cross Entropy, and Muon+AdamW.
 
 ## Layout
 
-- `model.py` — the GPT (project-local on purpose: per-doc RoPE position reset, no muP —
-  diverges from `chimera.models.gpt`; candidate for the library once the unified LLM
-  redo picks the canonical GPT)
+- `model.py` — the GPT, project-local on purpose: per-doc RoPE position reset, VWN
+  routing, and no muP; it is the canonical model for this experiment
 - `train.py` — raw PyTorch training loop; saves the checkpoint to
   `/mnt/ai/runs/tinylm/pretrain/chimera_gpt6m.pt`
 - `main.ipynb` — analysis only: loads the checkpoint, mask visualization, samples,
@@ -29,7 +28,7 @@ Index of source `id`s used in the `mix` column below (`chimera.data` module → 
 Add a row here when a new source gets an id.
 
 | id  | dataset                     | module                           | HF repo                                       |
-|-----|-----------------------------|----------------------------------|-----------------------------------------------|
+| --- | --------------------------- | -------------------------------- | --------------------------------------------- |
 | tt  | Tiny Textbooks              | `TinyTextbooksDataModule`        | `nampdn-ai/tiny-textbooks`                    |
 | str | Tiny Strange Textbooks      | `TinyStrangeTextbooksDataModule` | `nampdn-ai/tiny-strange-textbooks`            |
 | fw  | FineWeb-Edu (sample-10BT)   | `FineWebEduTextDataModule`       | `HuggingFaceFW/fineweb-edu`                   |
@@ -53,21 +52,21 @@ batch 128 × seq 512). Best real run bolded per task; `gpt2` is a reference ceil
 `mix` = per-source share of the training pool (sampling weight = per-source token cap);
 source `id`s are defined in Datasets above.
 
-| run    | steps | mix                               | blimp     | lambada   | piqa      | sciq      | arc_easy  |
-|--------|-------|-----------------------------------|-----------|-----------|-----------|-----------|-----------|
-| vwn+mhc| 5k    | curric + VWN(2,3) 1.5× + mHC-Lite | **71.01** | **18.36** | 56.31     | 67.80     | **35.35** |
-| curric | 5k    | qa-mix, sc30, cosine LR, cos20→40 | 69.86     | 17.47     | 56.47     | **68.10** | 35.23     |
-| sc30   | 5k    | qa-mix + logit softcap 30         | 69.18     | 16.86     | 55.93     | 67.70     | 34.93     |
-| qa-mix | 5k    | cos30 fw34 ts30 gq5 sq1 +doc      | 69.53     | 17.27     | 57.24     | 67.40     | 34.76     |
-| cos    | 5k    | cos30 fw40 ts30                   | 70.09     | 16.94     | 55.44     | 54.50     | 33.96     |
-| 3-way  | 5k    | str30 fw40 ts30                   | 68.66     | 15.54     | 56.37     | 54.80     | 34.55     |
-| 4-way  | 5k    | tt30 str30 fw25 ts15              | 67.63     | 16.01     | **57.29** | 55.80     | 34.34     |
-| 5-way  | 5k    | tt30 str25 fw20 ts15 wt10         | 67.94     | 16.11     | 56.42     | 55.30     | 34.89     |
-| tt+ts  | 5k    | tt50 ts50                         | 65.03     | 12.59     | 56.53     | 54.70     | 31.99     |
-| tt     | 5k    | tt100                             | 63.72     | 6.95      | 56.96     | 55.10     | 33.63     |
-| ts     | 5k    | ts100                             | 62.93     | 10.87     | 52.34     | 27.40     | 26.94     |
-| chance | —     | —                                 | 50.0      | 0.0       | 50.0      | 25.0      | 25.0      |
-| gpt2   | —     | — (124M ref)                      | 82.29     | 32.16     | 62.62     | 64.40     | 39.52     |
+| run     | steps | mix                               | blimp     | lambada   | piqa      | sciq      | arc_easy  |
+| ------- | ----- | --------------------------------- | --------- | --------- | --------- | --------- | --------- |
+| vwn+mhc | 5k    | curric + VWN(2,3) 1.5× + mHC-Lite | **71.01** | **18.36** | 56.31     | 67.80     | **35.35** |
+| curric  | 5k    | qa-mix, sc30, cosine LR, cos20→40 | 69.86     | 17.47     | 56.47     | **68.10** | 35.23     |
+| sc30    | 5k    | qa-mix + logit softcap 30         | 69.18     | 16.86     | 55.93     | 67.70     | 34.93     |
+| qa-mix  | 5k    | cos30 fw34 ts30 gq5 sq1 +doc      | 69.53     | 17.27     | 57.24     | 67.40     | 34.76     |
+| cos     | 5k    | cos30 fw40 ts30                   | 70.09     | 16.94     | 55.44     | 54.50     | 33.96     |
+| 3-way   | 5k    | str30 fw40 ts30                   | 68.66     | 15.54     | 56.37     | 54.80     | 34.55     |
+| 4-way   | 5k    | tt30 str30 fw25 ts15              | 67.63     | 16.01     | **57.29** | 55.80     | 34.34     |
+| 5-way   | 5k    | tt30 str25 fw20 ts15 wt10         | 67.94     | 16.11     | 56.42     | 55.30     | 34.89     |
+| tt+ts   | 5k    | tt50 ts50                         | 65.03     | 12.59     | 56.53     | 54.70     | 31.99     |
+| tt      | 5k    | tt100                             | 63.72     | 6.95      | 56.96     | 55.10     | 33.63     |
+| ts      | 5k    | ts100                             | 62.93     | 10.87     | 52.34     | 27.40     | 26.94     |
+| chance  | —     | —                                 | 50.0      | 0.0       | 50.0      | 25.0      | 25.0      |
+| gpt2    | —     | — (124M ref)                      | 82.29     | 32.16     | 62.62     | 64.40     | 39.52     |
 
 5-way stderr: blimp 0.16, lambada 0.51, piqa 1.16, sciq 1.57, arc_easy 0.98.
 
@@ -132,6 +131,34 @@ the ~13% eval overhead. Run log:
 
 ## TODO
 
+- **Expand the continued-pretraining sources for the assistant target.** Add filtered
+  Dolma Stack Exchange for natural question/explanation structure and a
+  Wikipedia/Wikibooks slice for clean expository and long-document text. During late
+  pretraining, introduce only 1–3% high-rated English OASST1 or filtered UltraChat
+  rendered as full-token ChatML; SFT remains responsible for assistant-only behavior.
+  Mix by tokens, audit overlap with evaluation data, and retain per-source validation
+  metrics. See the project-level [training roadmap](../README.md#training-roadmap).
+- **Add an 8192-token context-extension stage.** Length-bucket long FineWeb/reference
+  documents and complete grounded conversations, train with batches of roughly 8–16,
+  and retain short-context examples to measure and prevent capability regression.
+- **Broaden the zero-shot benchmark suite.** Add `hellaswag` (`acc_norm`) for
+  contextual continuation/commonsense, `boolq` for passage comprehension, and
+  `winogrande` for coreference/commonsense. These are all loglikelihood-ranking tasks
+  and fit the existing `ChimeraLM` adapter. Use a fixed deterministic HellaSwag subset
+  for cheap in-training curves and the full validation set for final checkpoints.
+- **Add prompt-robustness diagnostics.** Score the same SciQ, ARC-Easy, and BoolQ
+  examples under 2–3 semantically equivalent prompt templates; report mean accuracy
+  and the range across templates. The qa-mix SciQ jump shows that the current headline
+  score partly measures exposure to `Question:/Answer:` formatting, so this should
+  separate format transfer from knowledge/reasoning gains.
+- **Add external held-out LM evaluation.** Implement `ChimeraLM.loglikelihood_rolling`
+  and periodically report WikiText-2 bits per byte (plus its standard perplexity
+  metrics) on final checkpoints. Keep the existing fixed Tiny Textbooks BPB for fast
+  in-training comparisons.
+- **Defer poorly calibrated additions for now.** MMLU and ARC-Challenge will likely be
+  dominated by chance noise at 6M parameters; OpenBookQA overlaps SciQ/ARC-Easy; GSM8K
+  needs generation support; and TruthfulQA is a poor fit for the model size and
+  512-token context.
 - **Standardize the tokenizer before trusting cross-mix rankings (circle back).**
   Every Results row retrained its own 16k vocab on that run's mixture, so mix-to-mix
   deltas — including the `cos`-vs-`str` blimp/lambada gap that currently crowns `cos` —

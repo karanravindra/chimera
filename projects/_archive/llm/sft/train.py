@@ -50,10 +50,15 @@ def parse_args():
     p.add_argument("--data-dir", default="/mnt/ai/data")
     p.add_argument("--run-dir", default="/mnt/ai/runs/llm/sft")
     # SFT mixture built by build_mixture.py --sft (masked ids)
-    p.add_argument("--mix", default="sft_smoke", help="SFT mixture name under llm-mix/mix_sft/")
-    p.add_argument("--tokenizer", default="LiquidAI/LFM2.5-230M",
-                   help="tokenizer: HF hub id or local path (train_tokenizer.py output). "
-                        "Must match the one the SFT mix was tokenized with.")
+    p.add_argument(
+        "--mix", default="sft_smoke", help="SFT mixture name under llm-mix/mix_sft/"
+    )
+    p.add_argument(
+        "--tokenizer",
+        default="LiquidAI/LFM2.5-230M",
+        help="tokenizer: HF hub id or local path (train_tokenizer.py output). "
+        "Must match the one the SFT mix was tokenized with.",
+    )
     # Base checkpoint from the pretrain stage. None = random init (smoke tests
     # only -- an un-pretrained model produces gibberish chat).
     p.add_argument("--init-ckpt", default=None)
@@ -106,7 +111,9 @@ def parse_args():
     p.add_argument("--route-scale", type=float, default=1.0)
     p.add_argument("--bias-update-speed", type=float, default=0.001)
     p.add_argument("--no-scheduler", dest="use_scheduler", action="store_false")
-    p.add_argument("--grad-checkpoint", dest="gradient_checkpointing", action="store_true")
+    p.add_argument(
+        "--grad-checkpoint", dest="gradient_checkpointing", action="store_true"
+    )
     p.add_argument("--no-tie-embedding", dest="tie_embedding", action="store_false")
     p.add_argument("--no-compile", dest="compile", action="store_false")
     p.add_argument("--no-cce", dest="use_cce", action="store_false")
@@ -114,7 +121,10 @@ def parse_args():
     # Sample chat generations printed + logged after training (a quick
     # qualitative check; the zero-shot bench suite is a base-model measure and
     # doesn't apply here).
-    p.add_argument("--sample-prompts", default="What is photosynthesis?|Write a haiku about the ocean.")
+    p.add_argument(
+        "--sample-prompts",
+        default="What is photosynthesis?|Write a haiku about the ocean.",
+    )
     p.add_argument("--sample-max-new-tokens", type=int, default=128)
     p.add_argument("--no-sample", dest="run_sample", action="store_false")
     return p.parse_args()
@@ -150,7 +160,7 @@ def load_base_checkpoint(model: GPT, ckpt_path: str) -> None:
     for k, v in state_dict.items():
         for prefix in ("model.", "_orig_mod."):
             if k.startswith(prefix):
-                k = k[len(prefix):]
+                k = k[len(prefix) :]
         cleaned[k] = v
     model.load_state_dict(cleaned, strict=True)
     print(f"loaded base checkpoint {ckpt_path} (global_step={ckpt.get('global_step')})")
@@ -164,7 +174,7 @@ def sample_chats(model, dm, prompts, max_new_tokens, device):
     for prompt in prompts:
         ids = dm.render_prompt([{"role": "user", "content": prompt}])
         idx = torch.tensor([ids], dtype=torch.long, device=device)
-        out = model.generate(idx, max_new_tokens=max_new_tokens)[0, len(ids):].tolist()
+        out = model.generate(idx, max_new_tokens=max_new_tokens)[0, len(ids) :].tolist()
         if dm.im_end_id in out:  # trim at the assistant's end-of-turn token
             out = out[: out.index(dm.im_end_id)]
         replies.append(dm.decode(out))
@@ -205,9 +215,13 @@ def main():
     dm.setup("fit")
     train_loader = dm.train_dataloader()
     val_loader = dm.val_dataloader()
-    print(f"sft mixture={args.mix}  tokenizer={dm.pretrained_id}  vocab_size={dm.vocab_size}")
+    print(
+        f"sft mixture={args.mix}  tokenizer={dm.pretrained_id}  vocab_size={dm.vocab_size}"
+    )
     if dm.manifest:
-        srcs = ", ".join(f"{r['key']}:{r['renorm_weight']:.2f}" for r in dm.manifest["sources"])
+        srcs = ", ".join(
+            f"{r['key']}:{r['renorm_weight']:.2f}" for r in dm.manifest["sources"]
+        )
         print(f"sft sources -> {srcs}")
 
     model = GPT(
@@ -277,6 +291,7 @@ def main():
     # bpb logging alongside bpt. SFT loss averages over supervised (assistant)
     # tokens only, so bpb is normalized by supervised bytes/token (mask-aware).
     import sys as _sys
+
     _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "gpt"))
     from bpb import bytes_per_token_cached
 
@@ -285,7 +300,10 @@ def main():
     )
     print(f"bytes/supervised-token={bytes_per_token:.4f} (<stage>/bpb = bpt / this)")
     lm_module = LanguageModelModule(
-        model, optimizer, scheduler, use_cce=args.use_cce,
+        model,
+        optimizer,
+        scheduler,
+        use_cce=args.use_cce,
         bytes_per_token=bytes_per_token,
     )
 

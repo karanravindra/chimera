@@ -50,18 +50,21 @@ SAMPLE_PROMPTS = [
 # Random-chance baselines (percent) for accuracy metrics, so a number reads
 # against "better than guessing" at a glance.
 CHANCE = {
-    "blimp": 50.0,            # 2-way minimal pairs
-    "lambada_openai": 0.0,    # exact last-word match
-    "piqa": 50.0,             # 2-way
-    "sciq": 25.0,             # 4-way
-    "arc_easy": 25.0,         # ~4-way
+    "blimp": 50.0,  # 2-way minimal pairs
+    "lambada_openai": 0.0,  # exact last-word match
+    "piqa": 50.0,  # 2-way
+    "sciq": 25.0,  # 4-way
+    "arc_easy": 25.0,  # ~4-way
 }
 PPL_METRICS = {"perplexity", "word_perplexity", "byte_perplexity", "bits_per_byte"}
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--ckpt", default="/mnt/ai/runs/tiny-llm/gpt/smoke-small-8k/checkpoints/gpt.ckpt")
+    p.add_argument(
+        "--ckpt",
+        default="/mnt/ai/runs/tiny-llm/gpt/smoke-small-8k/checkpoints/gpt.ckpt",
+    )
     p.add_argument("--out-dir", default="/mnt/ai/runs/tiny-llm/gpt/eval")
     p.add_argument("--tasks", default=",".join(DEFAULT_TASKS))
     p.add_argument("--tokenizer-id", default="/mnt/ai/data/tiny-llm/tokenizer/8k")
@@ -74,14 +77,24 @@ def parse_args():
     p.add_argument("--n-layer", type=int, default=6)
     p.add_argument("--mup-base-width", type=int, default=256)
     p.add_argument("--batch-tokens", type=int, default=32768)
-    p.add_argument("--limit", type=int, default=None, help="cap examples per task (smoke)")
+    p.add_argument(
+        "--limit", type=int, default=None, help="cap examples per task (smoke)"
+    )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     # Backfill: log to an EXISTING wandb run (e.g. a training run that skipped eval).
-    p.add_argument("--wandb-id", default=None, help="existing wandb run id to backfill into")
+    p.add_argument(
+        "--wandb-id", default=None, help="existing wandb run id to backfill into"
+    )
     p.add_argument("--wandb-project", default="tiny-llm-pretrain")
-    p.add_argument("--gen", action="store_true", help="also sample + log test/generations")
-    p.add_argument("--no-bench", dest="bench", action="store_false",
-                   help="skip the benchmark suite (e.g. generations-only backfill)")
+    p.add_argument(
+        "--gen", action="store_true", help="also sample + log test/generations"
+    )
+    p.add_argument(
+        "--no-bench",
+        dest="bench",
+        action="store_false",
+        help="skip the benchmark suite (e.g. generations-only backfill)",
+    )
     return p.parse_args()
 
 
@@ -101,7 +114,9 @@ def load_model(args, vocab_size: int) -> GPT:
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     prefix = "model._orig_mod."  # Lightning + torch.compile prefix
     state_dict = {
-        k[len(prefix):]: v for k, v in ckpt["state_dict"].items() if k.startswith(prefix)
+        k[len(prefix) :]: v
+        for k, v in ckpt["state_dict"].items()
+        if k.startswith(prefix)
     }
     model.load_state_dict(state_dict)
     model.to(args.device).eval()
@@ -111,8 +126,14 @@ def load_model(args, vocab_size: int) -> GPT:
 class ChimeraLM(TemplateLM):
     """Minimal lm-eval adapter around ``chimera.models.GPT`` for loglikelihood tasks."""
 
-    def __init__(self, model: GPT, tokenizer: BPETokenizer, block_size: int,
-                 batch_tokens: int, device: str):
+    def __init__(
+        self,
+        model: GPT,
+        tokenizer: BPETokenizer,
+        block_size: int,
+        batch_tokens: int,
+        device: str,
+    ):
         super().__init__()
         self.model = model
         self.tokenizer = tokenizer
@@ -130,7 +151,9 @@ class ChimeraLM(TemplateLM):
 
     def tok_encode(self, string, add_special_tokens: bool = False, **kwargs):
         # add_special_tokens=False matches training-time tokenization.
-        return self.tokenizer._tok.encode(string, add_special_tokens=add_special_tokens).ids
+        return self.tokenizer._tok.encode(
+            string, add_special_tokens=add_special_tokens
+        ).ids
 
     def loglikelihood(self, requests, disable_tqdm=False):
         new_reqs = self._encode_pairs_cached([req.args for req in requests])
@@ -145,13 +168,19 @@ class ChimeraLM(TemplateLM):
         # a few common tokens: 4k/8k/16k share their low-id common tokens, so a short
         # fingerprint collides across vocab sizes -> one vocab's cached token ids get
         # fed to another model's embedding -> out-of-range index / device-side assert.
-        fp = (self.tokenizer._tok.get_vocab_size(),
-              hashlib.md5(self.tokenizer._tok.to_str().encode()).hexdigest())
+        fp = (
+            self.tokenizer._tok.get_vocab_size(),
+            hashlib.md5(self.tokenizer._tok.to_str().encode()).hexdigest(),
+        )
         h = hashlib.md5(f"{version}|{fp}|{len(pairs)}".encode())
         for ctx, cont in pairs:
-            h.update(ctx.encode("utf-8")); h.update(b"\x00")
-            h.update(cont.encode("utf-8")); h.update(b"\x01")
-        cache_dir = Path(os.environ.get("LM_HARNESS_CACHE_PATH", "/mnt/ai/data/lm_eval_cache"))
+            h.update(ctx.encode("utf-8"))
+            h.update(b"\x00")
+            h.update(cont.encode("utf-8"))
+            h.update(b"\x01")
+        cache_dir = Path(
+            os.environ.get("LM_HARNESS_CACHE_PATH", "/mnt/ai/data/lm_eval_cache")
+        )
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_file = cache_dir / f"chimera-tokcache-{h.hexdigest()}.pkl"
         if cache_file.exists():
@@ -159,7 +188,9 @@ class ChimeraLM(TemplateLM):
             return pickle.loads(cache_file.read_bytes())
         new_reqs = self._encode_pairs_batched(pairs)
         cache_file.write_bytes(pickle.dumps(new_reqs))
-        print(f"[bench] pretokenized + cached {len(pairs)} eval inputs -> {cache_file.name}")
+        print(
+            f"[bench] pretokenized + cached {len(pairs)} eval inputs -> {cache_file.name}"
+        )
         return new_reqs
 
     def _encode_pairs_batched(self, pairs):
@@ -176,8 +207,16 @@ class ChimeraLM(TemplateLM):
             shifted.append((context, continuation, False))
             ctxs.append(context)
             wholes.append(context + continuation)
-        whole_encs = [e.ids for e in enc.encode_batch(wholes, add_special_tokens=False)] if wholes else []
-        ctx_encs = [e.ids for e in enc.encode_batch(ctxs, add_special_tokens=False)] if ctxs else []
+        whole_encs = (
+            [e.ids for e in enc.encode_batch(wholes, add_special_tokens=False)]
+            if wholes
+            else []
+        )
+        ctx_encs = (
+            [e.ids for e in enc.encode_batch(ctxs, add_special_tokens=False)]
+            if ctxs
+            else []
+        )
 
         new_reqs = []
         j = 0
@@ -191,7 +230,7 @@ class ChimeraLM(TemplateLM):
                 new_reqs.append((("", continuation), context_enc, continuation_enc))
                 continue
             context_enc = ctx_encs[j]
-            continuation_enc = whole_encs[j][len(context_enc):]
+            continuation_enc = whole_encs[j][len(context_enc) :]
             new_reqs.append(((context, continuation), context_enc, continuation_enc))
             j += 1
         return new_reqs
@@ -207,11 +246,13 @@ class ChimeraLM(TemplateLM):
         for idx, (_, context_enc, continuation_enc) in enumerate(requests):
             whole = list(context_enc) + list(continuation_enc)
             if len(whole) > self.block_size + 1:
-                whole = whole[-(self.block_size + 1):]  # left-truncate context only
+                whole = whole[-(self.block_size + 1) :]  # left-truncate context only
             inp = whole[:-1]
             prepared.append((idx, inp, continuation_enc))
 
-        prepared.sort(key=lambda x: len(x[1]), reverse=True)  # largest first -> OOM early
+        prepared.sort(
+            key=lambda x: len(x[1]), reverse=True
+        )  # largest first -> OOM early
 
         results = [None] * len(requests)
         from tqdm import tqdm
@@ -235,13 +276,17 @@ class ChimeraLM(TemplateLM):
     @torch.inference_mode()
     def _score_batch(self, batch, results):
         max_len = max(len(inp) for _, inp, _ in batch)
-        input_ids = torch.full((len(batch), max_len), self.eot_token_id, dtype=torch.long)
+        input_ids = torch.full(
+            (len(batch), max_len), self.eot_token_id, dtype=torch.long
+        )
         for i, (_, inp, _) in enumerate(batch):
             input_ids[i, : len(inp)] = torch.tensor(inp, dtype=torch.long)
         input_ids = input_ids.to(self._device)
 
         autocast_enabled = self._device.startswith("cuda")
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled
+        ):
             hidden = self.model(input_ids, return_hidden=True)  # (B, L, C)
             slices, meta = [], []
             for i, (idx, inp, continuation_enc) in enumerate(batch):
@@ -249,7 +294,9 @@ class ChimeraLM(TemplateLM):
                 cont_start = len(inp) - cont_len
                 slices.append(hidden[i, cont_start : cont_start + cont_len, :])
                 meta.append((idx, continuation_enc))
-            flat_hidden = torch.cat(slices, dim=0)  # never materializes full (B,L,V) logits
+            flat_hidden = torch.cat(
+                slices, dim=0
+            )  # never materializes full (B,L,V) logits
             logits = self.model.project(flat_hidden)
 
         log_probs = F.log_softmax(logits.float(), dim=-1)
@@ -266,9 +313,16 @@ class ChimeraLM(TemplateLM):
 
 
 @torch.inference_mode()
-def generate_rows(model, tokenizer, device, prompts=SAMPLE_PROMPTS,
-                  max_new_tokens=80, temperature=0.8,
-                  repetition_penalty=1.3, min_p=0.05):
+def generate_rows(
+    model,
+    tokenizer,
+    device,
+    prompts=SAMPLE_PROMPTS,
+    max_new_tokens=80,
+    temperature=0.8,
+    repetition_penalty=1.3,
+    min_p=0.05,
+):
     """Sample continuations from fixed prompts -> [[prompt, generation], ...].
 
     Defaults match train.py's log_generations (repetition_penalty + min_p) so
@@ -278,9 +332,14 @@ def generate_rows(model, tokenizer, device, prompts=SAMPLE_PROMPTS,
     for p in prompts:
         ids = tokenizer._tok.encode(p, add_special_tokens=False).ids
         x = torch.tensor([ids], dtype=torch.long, device=device)
-        out = model.generate(x, max_new_tokens=max_new_tokens, temperature=temperature,
-                             repetition_penalty=repetition_penalty, min_p=min_p)
-        rows.append([p, tokenizer.decode(out[0].tolist()[len(ids):])])
+        out = model.generate(
+            x,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
+            min_p=min_p,
+        )
+        rows.append([p, tokenizer.decode(out[0].tolist()[len(ids) :])])
     return rows
 
 
@@ -318,7 +377,11 @@ def iter_metrics(results_by_task: dict):
     for task, metrics in sorted(results_by_task.items()):
         for key, val in metrics.items():
             metric_name = key.split(",")[0]
-            if metric_name in skip_metrics or not isinstance(val, (int, float)) or "_stderr" in key:
+            if (
+                metric_name in skip_metrics
+                or not isinstance(val, (int, float))
+                or "_stderr" in key
+            ):
                 continue
             filt = key.split(",", 1)[1] if "," in key else "none"
             stderr = metrics.get(f"{metric_name}_stderr,{filt}")
@@ -343,7 +406,9 @@ def headline_metrics(results_by_task: dict, tasks: list[str] | None):
     for task, metric, val, stderr in iter_metrics(results_by_task):
         if keep is not None and task not in keep:
             continue
-        rank = _METRIC_PREF.index(metric) if metric in _METRIC_PREF else len(_METRIC_PREF)
+        rank = (
+            _METRIC_PREF.index(metric) if metric in _METRIC_PREF else len(_METRIC_PREF)
+        )
         cur = best.get(task)
         if cur is None or rank < cur[0]:
             best[task] = (rank, metric, val, stderr)
@@ -352,8 +417,11 @@ def headline_metrics(results_by_task: dict, tasks: list[str] | None):
 
 def print_table(results_by_task: dict, tasks: list[str] | None = None):
     """Print the headline metric per task. ``tasks=None`` prints every metric."""
-    rows = (headline_metrics(results_by_task, tasks) if tasks is not None
-            else list(iter_metrics(results_by_task)))
+    rows = (
+        headline_metrics(results_by_task, tasks)
+        if tasks is not None
+        else list(iter_metrics(results_by_task))
+    )
     header = f"| {'task':<16} | {'metric':<10} | {'value':>7} | {'stderr':>7} | {'chance':>7} |"
     print(header)
     print("|" + "-" * (len(header) - 2) + "|")
@@ -361,18 +429,28 @@ def print_table(results_by_task: dict, tasks: list[str] | None = None):
         is_ppl = metric_name in PPL_METRICS
         chance = None if is_ppl else CHANCE.get(task)
         val_s = f"{val:.2f}" if is_ppl else f"{val * 100:.2f}"
-        stderr_s = "-" if stderr is None else (f"{stderr:.2f}" if is_ppl else f"{stderr * 100:.2f}")
+        stderr_s = (
+            "-"
+            if stderr is None
+            else (f"{stderr:.2f}" if is_ppl else f"{stderr * 100:.2f}")
+        )
         chance_s = "-" if chance is None else f"{chance:.1f}"
-        print(f"| {task:<16} | {metric_name:<10} | {val_s:>7} | {stderr_s:>7} | {chance_s:>7} |")
+        print(
+            f"| {task:<16} | {metric_name:<10} | {val_s:>7} | {stderr_s:>7} | {chance_s:>7} |"
+        )
 
 
-def flatten_for_wandb(results_by_task: dict, tasks: list[str] | None = None,
-                      prefix: str = "test") -> dict[str, float]:
+def flatten_for_wandb(
+    results_by_task: dict, tasks: list[str] | None = None, prefix: str = "test"
+) -> dict[str, float]:
     """Flatten to ``{"test/<task>/<metric>": value}`` — ONE headline metric per
     requested task (pass ``tasks`` to collapse BLiMP's subtasks + drop secondary
     metrics; ``None`` keeps every metric, the old behavior)."""
-    rows = (headline_metrics(results_by_task, tasks) if tasks is not None
-            else list(iter_metrics(results_by_task)))
+    rows = (
+        headline_metrics(results_by_task, tasks)
+        if tasks is not None
+        else list(iter_metrics(results_by_task))
+    )
     return {f"{prefix}/{task}/{metric_name}": val for task, metric_name, val, _ in rows}
 
 
@@ -387,11 +465,19 @@ def main():
     results = None
     if args.bench:
         results = run_benchmarks(
-            model, tokenizer, tasks, args.block_size, args.batch_tokens, args.device, args.limit
+            model,
+            tokenizer,
+            tasks,
+            args.block_size,
+            args.batch_tokens,
+            args.device,
+            args.limit,
         )
         out_dir = Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "results.json").write_text(json.dumps(results, indent=2, default=str))
+        (out_dir / "results.json").write_text(
+            json.dumps(results, indent=2, default=str)
+        )
         print(f"saved results to {out_dir / 'results.json'}")
         print_table(results, tasks=tasks)  # headline per task (full detail in json)
 
@@ -404,15 +490,25 @@ def main():
 
     if args.wandb_id:
         import wandb
+
         run = wandb.init(project=args.wandb_project, id=args.wandb_id, resume="must")
         if results is not None:
             metrics = flatten_for_wandb(results, tasks=tasks)
             run.log(metrics)
-            print(f"backfilled {len(metrics)} benchmark metrics into wandb run {args.wandb_id}")
+            print(
+                f"backfilled {len(metrics)} benchmark metrics into wandb run {args.wandb_id}"
+            )
         if gen_rows is not None:
-            run.log({"test/generations":
-                     wandb.Table(columns=["prompt", "generation"], data=gen_rows)})
-            print(f"backfilled test/generations ({len(gen_rows)} prompts) into {args.wandb_id}")
+            run.log(
+                {
+                    "test/generations": wandb.Table(
+                        columns=["prompt", "generation"], data=gen_rows
+                    )
+                }
+            )
+            print(
+                f"backfilled test/generations ({len(gen_rows)} prompts) into {args.wandb_id}"
+            )
         run.finish()
 
 

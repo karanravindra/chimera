@@ -11,16 +11,22 @@ class RotaryEmbedding(nn.Module):
 
     def __init__(self, head_dim: int, base: float = 10000.0):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     @torch.no_grad()
-    def forward(self, offset: int, seq_len: int, device, pos_ids: torch.Tensor | None = None):
+    def forward(
+        self, offset: int, seq_len: int, device, pos_ids: torch.Tensor | None = None
+    ):
         # pos_ids overrides the contiguous offset..offset+seq_len positions with explicit
         # per-token positions, e.g. (B, T) ids that restart at 0 on each packed-document
         # boundary. cos/sin then come back with matching leading dims.
         if pos_ids is None:
-            pos = torch.arange(offset, offset + seq_len, device=device, dtype=torch.float32)
+            pos = torch.arange(
+                offset, offset + seq_len, device=device, dtype=torch.float32
+            )
         else:
             pos = pos_ids.to(torch.float32)
         freqs = pos[..., None] * self.inv_freq  # (..., T, head_dim / 2)

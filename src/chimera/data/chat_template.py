@@ -70,10 +70,13 @@ def decode_unicode_escapes(text: str) -> str:
 
     def _dec(m: re.Match) -> str:
         seq = m.group(0)
-        units = bytes.fromhex("".join(seq[i + 2 : i + 6] for i in range(0, len(seq), 6)))
+        units = bytes.fromhex(
+            "".join(seq[i + 2 : i + 6] for i in range(0, len(seq), 6))
+        )
         return units.decode("utf-16-be", errors="replace")
 
     return _UNICODE_ESCAPE_RUN.sub(_dec, text)
+
 
 # --------------------------------------------------------------------------- #
 # Special tokens (order fixed: structural first -> low, stable ids)
@@ -94,21 +97,36 @@ TOOL_RESPONSE_END = "</tool_response>"
 # BPETokenizer._train_hf). Structural markers first so their ids are the lowest
 # and most stable; semantic markers next.
 SPECIAL_TOKENS: list[str] = [
-    EOS, BOS, PAD, IM_START, IM_END,
-    THINK_START, THINK_END,
-    TOOL_CALL_START, TOOL_CALL_END,
-    TOOL_RESPONSE_START, TOOL_RESPONSE_END,
+    EOS,
+    BOS,
+    PAD,
+    IM_START,
+    IM_END,
+    THINK_START,
+    THINK_END,
+    TOOL_CALL_START,
+    TOOL_CALL_END,
+    TOOL_RESPONSE_START,
+    TOOL_RESPONSE_END,
 ]
 
 # roles the model itself produces -> supervised at SFT time
 ASSISTANT_ROLES = {"assistant", "gpt", "function_call", "model", "chatbot"}
 # normalize source-specific role names to canonical ChatML roles
 ROLE_MAP = {
-    "human": "user", "user": "user", "prompter": "user",
-    "gpt": "assistant", "assistant": "assistant", "model": "assistant",
-    "chatbot": "assistant", "function_call": "assistant",
-    "observation": "tool", "tool": "tool", "ipython": "tool",
-    "tool_response": "tool", "function_response": "tool",
+    "human": "user",
+    "user": "user",
+    "prompter": "user",
+    "gpt": "assistant",
+    "assistant": "assistant",
+    "model": "assistant",
+    "chatbot": "assistant",
+    "function_call": "assistant",
+    "observation": "tool",
+    "tool": "tool",
+    "ipython": "tool",
+    "tool_response": "tool",
+    "function_response": "tool",
     "system": "system",
 }
 
@@ -150,8 +168,9 @@ def _coerce_tool_calls(msg: dict) -> list[dict]:
     if fc:
         fc = _as_obj(fc)
         if isinstance(fc, dict) and fc.get("name"):
-            calls.append({"name": fc["name"],
-                          "arguments": _as_obj(fc.get("arguments", {}))})
+            calls.append(
+                {"name": fc["name"], "arguments": _as_obj(fc.get("arguments", {}))}
+            )
     return calls
 
 
@@ -186,7 +205,9 @@ def normalize_messages(raw: Iterable[dict]) -> list[dict]:
                 thinking, content = _split_thinking(content)
                 turn["content"] = content
             if thinking:
-                turn["thinking"] = thinking.strip() if isinstance(thinking, str) else thinking
+                turn["thinking"] = (
+                    thinking.strip() if isinstance(thinking, str) else thinking
+                )
             calls = _coerce_tool_calls(m)
             if calls:
                 turn["tool_calls"] = calls
@@ -201,7 +222,9 @@ def _tool_call_block(calls: list[dict]) -> str:
     out = []
     for c in calls:
         payload = {"name": c["name"], "arguments": c.get("arguments", {})}
-        out.append(f"{TOOL_CALL_START}\n{json.dumps(payload, ensure_ascii=False)}\n{TOOL_CALL_END}")
+        out.append(
+            f"{TOOL_CALL_START}\n{json.dumps(payload, ensure_ascii=False)}\n{TOOL_CALL_END}"
+        )
     return "\n".join(out)
 
 
@@ -211,13 +234,21 @@ def _system_text(system: Optional[str], tools) -> Optional[str]:
     if system:
         parts.append(system.strip())
     if tools:
-        tools_json = decode_unicode_escapes(tools) if isinstance(tools, str) else json.dumps(tools, ensure_ascii=False)
+        tools_json = (
+            decode_unicode_escapes(tools)
+            if isinstance(tools, str)
+            else json.dumps(tools, ensure_ascii=False)
+        )
         parts.append(f"# Tools\n<tools>\n{tools_json}\n</tools>")
     return "\n\n".join(parts) if parts else None
 
 
-def iter_segments(messages: list[dict], tools=None, system: Optional[str] = None,
-                  add_generation_prompt: bool = False) -> list[tuple[str, bool]]:
+def iter_segments(
+    messages: list[dict],
+    tools=None,
+    system: Optional[str] = None,
+    add_generation_prompt: bool = False,
+) -> list[tuple[str, bool]]:
     """Yield (text, supervised) segments for a normalized conversation.
 
     ``supervised`` marks the assistant's own output (its think block, content,
@@ -238,7 +269,9 @@ def iter_segments(messages: list[dict], tools=None, system: Optional[str] = None
         segs.append((f"{IM_START}{role}\n", False))  # header, never supervised
         sup = role == "assistant"
         if role == "tool":
-            segs.append((f"{TOOL_RESPONSE_START}\n{m['content']}\n{TOOL_RESPONSE_END}", False))
+            segs.append(
+                (f"{TOOL_RESPONSE_START}\n{m['content']}\n{TOOL_RESPONSE_END}", False)
+            )
         elif role == "assistant":
             if m.get("thinking"):
                 segs.append((f"{THINK_START}\n{m['thinking']}\n{THINK_END}\n", True))
@@ -249,7 +282,7 @@ def iter_segments(messages: list[dict], tools=None, system: Optional[str] = None
                 segs.append((sep + _tool_call_block(m["tool_calls"]), True))
         else:
             segs.append((m["content"], False))
-        segs.append((IM_END, sup))   # supervise the stop token on assistant turns
+        segs.append((IM_END, sup))  # supervise the stop token on assistant turns
         segs.append(("\n", False))
 
     if add_generation_prompt:
@@ -260,12 +293,24 @@ def iter_segments(messages: list[dict], tools=None, system: Optional[str] = None
 def render(messages, tools=None, system=None, add_generation_prompt=False) -> str:
     """Render a (possibly raw) conversation to canonical ChatML text."""
     norm = normalize_messages(messages)
-    return "".join(t for t, _ in iter_segments(
-        norm, tools=tools, system=system, add_generation_prompt=add_generation_prompt))
+    return "".join(
+        t
+        for t, _ in iter_segments(
+            norm,
+            tools=tools,
+            system=system,
+            add_generation_prompt=add_generation_prompt,
+        )
+    )
 
 
-def render_masked(messages, encode: Callable[[str], list[int]], tools=None,
-                  system=None, eos_id: Optional[int] = None) -> tuple[list[int], list[int]]:
+def render_masked(
+    messages,
+    encode: Callable[[str], list[int]],
+    tools=None,
+    system=None,
+    eos_id: Optional[int] = None,
+) -> tuple[list[int], list[int]]:
     """Encode a conversation to (ids, mask); mask=1 on supervised (assistant) tokens.
 
     ``encode`` maps text -> token ids (special markers become their atomic ids if

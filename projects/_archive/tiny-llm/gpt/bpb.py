@@ -87,7 +87,9 @@ def measure(
     aggregate = agg_b / agg_t
 
     cache.setdefault(tokenizer_id, {})[mix_name] = {
-        "aggregate": aggregate, "per_source": per_source, "split": split,
+        "aggregate": aggregate,
+        "per_source": per_source,
+        "split": split,
     }
     cache_path.write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n")
     return aggregate, per_source
@@ -100,7 +102,9 @@ def main():
     p.add_argument("--data-dir", default="/mnt/ai/data")
     p.add_argument("--force", action="store_true")
     args = p.parse_args()
-    agg, per = measure(args.tokenizer, args.mix, data_dir=args.data_dir, force=args.force)
+    agg, per = measure(
+        args.tokenizer, args.mix, data_dir=args.data_dir, force=args.force
+    )
     print(f"tokenizer={args.tokenizer}  mix={args.mix}")
     print(f"aggregate bytes/token = {agg:.4f}")
     for k, v in per.items():

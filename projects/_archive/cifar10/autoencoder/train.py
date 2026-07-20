@@ -73,9 +73,7 @@ def main():
         monitor="val/loss",
         enable_version_counter=False,
     )
-    loggers = build_run_loggers(
-        run_dir, args.wandb_project, None, args.wandb_offline
-    )
+    loggers = build_run_loggers(run_dir, args.wandb_project, None, args.wandb_offline)
 
     trainer = Trainer(
         max_epochs=args.epochs,
@@ -87,7 +85,9 @@ def main():
         callbacks=[checkpoint],
     )
     trainer.fit(autoencoder_module, datamodule=dm)
-    trainer.test(autoencoder_module, datamodule=dm, ckpt_path=checkpoint.best_model_path)
+    trainer.test(
+        autoencoder_module, datamodule=dm, ckpt_path=checkpoint.best_model_path
+    )
     print("best checkpoint:", checkpoint.best_model_path)
 
 

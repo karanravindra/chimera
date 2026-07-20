@@ -166,7 +166,10 @@ class ChatSFTDataModule(pl.LightningDataModule):
 
         # int32 not int16: labels carry -100 alongside ids up to the vocab size
         data = torch.stack(
-            [torch.tensor(ids, dtype=torch.int32), torch.tensor(labels, dtype=torch.int32)]
+            [
+                torch.tensor(ids, dtype=torch.int32),
+                torch.tensor(labels, dtype=torch.int32),
+            ]
         )
         save_cached_ids(path, data)
         return data[0], data[1]

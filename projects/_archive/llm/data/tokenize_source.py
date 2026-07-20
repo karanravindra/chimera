@@ -148,8 +148,13 @@ class Writer:
 # --------------------------------------------------------------------------- #
 # Tokenize one source
 # --------------------------------------------------------------------------- #
-def tokenize_source(key: str, cap: int, s3_workers: int = 128, batch: int = 512,
-                    tokenizer: str = "LiquidAI/LFM2.5-230M"):
+def tokenize_source(
+    key: str,
+    cap: int,
+    s3_workers: int = 128,
+    batch: int = 512,
+    tokenizer: str = "LiquidAI/LFM2.5-230M",
+):
     src = S.get(key)
     out_dir = CACHE / key
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -182,7 +187,10 @@ def tokenize_source(key: str, cap: int, s3_workers: int = 128, batch: int = 512,
 
         def flush_rows():
             nonlocal n_docs
-            blobs = [(r.get("blob_id"), r.get("src_encoding") or "utf-8") for r in pending_rows]
+            blobs = [
+                (r.get("blob_id"), r.get("src_encoding") or "utf-8")
+                for r in pending_rows
+            ]
             texts = list(pool.map(lambda b: _safe_content(*b), blobs))
             texts = [t for t in texts if t]
             encode_texts(texts)
@@ -229,8 +237,10 @@ def tokenize_source(key: str, cap: int, s3_workers: int = 128, batch: int = 512,
         "seconds": round(time.time() - t0, 1),
     }
     meta_path.write_text(json.dumps(meta, indent=2))
-    print(f"[{key}] done: {w.n:,} tokens, {n_docs:,} docs, {meta['seconds']}s "
-          f"({w.n / max(meta['seconds'], 1e-9) / 1e6:.2f}M tok/s)")
+    print(
+        f"[{key}] done: {w.n:,} tokens, {n_docs:,} docs, {meta['seconds']}s "
+        f"({w.n / max(meta['seconds'], 1e-9) / 1e6:.2f}M tok/s)"
+    )
     return meta
 
 
@@ -249,22 +259,29 @@ def _render_row_masked(src, row, enc, eos_id):
     if src.kind == "openmath":
         prob = row.get("problem") or row.get("question") or ""
         sol = row.get("generated_solution") or row.get("solution") or ""
-        msgs = [{"role": "user", "content": prob},
-                {"role": "assistant", "content": sol}]
+        msgs = [
+            {"role": "user", "content": prob},
+            {"role": "assistant", "content": sol},
+        ]
         return ct.render_masked(msgs, encode=enc, eos_id=eos_id)
     conv = S._coerce_conv(row.get("conversations") or row.get("messages"))
     return ct.render_masked(conv, encode=enc, tools=row.get("tools"), eos_id=eos_id)
 
 
-def tokenize_source_sft(key: str, cap: int, batch: int = 256,
-                        tokenizer: str = "LiquidAI/LFM2.5-230M"):
+def tokenize_source_sft(
+    key: str, cap: int, batch: int = 256, tokenizer: str = "LiquidAI/LFM2.5-230M"
+):
     src = S.get(key)
     if src.kind not in ("chat", "openmath"):
         print(f"[{key}] kind={src.kind!r} is not an SFT source — skip")
         return None
     out_dir = CACHE_SFT / key
     out_dir.mkdir(parents=True, exist_ok=True)
-    ids_path, mask_path, meta_path = out_dir / "ids.bin", out_dir / "mask.bin", out_dir / "meta.json"
+    ids_path, mask_path, meta_path = (
+        out_dir / "ids.bin",
+        out_dir / "mask.bin",
+        out_dir / "meta.json",
+    )
     if meta_path.exists():
         meta = json.loads(meta_path.read_text())
         if meta.get("complete") and meta.get("n_tokens", 0) >= cap:
@@ -295,13 +312,21 @@ def tokenize_source_sft(key: str, cap: int, batch: int = 256,
     fi.close()
     fm.close()
     meta = {
-        "key": key, "n_tokens": n, "n_docs": n_docs, "dtype": "uint16",
-        "has_mask": True, "supervised_frac": round(n_sup / max(n, 1), 4),
-        "cap": cap, "complete": True, "seconds": round(time.time() - t0, 1),
+        "key": key,
+        "n_tokens": n,
+        "n_docs": n_docs,
+        "dtype": "uint16",
+        "has_mask": True,
+        "supervised_frac": round(n_sup / max(n, 1), 4),
+        "cap": cap,
+        "complete": True,
+        "seconds": round(time.time() - t0, 1),
     }
     meta_path.write_text(json.dumps(meta, indent=2))
-    print(f"[{key}] SFT done: {n:,} tokens ({meta['supervised_frac']:.1%} supervised), "
-          f"{n_docs:,} docs, {meta['seconds']}s")
+    print(
+        f"[{key}] SFT done: {n:,} tokens ({meta['supervised_frac']:.1%} supervised), "
+        f"{n_docs:,} docs, {meta['seconds']}s"
+    )
     return meta
 
 
@@ -316,6 +341,8 @@ def _progress(key, n, cap, n_docs, t0):
     dt = time.time() - t0
     rate = n / max(dt, 1e-9)
     eta = (cap - n) / max(rate, 1e-9)
-    print(f"[{key}] {n / 1e6:.1f}M/{cap / 1e6:.0f}M tok  {n_docs:,} docs  "
-          f"{rate / 1e6:.2f}M tok/s  eta {eta / 60:.1f}min", flush=True)
-
+    print(
+        f"[{key}] {n / 1e6:.1f}M/{cap / 1e6:.0f}M tok  {n_docs:,} docs  "
+        f"{rate / 1e6:.2f}M tok/s  eta {eta / 60:.1f}min",
+        flush=True,
+    )

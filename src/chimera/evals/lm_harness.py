@@ -73,7 +73,9 @@ class ChimeraLM(TemplateLM):
 
     def tok_encode(self, string, add_special_tokens=False, **kwargs):
         # add_special_tokens=False matches training-time tokenization.
-        return self.tokenizer._tok.encode(string, add_special_tokens=add_special_tokens).ids
+        return self.tokenizer._tok.encode(
+            string, add_special_tokens=add_special_tokens
+        ).ids
 
     def loglikelihood_rolling(self, requests, disable_tqdm=False):
         raise NotImplementedError("no configured task needs rolling loglikelihood")
@@ -90,7 +92,9 @@ class ChimeraLM(TemplateLM):
     def _encode_pairs_cached(self, pairs):
         # Key on the tokenizer + the exact (ctx, cont) pairs. Independent of model
         # weights, so it survives retraining: re-score, but never re-tokenize.
-        h = hashlib.md5(f"v2|bos={self._bos_id}|{self.tokenizer_name}|{len(pairs)}".encode())
+        h = hashlib.md5(
+            f"v2|bos={self._bos_id}|{self.tokenizer_name}|{len(pairs)}".encode()
+        )
         for ctx, cont in pairs:
             h.update(ctx.encode("utf-8"))
             h.update(b"\x00")
@@ -124,10 +128,14 @@ class ChimeraLM(TemplateLM):
             ctxs.append(context)
             wholes.append(context + continuation)
         whole_encs = (
-            [e.ids for e in enc.encode_batch(wholes, add_special_tokens=False)] if wholes else []
+            [e.ids for e in enc.encode_batch(wholes, add_special_tokens=False)]
+            if wholes
+            else []
         )
         ctx_encs = (
-            [e.ids for e in enc.encode_batch(ctxs, add_special_tokens=False)] if ctxs else []
+            [e.ids for e in enc.encode_batch(ctxs, add_special_tokens=False)]
+            if ctxs
+            else []
         )
 
         new_reqs = []
@@ -158,7 +166,9 @@ class ChimeraLM(TemplateLM):
             inp = whole[:-1]
             prepared.append((idx, inp, continuation_enc))
 
-        prepared.sort(key=lambda x: len(x[1]), reverse=True)  # largest first -> OOM early
+        prepared.sort(
+            key=lambda x: len(x[1]), reverse=True
+        )  # largest first -> OOM early
 
         results = [None] * len(requests)
         batch, batch_max_len = [], 0
@@ -182,7 +192,9 @@ class ChimeraLM(TemplateLM):
         max_len = max(len(inp) for _, inp, _ in batch)
         # Right-pad with eot: attention is causal, so pad tokens after the real content
         # never affect the continuation-position logits we read.
-        input_ids = torch.full((len(batch), max_len), self.eot_token_id, dtype=torch.long)
+        input_ids = torch.full(
+            (len(batch), max_len), self.eot_token_id, dtype=torch.long
+        )
         for i, (_, inp, _) in enumerate(batch):
             input_ids[i, : len(inp)] = torch.tensor(inp, dtype=torch.long)
         input_ids = input_ids.to(self._device)

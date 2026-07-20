@@ -36,10 +36,7 @@ class SQuADTextDataModule(HFTextDataModule):
     def _row_text(self, row) -> str:
         # single-row rendering (tokenizer-training sample path)
         answer = row["answers"]["text"][0]
-        return (
-            f"{row['context']}\n\n"
-            f"Question: {row['question']}\nAnswer: {answer}"
-        )
+        return f"{row['context']}\n\nQuestion: {row['question']}\nAnswer: {answer}"
 
     def iter_texts(self, ds, batch_size: int = 1024):
         """One document per passage: context + all its Q/A pairs.

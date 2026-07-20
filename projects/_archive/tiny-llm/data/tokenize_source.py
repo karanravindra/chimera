@@ -79,8 +79,9 @@ class Writer:
         self.f.close()
 
 
-def tokenize_source(key: str, cap: int, tokenizer: str, tok_tag: str,
-                    batch: int = 1024) -> dict:
+def tokenize_source(
+    key: str, cap: int, tokenizer: str, tok_tag: str, batch: int = 1024
+) -> dict:
     src = S.get(key)
     out_dir = TOK_ROOT / tok_tag / key
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -133,13 +134,21 @@ def tokenize_source(key: str, cap: int, tokenizer: str, tok_tag: str,
     w.close()
 
     meta = {
-        "key": key, "n_tokens": w.n, "n_docs": n_docs, "dtype": "uint16",
-        "tokenizer": tokenizer, "tok_tag": tok_tag, "cap": cap,
-        "complete": True, "seconds": round(time.time() - t0, 1),
+        "key": key,
+        "n_tokens": w.n,
+        "n_docs": n_docs,
+        "dtype": "uint16",
+        "tokenizer": tokenizer,
+        "tok_tag": tok_tag,
+        "cap": cap,
+        "complete": True,
+        "seconds": round(time.time() - t0, 1),
     }
     meta_path.write_text(json.dumps(meta, indent=2))
-    print(f"[{key}] done: {w.n:,} tok, {n_docs:,} docs, {meta['seconds']}s "
-          f"({w.n / max(meta['seconds'], 1e-9) / 1e6:.2f}M tok/s)")
+    print(
+        f"[{key}] done: {w.n:,} tok, {n_docs:,} docs, {meta['seconds']}s "
+        f"({w.n / max(meta['seconds'], 1e-9) / 1e6:.2f}M tok/s)"
+    )
     return meta
 
 
@@ -147,23 +156,40 @@ def _progress(key, n, cap, n_docs, t0):
     dt = time.time() - t0
     rate = n / max(dt, 1e-9)
     eta = (cap - n) / max(rate, 1e-9)
-    print(f"[{key}] {n/1e6:.0f}M/{cap/1e6:.0f}M tok  {n_docs:,} docs  "
-          f"{rate/1e6:.2f}M tok/s  eta {eta/60:.1f}min", flush=True)
+    print(
+        f"[{key}] {n / 1e6:.0f}M/{cap / 1e6:.0f}M tok  {n_docs:,} docs  "
+        f"{rate / 1e6:.2f}M tok/s  eta {eta / 60:.1f}min",
+        flush=True,
+    )
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokenizer", default="/mnt/ai/data/tiny-llm/tokenizer/8k")
-    ap.add_argument("--keys", nargs="*", default=None,
-                    help="sources to tokenize (default: all pretrain sources)")
-    ap.add_argument("--headroom", type=float, default=1.15,
-                    help="cap = weight*budget*headroom (over-tokenize a bit so the "
-                         "val split + block rounding never starve the target)")
+    ap.add_argument(
+        "--keys",
+        nargs="*",
+        default=None,
+        help="sources to tokenize (default: all pretrain sources)",
+    )
+    ap.add_argument(
+        "--headroom",
+        type=float,
+        default=1.15,
+        help="cap = weight*budget*headroom (over-tokenize a bit so the "
+        "val split + block rounding never starve the target)",
+    )
     args = ap.parse_args()
 
     tok_tag = Path(args.tokenizer).name
-    srcs = [S.get(k) for k in args.keys] if args.keys else [s for s in S.SOURCES if s.weight > 0]
-    print(f"tokenizer={args.tokenizer} (tag {tok_tag})  budget={S.TARGET_TOKENS/1e9:.1f}B")
+    srcs = (
+        [S.get(k) for k in args.keys]
+        if args.keys
+        else [s for s in S.SOURCES if s.weight > 0]
+    )
+    print(
+        f"tokenizer={args.tokenizer} (tag {tok_tag})  budget={S.TARGET_TOKENS / 1e9:.1f}B"
+    )
     for src in srcs:
         cap = math.ceil(src.weight * S.TARGET_TOKENS * args.headroom)
         tokenize_source(src.key, cap, args.tokenizer, tok_tag)

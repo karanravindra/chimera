@@ -19,7 +19,9 @@ class _Config(TrainConfig):
 
 
 def test_config_cli_parse():
-    cfg = tyro.cli(_Config, args=["--lr", "3e-4", "--arch", "large", "--tags", "a", "b"])
+    cfg = tyro.cli(
+        _Config, args=["--lr", "3e-4", "--arch", "large", "--tags", "a", "b"]
+    )
     assert cfg.lr == 3e-4
     assert cfg.arch == "large"
     assert cfg.tags == ("a", "b")
@@ -61,10 +63,20 @@ class _Data(LightningDataModule):
 
 def test_run_smoke(tmp_path, monkeypatch):
     monkeypatch.setenv("WANDB_MODE", "offline")
-    cfg = _Config(run_dir=tmp_path, wandb_project="test-task", epochs=1,
-                  precision="32-true", wandb_offline=True, ema_decay=0.99)
-    result = run(cfg, _Module(), _Data(),
-                 trainer_kwargs={"accelerator": "cpu", "enable_progress_bar": False})
+    cfg = _Config(
+        run_dir=tmp_path,
+        wandb_project="test-task",
+        epochs=1,
+        precision="32-true",
+        wandb_offline=True,
+        ema_decay=0.99,
+    )
+    result = run(
+        cfg,
+        _Module(),
+        _Data(),
+        trainer_kwargs={"accelerator": "cpu", "enable_progress_bar": False},
+    )
     assert isinstance(result, RunResult)
     assert result.best_ckpt is not None and result.best_ckpt.exists()
     assert result.best_ckpt == tmp_path / "checkpoints" / "best.ckpt"
