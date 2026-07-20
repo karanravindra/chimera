@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 from cut_cross_entropy import linear_cross_entropy
 from model import GPT
+from sampled_ce import _sampled_ce_from_negatives, sampled_cross_entropy
 from torchinfo import summary
 from tqdm import tqdm
 
@@ -64,7 +65,11 @@ SEQ_LEN = 512
 DIM = 384
 N_HEADS = 12
 MLP_MULT = 3
-N_LAYERS = 6
+# Looped A/B vs the 6-unique-layer baseline: 3 unique blocks applied twice
+# (matched FLOPs / unrolled depth 6, ~half the block params). N_LOOPS=1
+# recovers the baseline.
+N_LAYERS = 3
+N_LOOPS = 2
 
 # optimization
 MUON_LR = 0.02
@@ -98,6 +103,12 @@ RATIOS_PHASE2 = {
 # training AND eval so both see the same distribution; None = off. Must be a
 # train-time setting — capping an uncapped model at inference only hurts.
 LOGIT_SOFTCAP = 30.0
+# Sampled-softmax CE for TRAINING steps only (eval stays exact CCE/full CE).
+# ~1.2x tok/s over CCE at k=1024 but the objective is biased low (see
+# bench_sampled_ce.py); train loss values are not comparable to CE. Off by
+# default — CCE remains the reference loss.
+SAMPLED_CE = False
+SAMPLED_CE_K = 1024
 ADAMW_LR = 1e-3
 ADAMW_WEIGHT_DECAY = 0.0
 
@@ -117,7 +128,9 @@ BENCH_EVERY_N_STEPS = 2500  # in-training benchmark curve (0/None to disable)
 N_EPOCHS = 1
 
 RUN_DIR = Path("/mnt/ai/runs/tinylm/pretrain")
-CHECKPOINT_PATH = RUN_DIR / "chimera_gpt6m.pt"
+# Looped runs save under their own name so the baseline checkpoint survives.
+_LOOP_TAG = "" if N_LOOPS == 1 else f"_loop{N_LAYERS}x{N_LOOPS}"
+CHECKPOINT_PATH = RUN_DIR / f"chimera_gpt6m{_LOOP_TAG}.pt"
 
 
 def make_datamodule() -> ConcatTextDataModule:
@@ -275,6 +288,7 @@ def make_model(vocab_size: int) -> GPT:
         n_heads=N_HEADS,
         mlp_mult=MLP_MULT,
         n_layers=N_LAYERS,
+        n_loops=N_LOOPS,
         logit_softcap=LOGIT_SOFTCAP,
         vwn_m=VWN_M,
         vwn_n=VWN_N,
@@ -312,7 +326,16 @@ def _split_no_decay_group(model, groups, no_decay_names: set[str]) -> None:
         groups.append({**group, "params": move, "weight_decay": 0.0})
 
 
-def compute_loss(model, x, y, eos_id: int, vocab_size: int):
+# Fusing the sampled-CE logit math is what makes it beat CCE (eager loses past
+# k=1024); RNG stays outside the compiled core.
+_sampled_ce_core = (
+    torch.compile(_sampled_ce_from_negatives, mode="max-autotune-no-cudagraphs")
+    if SAMPLED_CE and USE_CCE
+    else _sampled_ce_from_negatives
+)
+
+
+def compute_loss(model, x, y, eos_id: int, vocab_size: int, sampled: bool = False):
     if USE_CCE:
         # FlexAttention block mask (causal + document) + per-document RoPE position
         # ids — rebuilt per batch. Note: the smaller last validation batch triggers a
@@ -320,6 +343,15 @@ def compute_loss(model, x, y, eos_id: int, vocab_size: int):
         block_mask, pos_ids = build_block_mask_and_pos(x, eos_id)
         hidden = model(x, return_hidden=True, block_mask=block_mask, pos_ids=pos_ids)
         weight = getattr(model, "_orig_mod", model).token_emb.weight  # tied lm_head
+        if sampled:
+            return sampled_cross_entropy(
+                hidden,
+                weight,
+                y,
+                num_samples=SAMPLED_CE_K,
+                softcap=LOGIT_SOFTCAP,
+                core=_sampled_ce_core,
+            )
         return linear_cross_entropy(hidden, weight, y, softcap=LOGIT_SOFTCAP)
     logits = model(x)  # CPU fallback: plain causal, no doc masking / flex
     return nn.CrossEntropyLoss()(logits.view(-1, vocab_size), y.view(-1))
@@ -582,7 +614,10 @@ def train():
             for mb in range(GRAD_ACCUM_STEPS):
                 sl = slice(mb * micro, (mb + 1) * micro)
                 mb_loss = (
-                    compute_loss(model, x[sl], y[sl], dm.eos_id, dm.vocab_size)
+                    compute_loss(
+                        model, x[sl], y[sl], dm.eos_id, dm.vocab_size,
+                        sampled=SAMPLED_CE,
+                    )
                     / GRAD_ACCUM_STEPS
                 )
                 mb_loss.backward()
