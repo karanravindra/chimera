@@ -109,6 +109,9 @@ LOGIT_SOFTCAP = 30.0
 # default — CCE remains the reference loss.
 SAMPLED_CE = os.environ.get("TINYLM_SAMPLED_CE", "0") == "1"
 SAMPLED_CE_K = 1024
+# logQ proposal correction (+ln(V/k) on negative logits): consistent loss
+# scale + restores full-softmax-equivalent negative gradient pressure.
+SAMPLED_CE_LOGQ = os.environ.get("TINYLM_SAMPLED_CE_LOGQ", "0") == "1"
 ADAMW_LR = 1e-3
 ADAMW_WEIGHT_DECAY = 0.0
 
@@ -122,7 +125,7 @@ BATCH_SIZE = 128
 # 2x64); split each global batch into microbatches with gradient accumulation.
 # Same global batch / identical gradients up to fp rounding.
 GRAD_ACCUM_STEPS = 2
-MAX_TRAIN_STEPS = 5000
+MAX_TRAIN_STEPS = int(os.environ.get("TINYLM_MAX_STEPS", "5000"))
 VALIDATE_EVERY_N_STEPS = 1000
 BENCH_EVERY_N_STEPS = 2500  # in-training benchmark curve (0/None to disable)
 N_EPOCHS = 1
@@ -341,7 +344,12 @@ def compute_loss(model, x, y, eos_id: int, vocab_size: int, sampled: bool = Fals
             # Fused Triton kernel (flash-style online LSE, never materializes
             # the [T, k] logits); same biased objective as sampled_ce.py.
             return sampled_cross_entropy(
-                hidden, weight, y, num_samples=SAMPLED_CE_K, softcap=LOGIT_SOFTCAP
+                hidden,
+                weight,
+                y,
+                num_samples=SAMPLED_CE_K,
+                softcap=LOGIT_SOFTCAP,
+                logq=SAMPLED_CE_LOGQ,
             )
         return linear_cross_entropy(hidden, weight, y, softcap=LOGIT_SOFTCAP)
     logits = model(x)  # CPU fallback: plain causal, no doc masking / flex

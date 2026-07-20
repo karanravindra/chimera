@@ -36,6 +36,8 @@ only; eval/report must use the full softmax.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -78,6 +80,7 @@ def _fwd_kernel(
     T, K, D,
     s_ht, s_hd, s_wv, s_wd, s_nk, s_nd,
     softcap,
+    neg_offset,  # logQ proposal correction, added after the softcap
     HAS_CAP: tl.constexpr,
     BLOCK_T: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
@@ -115,6 +118,7 @@ def _fwd_kernel(
             acc = tl.dot(h, tl.trans(wn), acc)
         if HAS_CAP:
             acc = softcap * _tanh(acc / softcap)
+        acc = acc + neg_offset
         nid = tl.load(NEG + koff, mask=kmask, other=-1)
         dead = (nid[None, :] == tgt[:, None]) | (koff[None, :] >= K)
         acc = tl.where(dead, float("-inf"), acc)
@@ -137,6 +141,7 @@ def _bwd_kernel(
     T, K, D,
     s_ht, s_hd, s_nk, s_nd, s_gt, s_gk,
     softcap,
+    neg_offset,
     HAS_CAP: tl.constexpr,
     BLOCK_T: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
@@ -173,7 +178,9 @@ def _bwd_kernel(
         else:
             capped = acc
             dcap = 1.0
-        p = tl.exp(capped - lse[:, None])                # softmax prob vs saved LSE
+        # Softmax prob vs saved LSE; the constant offset shifts the logit but
+        # not d(capped)/d(raw), so it only enters through p.
+        p = tl.exp(capped + neg_offset - lse[:, None])
         nid = tl.load(NEG + koff, mask=kmask, other=-1)
         dead = (nid[None, :] == tgt[:, None]) | (koff[None, :] >= K)
         g = tl.where(dead, 0.0, p * dcap * scale)
@@ -189,7 +196,7 @@ def _bwd_kernel(
 
 class _SampledCEFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hidden, weight, targets, neg_idx, softcap):
+    def forward(ctx, hidden, weight, targets, neg_idx, softcap, neg_offset):
         # hidden [T, D], weight [V, D], targets [T] int64, neg_idx [K] int64
         T, D = hidden.shape
         K = neg_idx.numel()
@@ -207,10 +214,12 @@ class _SampledCEFn(torch.autograd.Function):
             weight.stride(0), weight.stride(1),
             w_neg.stride(0), w_neg.stride(1),
             1.0 if softcap is None else float(softcap),
+            float(neg_offset),
             HAS_CAP=softcap is not None,
         )
         ctx.save_for_backward(hidden, weight, targets, neg_idx, w_neg, lse, pos)
         ctx.softcap = softcap
+        ctx.neg_offset = neg_offset
         return loss.mean()
 
     @staticmethod
@@ -233,6 +242,7 @@ class _SampledCEFn(torch.autograd.Function):
             w_neg.stride(0), w_neg.stride(1),
             G.stride(0), G.stride(1),
             1.0 if ctx.softcap is None else float(ctx.softcap),
+            float(ctx.neg_offset),
             HAS_CAP=ctx.softcap is not None,
         )
         gpos_h = gpos.to(hidden.dtype)
@@ -250,7 +260,7 @@ class _SampledCEFn(torch.autograd.Function):
             d_weight.index_add_(
                 0, targets, (hidden * gpos_h.unsqueeze(1)).to(weight.dtype)
             )
-        return d_hidden, d_weight, None, None, None
+        return d_hidden, d_weight, None, None, None, None
 
 
 # --------------------------------------------------------------------------
@@ -264,8 +274,13 @@ def sampled_ce_from_negatives(
     targets: torch.Tensor,
     neg_idx: torch.Tensor,
     softcap: float | None = None,
+    neg_offset: float = 0.0,
 ) -> torch.Tensor:
-    """Deterministic core given pre-drawn negatives (RNG stays outside)."""
+    """Deterministic core given pre-drawn negatives (RNG stays outside).
+
+    ``neg_offset`` is the logQ proposal correction, added to every negative
+    logit after the softcap (post-cap: it is a log-probability offset).
+    """
     flat_hidden = hidden.reshape(-1, hidden.shape[-1])
     if not flat_hidden.is_contiguous():
         flat_hidden = flat_hidden.contiguous()
@@ -274,7 +289,7 @@ def sampled_ce_from_negatives(
     assert flat_targets.dtype == torch.int64 and neg_idx.dtype == torch.int64
     assert weight.shape[1] == flat_hidden.shape[1]
     return _SampledCEFn.apply(flat_hidden, weight, flat_targets,
-                              neg_idx.contiguous(), softcap)
+                              neg_idx.contiguous(), softcap, neg_offset)
 
 
 def sampled_cross_entropy(
@@ -284,12 +299,21 @@ def sampled_cross_entropy(
     num_samples: int,
     softcap: float | None = None,
     generator: torch.Generator | None = None,
+    logq: bool = False,
 ) -> torch.Tensor:
-    """Mean sampled-softmax CE of [B, N, D] hidden against a [V, D] head."""
+    """Mean sampled-softmax CE of [B, N, D] hidden against a [V, D] head.
+
+    ``logq=True`` applies the uniform-proposal logQ correction ln(V/k) to the
+    negative logits, making the candidate softmax a consistent estimator of
+    the full softmax (see sampled_ce.py docstring).
+    """
     neg_idx = torch.randint(
         weight.shape[0], (num_samples,), device=hidden.device, generator=generator
     )
-    return sampled_ce_from_negatives(hidden, weight, targets, neg_idx, softcap)
+    neg_offset = math.log(weight.shape[0] / num_samples) if logq else 0.0
+    return sampled_ce_from_negatives(
+        hidden, weight, targets, neg_idx, softcap, neg_offset
+    )
 
 
 # --------------------------------------------------------------------------
@@ -297,7 +321,7 @@ def sampled_cross_entropy(
 # --------------------------------------------------------------------------
 
 
-def _reference(hidden, weight, targets, neg_idx, softcap=None):
+def _reference(hidden, weight, targets, neg_idx, softcap=None, neg_offset=0.0):
     import torch.nn.functional as F
     flat_hidden = hidden.reshape(-1, hidden.shape[-1])
     flat_targets = targets.reshape(-1)
@@ -306,6 +330,8 @@ def _reference(hidden, weight, targets, neg_idx, softcap=None):
     if softcap is not None:
         pos_logits = softcap * torch.tanh(pos_logits / softcap)
         neg_logits = softcap * torch.tanh(neg_logits / softcap)
+    if neg_offset:
+        neg_logits = neg_logits + neg_offset
     collision = neg_idx.unsqueeze(0) == flat_targets.unsqueeze(1)
     neg_logits = neg_logits.masked_fill(collision, float("-inf"))
     logits = torch.cat([pos_logits.unsqueeze(1), neg_logits], dim=1)
@@ -318,8 +344,12 @@ def _test_parity():
 
     # fp32 tolerance is TF32-bound: vs an fp64 oracle, eager and triton grads
     # are both ~1.5e-3 off (RTX 5070 Ti), so their mutual error can reach ~3e-3.
-    for dtype, rtol in [(torch.float32, 5e-3), (torch.bfloat16, 3e-2)]:
-        for softcap in (None, 20.0):
+    from itertools import product
+
+    cases = product(
+        [(torch.float32, 5e-3), (torch.bfloat16, 3e-2)], (None, 20.0), (0.0, 2.77)
+    )
+    for (dtype, rtol), softcap, neg_offset in cases:
             # awkward sizes on purpose: nothing divides the block sizes
             T, D, V, K = 1021, 193, 5000, 211
             h = 0.7 * torch.randn(T, D, device="cuda", dtype=dtype)
@@ -334,8 +364,8 @@ def _test_parity():
             h2 = h.clone().requires_grad_(True)
             w2 = w.clone().requires_grad_(True)
 
-            l1 = _reference(h1, w1, y, neg, softcap)
-            l2 = sampled_ce_from_negatives(h2, w2, y, neg, softcap)
+            l1 = _reference(h1, w1, y, neg, softcap, neg_offset)
+            l2 = sampled_ce_from_negatives(h2, w2, y, neg, softcap, neg_offset)
             (l1 * 0.37).backward()
             (l2 * 0.37).backward()
 
@@ -345,7 +375,7 @@ def _test_parity():
             errs = (abs(l1.item() - l2.item()) / abs(l1.item()),
                     rel(h2.grad, h1.grad), rel(w2.grad, w1.grad))
             status = "ok " if max(errs) < rtol else "FAIL"
-            print(f"[{status}] {str(dtype):>15} cap={softcap}  "
+            print(f"[{status}] {str(dtype):>15} cap={softcap} off={neg_offset}  "
                   f"loss {errs[0]:.1e}  dH {errs[1]:.1e}  dW {errs[2]:.1e}")
             assert max(errs) < rtol, errs
 
