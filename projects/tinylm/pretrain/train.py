@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 from cut_cross_entropy import linear_cross_entropy
 from model import GPT
-from sampled_ce import _sampled_ce_from_negatives, sampled_cross_entropy
+from sampled_ce_triton import sampled_cross_entropy
 from torchinfo import summary
 from tqdm import tqdm
 
@@ -329,15 +329,6 @@ def _split_no_decay_group(model, groups, no_decay_names: set[str]) -> None:
         groups.append({**group, "params": move, "weight_decay": 0.0})
 
 
-# Fusing the sampled-CE logit math is what makes it beat CCE (eager loses past
-# k=1024); RNG stays outside the compiled core.
-_sampled_ce_core = (
-    torch.compile(_sampled_ce_from_negatives, mode="max-autotune-no-cudagraphs")
-    if SAMPLED_CE and USE_CCE
-    else _sampled_ce_from_negatives
-)
-
-
 def compute_loss(model, x, y, eos_id: int, vocab_size: int, sampled: bool = False):
     if USE_CCE:
         # FlexAttention block mask (causal + document) + per-document RoPE position
@@ -347,13 +338,10 @@ def compute_loss(model, x, y, eos_id: int, vocab_size: int, sampled: bool = Fals
         hidden = model(x, return_hidden=True, block_mask=block_mask, pos_ids=pos_ids)
         weight = getattr(model, "_orig_mod", model).token_emb.weight  # tied lm_head
         if sampled:
+            # Fused Triton kernel (flash-style online LSE, never materializes
+            # the [T, k] logits); same biased objective as sampled_ce.py.
             return sampled_cross_entropy(
-                hidden,
-                weight,
-                y,
-                num_samples=SAMPLED_CE_K,
-                softcap=LOGIT_SOFTCAP,
-                core=_sampled_ce_core,
+                hidden, weight, y, num_samples=SAMPLED_CE_K, softcap=LOGIT_SOFTCAP
             )
         return linear_cross_entropy(hidden, weight, y, softcap=LOGIT_SOFTCAP)
     logits = model(x)  # CPU fallback: plain causal, no doc masking / flex

@@ -18,6 +18,14 @@ This model resets RoPE positions per packed document (via ``pos_ids`` from
 ``build_block_mask_and_pos``) instead of relying on RoPE's relative-offset
 invariance. It has no muP parameterization and is project-local so this experiment
 remains the single source of truth for its architecture.
+
+Looped depth (``n_loops > 1``): the ``n_layers`` unique blocks are applied
+``n_loops`` times in sequence (Ouro-style fixed loop count, full unrolled
+backprop). Before every loop after the first, the expanded input embedding is
+re-injected Huginn-style by concatenation through a learned adapter whose
+weight starts as ``[I | small]`` — identity on the running state, near-zero on
+the injected input — so training begins as a plain carry. The fixed python
+loop unrolls into a single static graph under torch.compile.
 """
 
 import itertools
@@ -570,6 +578,7 @@ class GPT(nn.Module):
         n_heads: int,
         mlp_mult: int,
         n_layers: int,
+        n_loops: int = 1,
         eos_id: int = 0,
         logit_softcap: float | None = None,
         vwn_m: int = 2,
@@ -591,7 +600,10 @@ class GPT(nn.Module):
             raise ValueError(
                 f"vwn_carry_mode must be 'ghc' or 'mhc_lite', got {vwn_carry_mode!r}"
             )
+        if n_loops < 1:
+            raise ValueError(f"n_loops must be positive, got {n_loops}")
 
+        self.n_loops = n_loops
         self.seq_len = seq_len
         self.eos_id = eos_id
         self.dim = dim
@@ -652,7 +664,24 @@ class GPT(nn.Module):
         )
         self.ln_f = nn.RMSNorm(dim)
 
+        # Loop input injection: state and expanded input embedding concatenated
+        # through a learned adapter before every loop after the first.
+        self.loop_adapter = (
+            nn.Linear(2 * self.virtual_dim, self.virtual_dim, bias=False)
+            if n_loops > 1
+            else None
+        )
+
         self.apply(self._init_weights())
+
+        if self.loop_adapter is not None:
+            # [I | small]: start as an identity carry of the running state with a
+            # near-silent input-injection path (overrides the generic init above).
+            with torch.no_grad():
+                self.loop_adapter.weight[:, : self.virtual_dim] = torch.eye(
+                    self.virtual_dim
+                )
+                self.loop_adapter.weight[:, self.virtual_dim :].mul_(0.1)
 
     def _init_weights(self):
         def init_fn(module):
@@ -695,19 +724,26 @@ class GPT(nn.Module):
         # block_mask + pos_ids enable packed-document FlexAttention with
         # per-document RoPE positions. Leave both None for eval/sampling.
         h = self.input_expand(self.token_emb(x))
+        e = h  # expanded input embedding, re-injected at each loop boundary
 
+        # Weight-shared loop over the unique blocks. KV caches are per
+        # (loop, block) application: n_loops * n_layers entries.
         new_past_kv = [] if use_cache else None
-        for i, block in enumerate(self.blocks):
-            block_past_kv = past_kv[i] if past_kv is not None else None
-            h, new_kv = block(
-                h,
-                block_mask=block_mask,
-                pos_ids=pos_ids,
-                past_kv=block_past_kv,
-                use_cache=use_cache,
-            )
-            if use_cache:
-                new_past_kv.append(new_kv)
+        for loop_idx in range(self.n_loops):
+            if loop_idx > 0:
+                h = self.loop_adapter(torch.cat([h, e], dim=-1))
+            for i, block in enumerate(self.blocks):
+                kv_idx = loop_idx * len(self.blocks) + i
+                block_past_kv = past_kv[kv_idx] if past_kv is not None else None
+                h, new_kv = block(
+                    h,
+                    block_mask=block_mask,
+                    pos_ids=pos_ids,
+                    past_kv=block_past_kv,
+                    use_cache=use_cache,
+                )
+                if use_cache:
+                    new_past_kv.append(new_kv)
 
         # VWN state D' -> optional GroupNorm -> learned reduce -> final RMSNorm.
         h = self.pre_reduce_norm(h)

@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from cut_cross_entropy import linear_cross_entropy
 from model import GPT
 from sampled_ce import _sampled_ce_from_negatives, sampled_cross_entropy
+from sampled_ce_triton import sampled_cross_entropy as sampled_ce_triton
 
 from chimera.models.attention import build_block_mask_and_pos
 
@@ -66,7 +67,9 @@ def cce_loss(model, x, y):
     return linear_cross_entropy(hidden, weight, y, softcap=LOGIT_SOFTCAP)
 
 
-def make_sampled_loss(num_samples: int, compile_loss: bool = False):
+def make_sampled_loss(
+    num_samples: int, compile_loss: bool = False, triton_kernel: bool = False
+):
     core = _sampled_ce_from_negatives
     if compile_loss:
         core = torch.compile(
@@ -77,6 +80,10 @@ def make_sampled_loss(num_samples: int, compile_loss: bool = False):
         block_mask, pos_ids = build_block_mask_and_pos(x, EOS_ID)
         hidden = model(x, return_hidden=True, block_mask=block_mask, pos_ids=pos_ids)
         weight = getattr(model, "_orig_mod", model).token_emb.weight
+        if triton_kernel:
+            return sampled_ce_triton(
+                hidden, weight, y, num_samples=num_samples, softcap=LOGIT_SOFTCAP
+            )
         return sampled_cross_entropy(
             hidden,
             weight,
@@ -158,6 +165,15 @@ def main():
             bench(
                 f"sampled+tc k={k}",
                 make_sampled_loss(k, compile_loss=True),
+                model,
+                batches,
+            )
+        )
+    for k in SAMPLE_COUNTS:
+        results.append(
+            bench(
+                f"sampled+triton k={k}",
+                make_sampled_loss(k, triton_kernel=True),
                 model,
                 batches,
             )
