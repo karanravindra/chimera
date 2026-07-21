@@ -53,9 +53,11 @@ MLP_MULT = 3
 N_LAYERS = 6
 LOGIT_SOFTCAP = 30.0  # base model was trained under this cap; keep it
 
-# optimization — gentler than pretrain: the model is converged, SFT reshapes
-MUON_LR = 0.005
-ADAMW_LR = 2.5e-4
+# optimization — gentler than pretrain: the model is converged, SFT reshapes.
+# Env-driven so an unstable config (e.g. ctx8k SFT: seq8192 + small batch
+# diverged at 0.005, loss->ln(V)) can drop to a lower peak LR.
+MUON_LR = float(os.environ.get("TINYLM_MUON_LR", "0.005"))
+ADAMW_LR = float(os.environ.get("TINYLM_ADAMW_LR", "2.5e-4"))
 
 # LoRA mode: freeze the base, train low-rank deltas on every Linear (qkv/out/
 # fc1/fc2; embeddings + tied head stay frozen). Merged back before saving, so
