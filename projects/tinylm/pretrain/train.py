@@ -64,11 +64,12 @@ SEQ_LEN = 512
 DIM = 384
 N_HEADS = 12
 MLP_MULT = 3
-# Looped A/B vs the 6-unique-layer baseline: 3 unique blocks applied twice
-# (matched FLOPs / unrolled depth 6, ~half the block params). N_LOOPS=1
-# recovers the baseline.
-N_LAYERS = 3
-N_LOOPS = 2
+# Looped A/B vs the 6-unique-layer baseline. Matched-params variant (Ouro's
+# recipe): all 6 unique blocks applied twice — same params as baseline, 2x
+# per-token FLOPs / unrolled depth 12. N_LOOPS=1 recovers the baseline;
+# 3x2 (matched FLOPs) was run 2026-07-20, see loop3x2_train.log.
+N_LAYERS = 6
+N_LOOPS = 1
 
 # optimization
 MUON_LR = 0.02
@@ -116,6 +117,11 @@ BATCH_SIZE = 128
 # Same global batch / identical gradients up to fp rounding.
 GRAD_ACCUM_STEPS = 2
 MAX_TRAIN_STEPS = int(os.environ.get("TINYLM_MAX_STEPS", "5000"))
+# Eval cadence is expressed in TOKENS (env, in millions) and converted to steps
+# below once the global batch is known — so a token budget maps to the same
+# real cadence regardless of batch/seq. Falls back to the fixed step counts.
+VAL_EVERY_MTOKENS = float(os.environ.get("TINYLM_VAL_EVERY_MT", "0")) or None
+BENCH_EVERY_MTOKENS = float(os.environ.get("TINYLM_BENCH_EVERY_MT", "0")) or None
 VALIDATE_EVERY_N_STEPS = 1000
 BENCH_EVERY_N_STEPS = 2500  # in-training benchmark curve (0/None to disable)
 N_EPOCHS = 1
@@ -137,7 +143,14 @@ def make_datamodule() -> ConcatTextDataModule:
     # than any single register.
     DATA_DIR = "/mnt/ai/data"
     VAL_TOKENS = 500_000
-    TRAIN_TOKENS = 600_000_000
+    # Pool per source (sampling weight = share of this). Must exceed the tokens
+    # the step-capped run actually consumes (MAX_TRAIN_STEPS x global batch) so
+    # repetition stays negligible; env-bumped for the multi-BT context runs.
+    TRAIN_TOKENS = int(os.environ.get("TINYLM_TRAIN_TOKENS", "600_000_000"))
+    # A pinned, frozen tokenizer (the git-tracked suite) removes the vocab as a
+    # cross-run confound: every run keys its ids caches on this file's content
+    # hash instead of retraining a per-mix vocab. Empty -> train on the mixture.
+    TOKENIZER_PATH = os.environ.get("TINYLM_TOKENIZER_PATH", "").strip() or None
     # Any .md files dropped in documents/ are always in the mix, outside the
     # ratios: repeated DOCUMENTS_REPEAT times (tiny files would otherwise be
     # invisible) and excluded from the mixture tokenizer so the vocab + ids
@@ -145,16 +158,47 @@ def make_datamodule() -> ConcatTextDataModule:
     DOCUMENTS_DIR = Path(__file__).parent.parent / "documents"
     DOCUMENTS_REPEAT = 200
 
-    ratios = {
-        "tiny-textbooks": 0,
-        "cosmopedia-v2": 30,
-        "fineweb-edu": 34,
-        "tinystories-v2": 30,
-        "tiny-webtext": 0,
-        "gooaq": 5,  # closed-book Question:/Answer: format signal
-        # grounded passage+QA format signal; small corpus, this share ~= all of it
-        "squad": 1,
-    }
+    # The true-4B mix: TinyStories is exhausted at ~0.44B tokens, so at a 4B pool
+    # its validated 30% share would repeat ~3x. Drop it to its ceiling (~11%) and
+    # let cosmopedia/fineweb (effectively unlimited) absorb the rest, so the bulk
+    # is single-pass. Also widen the shard windows for those sources (below).
+    # Gated on TINYLM_MIX_4B so the small tokenizer-suite runs are untouched.
+    MIX_4B = os.environ.get("TINYLM_MIX_4B", "") == "1"
+    if MIX_4B:
+        ratios = {
+            "tiny-textbooks": 0,
+            "cosmopedia-v2": 42,
+            "fineweb-edu": 43,
+            "tinystories-v2": 11,  # ~0.44B unique = whole corpus, no repeat
+            "tiny-webtext": 0,
+            "gooaq": 3,
+            "squad": 1,  # ~all of the small corpus; format signal (repeats)
+        }
+        # Widen the download/tokenize windows to supply ~3.9B unique tokens.
+        # Instance-process-local class-attr overrides (never touches the shared
+        # module defaults on disk): cosmopedia 2->7 shards (~1.9B), fineweb
+        # 1->4 shards (~2.8B avail), gooaq 1->2 shards (~0.12B, its ceiling).
+        CosmopediaV2DataModule.DATA_FILES = [
+            f"cosmopedia-v2/train-{i:05d}-of-00104.parquet" for i in range(7)
+        ]
+        FineWebEduTextDataModule.DATA_FILES = [
+            f"sample/10BT/{i:03d}_00000.parquet" for i in range(4)
+        ]
+        GooAQDataModule.DATA_FILES = [
+            "pair/train-00000-of-00002.parquet",
+            "pair/train-00001-of-00002.parquet",
+        ]
+    else:
+        ratios = {
+            "tiny-textbooks": 0,
+            "cosmopedia-v2": 30,
+            "fineweb-edu": 34,
+            "tinystories-v2": 30,
+            "tiny-webtext": 0,
+            "gooaq": 5,  # closed-book Question:/Answer: format signal
+            # grounded passage+QA format signal; small corpus, this share ~= all of it
+            "squad": 1,
+        }
     total = sum(ratios.values())
     if total != 100:
         raise ValueError(f"train mix ratios must sum to 100, got {total}")
@@ -228,8 +272,10 @@ def make_datamodule() -> ConcatTextDataModule:
             ),
         ],
         batch_size=BATCH_SIZE,
-        train_tokenizer_on_mixture=True,
+        # Pin the frozen tokenizer when given; otherwise train one on the mixture.
+        train_tokenizer_on_mixture=TOKENIZER_PATH is None,
         tokenizer_sample_chars=1_000_000_000,
+        tokenizer_path=TOKENIZER_PATH,
     )
     dm.prepare_data()
     dm.setup("fit")
@@ -519,6 +565,19 @@ def train():
     val_tokens = len(dm.val_dataset.data)
     global_batch_size = x.numel()
 
+    # token-budget cadence -> steps (fall back to the fixed step constants)
+    val_every = (
+        max(1, round(VAL_EVERY_MTOKENS * 1e6 / global_batch_size))
+        if VAL_EVERY_MTOKENS
+        else VALIDATE_EVERY_N_STEPS
+    )
+    bench_every = (
+        max(1, round(BENCH_EVERY_MTOKENS * 1e6 / global_batch_size))
+        if BENCH_EVERY_MTOKENS
+        else BENCH_EVERY_N_STEPS
+    )
+    print(f"cadence: val every {val_every} steps, bench every {bench_every} steps")
+
     print(f"vocab_size={dm.vocab_size}")
     print(
         "train mix: "
@@ -604,7 +663,7 @@ def train():
 
             global_step += 1
 
-            if global_step % VALIDATE_EVERY_N_STEPS == 0:
+            if global_step % val_every == 0:
                 val_loss = evaluate(model, dm)
                 val_perplexity = math.exp(min(val_loss, 100))
                 val_bpb = bits_per_byte(model, bpb_X, bpb_Y, bpb_bytes)
@@ -615,8 +674,8 @@ def train():
             # in-training benchmark curve (skip the final step; the full table runs
             # after the loop) — a few cheap points to see the trajectory.
             if (
-                BENCH_EVERY_N_STEPS
-                and global_step % BENCH_EVERY_N_STEPS == 0
+                bench_every
+                and global_step % bench_every == 0
                 and global_step < MAX_TRAIN_STEPS
             ):
                 run_benchmarks(model, dm, step=global_step)

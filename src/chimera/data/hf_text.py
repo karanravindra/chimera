@@ -326,7 +326,11 @@ class HFTextDataModule(pl.LightningDataModule):
 
         # tokenize_with_progress batches these for encode_batch and stops early
         # once max_tokens is reached.
-        ids = tokenize_with_progress(
+        # Returns a flat int16 tensor (vocab << 32767), built via bounded chunks
+        # so multi-billion-token sources don't OOM. int16 = 4x less RAM than int64
+        # for the stream, which matters once several capped sources concatenate
+        # into one pool. Datasets cast per-item via TokenDataset.__getitem__().long().
+        data = tokenize_with_progress(
             self.tokenizer,
             self.iter_texts(ds),
             desc=f"Tokenizing {self.DIR_NAME} [{split}]",
@@ -336,10 +340,6 @@ class HFTextDataModule(pl.LightningDataModule):
             bos_id=self.bos_id,
             max_tokens=max_tokens,
         )
-        # int16 (vocab << 32767) not int64: 4x less RAM for the stream, which
-        # matters once several capped sources concatenate into one pool. Datasets
-        # cast per-item via TokenDataset.__getitem__().long().
-        data = torch.tensor(ids, dtype=torch.int16)
         save_cached_ids(ids_path, data)
         return data
 

@@ -117,7 +117,7 @@ class TinyShakespeareDataModule(pl.LightningDataModule):
                 desc="Tokenizing tinyshakespeare",
                 unit="chunk",
             )
-            data = torch.tensor(ids, dtype=torch.long)
+            data = ids.long()  # tokenize_with_progress returns an int16 tensor
             save_cached_ids(self._ids_path, data)
 
         n_val = int(len(data) * self.val_split)

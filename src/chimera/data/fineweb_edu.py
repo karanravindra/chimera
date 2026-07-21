@@ -205,7 +205,7 @@ class FineWebEduDataModule(pl.LightningDataModule):
                 eos_id=self.eos_id,
                 max_tokens=self.max_train_tokens,
             )
-            data = torch.tensor(ids, dtype=torch.long)
+            data = ids.long()  # tokenize_with_progress returns an int16 tensor
             save_cached_ids(self._ids_path, data)
 
         n_val = int(len(data) * self.val_split)

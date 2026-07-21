@@ -1,0 +1,129 @@
+{
+  "vocab_size": 16384,
+  "requested_vocab_size": 16384,
+  "tokenizer_hash": "d148cccaf358c842a48dfc378be85e5c",
+  "special_tokens": [
+    "<|endoftext|>",
+    "<|startoftext|>",
+    "<|pad|>",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<think>",
+    "</think>",
+    "<tool_call>",
+    "</tool_call>",
+    "<tool_response>",
+    "</tool_response>"
+  ],
+  "special_ids": {
+    "<|endoftext|>": 0,
+    "<|startoftext|>": 1,
+    "<|pad|>": 2,
+    "<|im_start|>": 3,
+    "<|im_end|>": 4,
+    "<think>": 5,
+    "</think>": 6,
+    "<tool_call>": 7,
+    "</tool_call>": 8,
+    "<tool_response>": 9,
+    "</tool_response>": 10
+  },
+  "split_digits": false,
+  "min_frequency": 2,
+  "seconds": 24.8,
+  "corpus": {
+    "seed": 0,
+    "total_chars": 493247755,
+    "requested_chars": 500000000,
+    "n_docs": 252734,
+    "shares_pct": {
+      "fineweb-edu": 35.0,
+      "cosmopedia-v2": 20.0,
+      "tinystories-v2": 15.0,
+      "stackexchange": 10.0,
+      "wikipedia": 5.0,
+      "coqa": 3.75,
+      "squad": 3.75,
+      "oasst1": 2.5,
+      "no_robots": 2.5,
+      "ultrachat": 2.5
+    },
+    "realized_chars": {
+      "fineweb-edu": 175001519,
+      "cosmopedia-v2": 100001686,
+      "tinystories-v2": 75000672,
+      "stackexchange": 50000162,
+      "wikipedia": 25000078,
+      "coqa": 18269446,
+      "squad": 18750569,
+      "oasst1": 6426032,
+      "no_robots": 12296632,
+      "ultrachat": 12500959
+    },
+    "corpus_hash": "656f9bd89cdc6900920da0fd4571a066"
+  },
+  "evaluation": {
+    "aggregate_chars_per_token": 4.116,
+    "aggregate_bytes_per_token": 4.123,
+    "per_source": {
+      "fineweb-edu": {
+        "chars_per_token": 4.172,
+        "bytes_per_token": 4.195
+      },
+      "cosmopedia-v2": {
+        "chars_per_token": 4.715,
+        "bytes_per_token": 4.72
+      },
+      "tinystories-v2": {
+        "chars_per_token": 4.017,
+        "bytes_per_token": 4.017
+      },
+      "stackexchange": {
+        "chars_per_token": 3.474,
+        "bytes_per_token": 3.476
+      },
+      "wikipedia": {
+        "chars_per_token": 3.952,
+        "bytes_per_token": 3.969
+      },
+      "squad": {
+        "chars_per_token": 4.278,
+        "bytes_per_token": 4.283
+      },
+      "ultrachat": {
+        "chars_per_token": 4.435,
+        "bytes_per_token": 4.438
+      }
+    },
+    "tokens_per_doc_mean": 30.8,
+    "tokens_per_doc_p95": 108,
+    "frac_within_512": 0.9996,
+    "frac_within_2048": 0.9999,
+    "frac_within_8192": 1.0,
+    "vocab_utilization": 0.9697,
+    "round_trips_ok": {
+      "unicode": true,
+      "markdown": true,
+      "json": true,
+      "url": true,
+      "contractions": true,
+      "dates": true,
+      "chatml": true
+    },
+    "all_round_trips_ok": true,
+    "special_tokens_atomic": {
+      "<|endoftext|>": true,
+      "<|startoftext|>": true,
+      "<|pad|>": true,
+      "<|im_start|>": true,
+      "<|im_end|>": true,
+      "<think>": true,
+      "</think>": true,
+      "<tool_call>": true,
+      "</tool_call>": true,
+      "<tool_response>": true,
+      "</tool_response>": true
+    },
+    "all_specials_atomic": true
+  }
+}

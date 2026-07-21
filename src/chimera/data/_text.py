@@ -144,8 +144,9 @@ def tokenize_with_progress(
     bos_id: Optional[int] = None,
     max_tokens: Optional[int] = None,
     batch_size: int = 1024,
-) -> list[int]:
-    """Encode an iterable of texts into one flat list of ids, showing a tqdm bar.
+    chunk_tokens: int = 20_000_000,
+) -> torch.Tensor:
+    """Encode an iterable of texts into one flat int16 token tensor, with a tqdm bar.
 
     Texts are encoded in batches via ``tokenizer.encode_batch`` (parallel on the
     fast backends), which is much faster than encoding one at a time. Optionally
@@ -153,19 +154,38 @@ def tokenize_with_progress(
     start marker / separator) and stops once ``max_tokens`` ids have been
     collected — so with a cap we never tokenize more than the last batch beyond
     it, and the surplus is trimmed off at the end.
+
+    Memory: the running ids are flushed to an int16 tensor chunk every
+    ``chunk_tokens`` and the Python buffer cleared, so peak RAM stays ~chunk-sized
+    regardless of corpus size. A flat Python ``list[int]`` of the whole stream (the
+    old behavior) is ~18 bytes/token and OOMs the box on multi-billion-token
+    sources; the int16 chunks are 2 bytes/token. Returns the concatenated int16
+    tensor (``vocab < 32767``, so int16 is lossless).
     """
-    ids: list[int] = []
     bar = tqdm(total=total, desc=desc, unit=unit)
+    chunks: list[torch.Tensor] = []
+    buf: list[int] = []
+    n_total = 0  # ids committed to chunks + still in buf
+
+    def spill() -> None:
+        # move the Python buffer into a compact int16 chunk and free it
+        if buf:
+            chunks.append(torch.tensor(buf, dtype=torch.int16))
+            buf.clear()
 
     def flush(batch: list[str]) -> None:
+        nonlocal n_total
         for enc in tokenizer.encode_batch(batch):
             if bos_id is not None:
-                ids.append(bos_id)
-            ids.extend(enc)
+                buf.append(bos_id)
+            buf.extend(enc)
             if eos_id is not None:
-                ids.append(eos_id)
+                buf.append(eos_id)
+        n_total = sum(c.numel() for c in chunks) + len(buf)
         bar.update(len(batch))
-        bar.set_postfix(tokens=len(ids))
+        bar.set_postfix(tokens=n_total)
+        if len(buf) >= chunk_tokens:
+            spill()
 
     batch: list[str] = []
     for text in texts:
@@ -173,17 +193,19 @@ def tokenize_with_progress(
         if len(batch) >= batch_size:
             flush(batch)
             batch = []
-            if max_tokens is not None and len(ids) >= max_tokens:
+            if max_tokens is not None and n_total >= max_tokens:
                 break
     else:
         # only reached if the loop wasn't cut short by the cap
         if batch:
             flush(batch)
+    spill()
     bar.close()
 
-    if max_tokens is not None and len(ids) > max_tokens:
-        del ids[max_tokens:]
-    return ids
+    data = torch.cat(chunks) if chunks else torch.empty(0, dtype=torch.int16)
+    if max_tokens is not None and data.numel() > max_tokens:
+        data = data[:max_tokens]
+    return data
 
 
 def load_cached_ids(path: Union[str, Path]) -> Optional[torch.Tensor]:

@@ -153,7 +153,7 @@ class Text8DataModule(pl.LightningDataModule):
                 desc="Tokenizing text8",
                 unit="chunk",
             )
-            data = torch.tensor(ids, dtype=torch.long)
+            data = ids.long()  # tokenize_with_progress returns an int16 tensor
             save_cached_ids(self._ids_path, data)
         return data
 

@@ -37,7 +37,8 @@ Usage:
 """
 
 import hashlib
-from typing import Optional, Sequence
+from pathlib import Path
+from typing import Optional, Sequence, Union
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -60,10 +61,21 @@ class ConcatTextDataModule(pl.LightningDataModule):
         pin_memory: Optional[bool] = None,
         train_tokenizer_on_mixture: bool = False,
         tokenizer_sample_chars: int = 200_000_000,
+        tokenizer_path: Optional[Union[str, Path]] = None,
     ):
         super().__init__()
         assert len(datamodules) >= 1, "need at least one submodule"
         self.datamodules = list(datamodules)
+        # When set, load THIS pinned tokenizer file and share it with every
+        # source instead of training one per source-set. Pinning one vocab
+        # across mixes removes the tokenizer as a confound in cross-mix
+        # comparisons (each mix otherwise retrains its own vocab on its own
+        # data, so benchmark deltas mix data and tokenizer effects).
+        self.tokenizer_path = Path(tokenizer_path) if tokenizer_path else None
+        assert not (self.tokenizer_path and train_tokenizer_on_mixture), (
+            "tokenizer_path pins a pre-trained vocab; it cannot be combined "
+            "with train_tokenizer_on_mixture"
+        )
         # When set, train ONE tokenizer on a sample drawn round-robin across all
         # sources (see setup) instead of letting the first source own it — so
         # the vocab compresses the whole mixture, not just the owner's register.
@@ -193,7 +205,20 @@ class ConcatTextDataModule(pl.LightningDataModule):
             return
 
         owner = self.datamodules[0]
-        if self.train_tokenizer_on_mixture and owner.tokenizer_backend != "pretrained":
+        if self.tokenizer_path is not None:
+            # Pinned shared vocab: load the file and hand it to every source.
+            # The fingerprint is the file's own bytes, so ids caches are keyed
+            # on the pinned tokenizer, never on any per-source retrain.
+            tokenizer = BPETokenizer.load(
+                self.tokenizer_path, backend=owner.tokenizer_backend
+            )
+            fingerprint = hashlib.blake2b(
+                self.tokenizer_path.read_bytes(), digest_size=6
+            ).hexdigest()
+            for dm in self.datamodules:
+                dm.set_shared_tokenizer(tokenizer, fingerprint)
+                dm.setup(stage)
+        elif self.train_tokenizer_on_mixture and owner.tokenizer_backend != "pretrained":
             # One vocab trained on the whole mixture: build it first, then hand
             # every source (owner included) the same tokenizer + fingerprint.
             tokenizer, fingerprint = self._train_or_load_blended_tokenizer()
