@@ -34,14 +34,17 @@ from tqdm import tqdm
 
 from chimera.data import (
     ConcatTextDataModule,
+    ContextMixDataModule,
     CosmopediaV2DataModule,
     FineWebEduTextDataModule,
     GooAQDataModule,
     LocalDocumentsDataModule,
     SQuADTextDataModule,
+    StackExchangeDataModule,
     TinyStoriesV2DataModule,
     TinyTextbooksDataModule,
     TinyWebTextDataModule,
+    WikipediaDataModule,
 )
 from chimera.models.attention import build_block_mask_and_pos
 from chimera.optim import Muon, muon_param_groups
@@ -60,7 +63,10 @@ BPB_HELDOUT_DOCS = 500
 BPB_BATCH_WINDOWS = 32
 
 # model
-SEQ_LEN = 512
+# Context length. 512 base by default; the context-extension stages bump it via
+# TINYLM_SEQ_LEN (2048/4096/8192). The model has no baked context limit (RoPE is
+# computed on the fly), so the same weights load and forward at any length.
+SEQ_LEN = int(os.environ.get("TINYLM_SEQ_LEN", "512"))
 DIM = 384
 N_HEADS = 12
 MLP_MULT = 3
@@ -111,12 +117,26 @@ ADAMW_WEIGHT_DECAY = 0.0
 # plain model. Static routing matrices are excluded from weight decay.
 VWN_M = int(os.environ.get("TINYLM_VWN_M", "2"))
 VWN_N = int(os.environ.get("TINYLM_VWN_N", "3"))
-BATCH_SIZE = 128
 # The VWN state at batch 128 hits VRAM pressure on the 16GB card (-31% tok/s vs
-# 2x64); split each global batch into microbatches with gradient accumulation.
-# Same global batch / identical gradients up to fp rounding.
-GRAD_ACCUM_STEPS = 2
+# 2x64); split each global batch into PHYS_BATCH-row microbatches with gradient
+# accumulation — same global batch / identical gradients up to fp rounding. The
+# long-context stages drop PHYS_BATCH (attention is O(N^2); a genuine 8k doc has
+# no block-sparsity to exploit) and raise GRAD_ACCUM to hold tokens/step ~= 65k:
+# 512->64x2, 2k->16x2, 4k->8x2, 8k->8x1 (all TINYLM_SEQ_LEN * BATCH_SIZE ~= 65536).
+PHYS_BATCH = int(os.environ.get("TINYLM_PHYS_BATCH", "64"))
+GRAD_ACCUM_STEPS = int(os.environ.get("TINYLM_GRAD_ACCUM", "2"))
+BATCH_SIZE = PHYS_BATCH * GRAD_ACCUM_STEPS  # global batch (split into microbatches)
 MAX_TRAIN_STEPS = int(os.environ.get("TINYLM_MAX_STEPS", "5000"))
+# Context-extension stage: "base" (flat 512 TokenDataset, unchanged) or
+# 2k/4k/8k (ContextMixDataModule: broad-short pool + long-window pool). Each
+# non-base stage resumes from the prior checkpoint via TINYLM_INIT_CKPT.
+CTX_STAGE = os.environ.get("TINYLM_CTX_STAGE", "base").strip()
+# Weights to load before training (the 512 base, or the prior context stage).
+INIT_CKPT = os.environ.get("TINYLM_INIT_CKPT", "").strip() or None
+# Per-stage short/long token shares (README "Context expansion route").
+CTX_STAGE_SHARES = {"2k": (0.35, 0.65), "4k": (0.27, 0.73), "8k": (0.25, 0.75)}
+# Banded-BPB eval cadence (millions of tokens); 0/unset -> reuse bench cadence.
+BAND_EVAL_EVERY_MTOKENS = float(os.environ.get("TINYLM_BAND_EVAL_EVERY_MT", "0")) or None
 # Eval cadence is expressed in TOKENS (env, in millions) and converted to steps
 # below once the global batch is known — so a token budget maps to the same
 # real cadence regardless of batch/seq. Falls back to the fixed step counts.
@@ -279,6 +299,100 @@ def make_datamodule() -> ConcatTextDataModule:
     )
     dm.prepare_data()
     dm.setup("fit")
+    return dm
+
+
+def make_context_datamodule() -> ContextMixDataModule:
+    """Two-pool datamodule for a context-extension stage (2k/4k/8k).
+
+    A broad SHORT pool (packed windows, short-context retention) plus a LONG pool
+    of genuinely long documents (Wikipedia + Stack Exchange + a long-FineWeb
+    slice) served as single-document random windows — the only data that trains
+    long-range attention, since doc masking resets at every EOS. Both pools pin
+    the SAME frozen tokenizer so their ids caches share one vocab.
+    """
+    DATA_DIR = "/mnt/ai/data"
+    VAL_TOKENS = 500_000
+    ctx = SEQ_LEN
+    TOKENIZER_PATH = os.environ.get("TINYLM_TOKENIZER_PATH", "").strip() or None
+    assert TOKENIZER_PATH is not None, (
+        "context stages require a pinned frozen tokenizer (TINYLM_TOKENIZER_PATH)"
+    )
+    assert CTX_STAGE in CTX_STAGE_SHARES, (
+        f"unknown TINYLM_CTX_STAGE={CTX_STAGE!r}; expected one of {list(CTX_STAGE_SHARES)}"
+    )
+    short_share, long_share = CTX_STAGE_SHARES[CTX_STAGE]
+    # Per-pool token pools (sampling weight = per-source cap). Generous so the
+    # step-capped run stays ~single-pass; env-overridable.
+    SHORT_TOKENS = int(os.environ.get("TINYLM_SHORT_POOL_TOKENS", "1_500_000_000"))
+    LONG_TOKENS = int(os.environ.get("TINYLM_LONG_POOL_TOKENS", "1_500_000_000"))
+
+    def _cap(pool: int, frac: float) -> int:
+        return int(pool * frac)
+
+    short_pool = ConcatTextDataModule(
+        [
+            # owner carries vocab_size/backend/doc convention (vocab is pinned)
+            CosmopediaV2DataModule(
+                data_dir=DATA_DIR, add_bos=True, seq_len=ctx, vocab_size=16_384,
+                max_train_tokens=_cap(SHORT_TOKENS, 0.30), max_val_tokens=VAL_TOKENS,
+            ),
+            FineWebEduTextDataModule(
+                data_dir=DATA_DIR, add_bos=True, seq_len=ctx,
+                max_train_tokens=_cap(SHORT_TOKENS, 0.34), max_val_tokens=VAL_TOKENS,
+            ),
+            TinyStoriesV2DataModule(
+                data_dir=DATA_DIR, add_bos=True, seq_len=ctx,
+                max_train_tokens=_cap(SHORT_TOKENS, 0.30), max_val_tokens=VAL_TOKENS,
+            ),
+            GooAQDataModule(
+                data_dir=DATA_DIR, add_bos=True, seq_len=ctx,
+                max_train_tokens=_cap(SHORT_TOKENS, 0.05), max_val_tokens=VAL_TOKENS,
+            ),
+            SQuADTextDataModule(
+                data_dir=DATA_DIR, add_bos=True, seq_len=ctx,
+                max_train_tokens=_cap(SHORT_TOKENS, 0.01), max_val_tokens=VAL_TOKENS,
+            ),
+        ],
+        batch_size=BATCH_SIZE,
+        tokenizer_path=TOKENIZER_PATH,
+    )
+    long_pool = ConcatTextDataModule(
+        [
+            WikipediaDataModule(
+                data_dir=DATA_DIR, add_bos=True, seq_len=ctx, vocab_size=16_384,
+                max_train_tokens=_cap(LONG_TOKENS, 0.50), max_val_tokens=VAL_TOKENS,
+            ),
+            # long-FineWeb slice: short pages get filtered out by min_doc_len,
+            # leaving the genuinely long coherent pages as long-range training data
+            FineWebEduTextDataModule(
+                data_dir=DATA_DIR, add_bos=True, seq_len=ctx,
+                max_train_tokens=_cap(LONG_TOKENS, 0.35), max_val_tokens=VAL_TOKENS,
+            ),
+            StackExchangeDataModule(
+                data_dir=DATA_DIR, add_bos=True, seq_len=ctx,
+                max_train_tokens=_cap(LONG_TOKENS, 0.15), max_val_tokens=VAL_TOKENS,
+            ),
+        ],
+        batch_size=BATCH_SIZE,
+        tokenizer_path=TOKENIZER_PATH,
+    )
+    dm = ContextMixDataModule(
+        short_pool,
+        long_pool,
+        ctx=ctx,
+        short_share=short_share,
+        long_share=long_share,
+        batch_size=BATCH_SIZE,
+        # bound the sampler to exactly this run's length (one item == one ctx row)
+        num_samples=MAX_TRAIN_STEPS * BATCH_SIZE,
+    )
+    dm.prepare_data()
+    dm.setup("fit")
+    print(
+        f"context stage {CTX_STAGE}: ctx={ctx} short/long={short_share:.0%}/{long_share:.0%}  "
+        f"short_items={len(dm.short_dataset):,} long_windows={len(dm.long_dataset):,}"
+    )
     return dm
 
 
@@ -558,12 +672,18 @@ def print_model_stats(model: GPT, global_batch_size: int):
 
 
 def train():
-    dm = make_datamodule()
+    is_context = CTX_STAGE != "base"
+    dm = make_context_datamodule() if is_context else make_datamodule()
 
     x, y = next(iter(dm.train_dataloader()))
-    train_tokens = len(dm.train_dataset.data)
-    val_tokens = len(dm.val_dataset.data)
     global_batch_size = x.numel()
+    if is_context:
+        # ContextMixDataModule.train_dataset is a ConcatDataset (no flat .data)
+        train_tokens = (len(dm.short_dataset) + len(dm.long_dataset)) * dm.ctx
+        val_tokens = len(dm.short_pool.val_dataset.data)
+    else:
+        train_tokens = len(dm.train_dataset.data)
+        val_tokens = len(dm.val_dataset.data)
 
     # token-budget cadence -> steps (fall back to the fixed step constants)
     val_every = (
@@ -576,16 +696,22 @@ def train():
         if BENCH_EVERY_MTOKENS
         else BENCH_EVERY_N_STEPS
     )
+    band_every = (
+        max(1, round(BAND_EVAL_EVERY_MTOKENS * 1e6 / global_batch_size))
+        if BAND_EVAL_EVERY_MTOKENS
+        else bench_every
+    )
     print(f"cadence: val every {val_every} steps, bench every {bench_every} steps")
 
     print(f"vocab_size={dm.vocab_size}")
-    print(
-        "train mix: "
-        + "  ".join(
-            f"{k}={v:,} ({v / train_tokens:.0%})"
-            for k, v in dm.source_train_tokens.items()
+    if not is_context:
+        print(
+            "train mix: "
+            + "  ".join(
+                f"{k}={v:,} ({v / train_tokens:.0%})"
+                for k, v in dm.source_train_tokens.items()
+            )
         )
-    )
     print(
         f"train tokens={train_tokens:,}  val tokens={val_tokens:,}  "
         f"total={train_tokens + val_tokens:,}"
@@ -594,6 +720,14 @@ def train():
     print(f"global batch size={global_batch_size:,}")
 
     model = make_model(dm.vocab_size)
+    # Resume from a prior checkpoint (the 512 base, or the previous context
+    # stage) before compile so the state_dict keys are clean. The model has no
+    # seq_len-dependent buffers, so 512 weights load into a longer-ctx model
+    # unchanged.
+    if INIT_CKPT is not None:
+        state = torch.load(INIT_CKPT, map_location="cpu")
+        model.load_state_dict(state)
+        print(f"loaded init weights from {INIT_CKPT}")
     optimizer = make_optimizer(model)
     base_lrs = [g["lr"] for g in optimizer.param_groups]
 
@@ -623,7 +757,12 @@ def train():
         model.train()
         # cap the epoch at MAX_TRAIN_STEPS batches (the pool is far larger) so
         # the bar tracks the real run length, not the full dataloader.
-        if CURRICULUM_PHASE_FRAC is not None:
+        if is_context:
+            # context stages: single mixed loader (short + long-window pools),
+            # no phase curriculum. Resample long-window offsets each epoch.
+            dm.set_epoch(epoch)
+            train_iter = islice(dm.train_dataloader(), MAX_TRAIN_STEPS)
+        elif CURRICULUM_PHASE_FRAC is not None:
             p1_steps = int(MAX_TRAIN_STEPS * CURRICULUM_PHASE_FRAC)
             loader1, loader2 = make_curriculum_loaders(dm)
             train_iter = chain(
@@ -670,6 +809,30 @@ def train():
                 print(
                     f"\nStep {global_step}: train_loss={step_loss:.4f}, train_perplexity={step_perplexity:.2f}, val_loss={val_loss:.4f}, val_perplexity={val_perplexity:.2f}, val_bpb={val_bpb:.4f}"
                 )
+                # length-banded BPB on long held-out docs: does widening the
+                # context actually lower bpb (long-range modelling) or flatline?
+                if is_context and global_step % band_every == 0:
+                    from bpb_banded import (
+                        CTX_WIDTHS,
+                        PROBE_DISTANCES,
+                        retrieval_probe,
+                        score_banded,
+                    )
+
+                    net = getattr(model, "_orig_mod", model)
+                    widths = [w for w in CTX_WIDTHS if w <= SEQ_LEN]
+                    bands = score_banded(net, dm.tokenizer, DEVICE, widths=widths)
+                    print(
+                        "  banded bpb: "
+                        + "  ".join(f"{k}={v:.4f}" for k, v in bands.items())
+                    )
+                    # synthetic long-range recall (bigram induction) up to ctx
+                    dists = [d for d in PROBE_DISTANCES if d <= SEQ_LEN]
+                    probe = retrieval_probe(net, DEVICE, distances=dists)
+                    print(
+                        "  retrieval: "
+                        + "  ".join(f"{k}={v:.2f}" for k, v in probe.items())
+                    )
 
             # in-training benchmark curve (skip the final step; the full table runs
             # after the loop) — a few cheap points to see the trajectory.

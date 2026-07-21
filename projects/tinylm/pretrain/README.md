@@ -242,6 +242,52 @@ Validate every phase separately by length band—for example `val/bpb_0_512`,
 `val/bpb_512_2k`, `val/bpb_2k_4k`, and `val/bpb_4k_8k`—and retain the short benchmark
 suite to detect regression before advancing to the next context length.
 
+### Implementation
+
+The machinery is built (data layer + train wiring; no model change — RoPE is computed
+on the fly, so the same 512 weights forward at any length):
+
+- `chimera.data.WindowSampledDataset` — random single-document contiguous windows from
+  the flat stream (boundaries recovered from inline EOS). Windows are window-relative in
+  position (`build_block_mask_and_pos` gives `0..N-1` for a single-doc window), carry no
+  false BOS mid-document, and cap windows-per-document so a few long docs can't dominate.
+  This is the only data that trains long-range attention; packed short docs don't (doc
+  masking resets at every EOS).
+- `chimera.data.ContextMixDataModule` — blends a broad **short** pool (packed
+  FineWeb/Cosmopedia/stories/QA) with a **long** pool (Wikipedia + Stack Exchange + a
+  long-FineWeb slice, window-sampled) by token share via a `WeightedRandomSampler`. Both
+  pools pin the **same frozen tokenizer**.
+- `bpb_banded.py` — two long-range capability signals (the short benchmark suite only
+  guards against short-context regression; it can't measure long-context *gain*):
+  - **length-banded BPB** (`val/bpb_512/2k/4k/8k`) scoring the same long held-out at
+    increasing context widths (reuses `bpb_gpt2.score`'s double-counting-safe rolling
+    window); shows whether widening the context actually lowers bpb.
+  - **retrieval probe** (`probe/recall_128…8k`, `retrieval_probe`) — bigram induction:
+    plant a random `(A, B)` pair, gap it by `d` tokens, re-present `A`, and measure how
+    often the top prediction is `B`. Chance ≈ 1/vocab, content-agnostic, pure forward
+    pass — a recall curve holding out to distance `d` localizes attention reach that
+    banded BPB alone can't. Advance a stage only if the capability signal beats the
+    previous width outside noise; if it flatlines, the 6M model is context-saturated —
+    stop rather than pay the next (4×-attention) stage.
+
+Each stage is one `train.py` run resuming from the prior checkpoint (`TINYLM_INIT_CKPT`),
+selected by `TINYLM_CTX_STAGE` (`2k`/`4k`/`8k`). `TINYLM_SEQ_LEN` sets the context; keep
+tokens/step ≈ 65k by dropping `TINYLM_PHYS_BATCH` and raising `TINYLM_GRAD_ACCUM`
+(2k→16×2, 4k→8×2, 8k→8×1). Short/long shares default to 35/65, 27/73, 25/75.
+
+```sh
+# 2k stage, resuming from the 512 base; 4k then resumes from ctx2k, 8k from ctx4k
+TINYLM_CTX_STAGE=2k TINYLM_SEQ_LEN=2048 TINYLM_PHYS_BATCH=16 TINYLM_GRAD_ACCUM=2 \
+  TINYLM_INIT_CKPT=/mnt/ai/runs/tinylm/pretrain/chimera_gpt6m.pt \
+  TINYLM_TOKENIZER_PATH=../data/tokenizers/16k/tokenizer.json \
+  TINYLM_MAX_STEPS=... TINYLM_VAL_EVERY_MT=100 TINYLM_BENCH_EVERY_MT=500 \
+  TINYLM_RUN_TAG=ctx2k uv run python train.py
+```
+
+Correctness is covered by `tests/test_window_dataset.py` (CPU: boundary recovery,
+single-doc windows, window-relative positions, per-epoch resampling, mixing shares). The
+GPU stage runs themselves are not yet done.
+
 ## TODO
 
 - **Expand the continued-pretraining sources for the assistant target.** Add filtered

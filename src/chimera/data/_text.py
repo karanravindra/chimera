@@ -95,6 +95,146 @@ class TokenDataset(Dataset):
         return x, y
 
 
+class WindowSampledDataset(Dataset):
+    """Document-aware random-window dataset over a flat int16 token stream.
+
+    :class:`TokenDataset` slices fixed non-overlapping windows that cross document
+    boundaries freely — fine for short-context training, but useless for teaching
+    long-range dependencies: FlexAttention document masking resets attention and
+    RoPE positions at every EOS, so a window packed from unrelated short documents
+    trains nothing at long range. This dataset instead serves a ``seq_len + 1``
+    window sampled at a RANDOM contiguous offset *inside a single long document*,
+    so every position in the window is mutually visible.
+
+    Document spans are recovered from the inline ``eos_id`` markers already in the
+    stream (``[bos?] doc tokens eos`` per document — the existing on-disk format,
+    no new layout). Only documents with at least ``min_doc_len`` tokens qualify;
+    shorter ones belong to the short/broad pool and are never zero-padded here.
+
+    Because a window is a slice of one document with no interior EOS,
+    :func:`chimera.models.attention.build_block_mask_and_pos` derives
+    ``pos_ids = 0..seq_len`` (window-relative) for it automatically. A mid-document
+    window carries no ``bos_id`` (the draw starts past a real doc's BOS) and no
+    leading/trailing EOS; the trailing EOS is present only when the window reaches
+    the true document end.
+
+    ``(x, y)`` are the ``seq_len``-length input and its one-token shift — the same
+    contract as :class:`TokenDataset`. Call :meth:`set_epoch` each epoch (and wire
+    :func:`window_worker_init_fn` as the DataLoader ``worker_init_fn``) so offsets
+    resample without correlating across workers.
+    """
+
+    def __init__(
+        self,
+        data: torch.Tensor,
+        seq_len: int,
+        eos_id: int,
+        bos_id: Optional[int] = None,
+        min_doc_len: Optional[int] = None,
+        max_windows_per_doc: int = 4,
+        seed: int = 0,
+    ):
+        self.data = data
+        self.seq_len = seq_len
+        self.eos_id = eos_id
+        self.bos_id = bos_id
+        # A window needs seq_len + 1 tokens (input + shifted target); a qualifying
+        # document must hold at least that. Callers can raise the floor to demand
+        # "genuinely long" docs (e.g. only score the tail of the length band).
+        self.min_doc_len = max(seq_len + 1, min_doc_len or 0)
+        self.max_windows_per_doc = max_windows_per_doc
+        self.seed = seed
+        self._epoch = 0
+        # Advanced on every __getitem__ so repeated draws of the same document
+        # (unavoidable under a with-replacement sampler) get FRESH offsets, not a
+        # deterministic-per-idx one. Reseeded by set_epoch / window_worker_init_fn.
+        self._gen = torch.Generator().manual_seed(seed)
+
+        # Recover document spans from inline EOS. Doc k occupies (prev_eos+1,
+        # eos_pos[k]] — inclusive of its trailing EOS; doc 0 starts at index 0.
+        eos_pos = (data == eos_id).nonzero(as_tuple=True)[0].tolist()
+        starts, ends = [], []
+        prev = 0
+        for e in eos_pos:
+            starts.append(prev)
+            ends.append(e)  # index of this doc's EOS token (inclusive end)
+            prev = e + 1
+
+        # Per-doc content start: skip a leading BOS so mid-doc windows never
+        # synthesize one (the window beginning exactly at doc start keeps its BOS).
+        self._doc_start = []
+        self._doc_end = []  # inclusive index of the doc's EOS
+        self._doc_nwin = []
+        for s, e in zip(starts, ends):
+            length = e - s + 1  # tokens including trailing EOS
+            if length < self.min_doc_len:
+                continue
+            self._doc_start.append(s)
+            self._doc_end.append(e)
+            # how many disjoint windows the doc could yield, capped
+            n = min(self.max_windows_per_doc, length // (seq_len + 1))
+            self._doc_nwin.append(max(1, n))
+
+        # Cumulative map: flat idx -> (doc index, window ordinal within doc).
+        self._cum = []
+        total = 0
+        for n in self._doc_nwin:
+            total += n
+            self._cum.append(total)
+        self._len = total
+
+    def set_epoch(self, epoch: int) -> None:
+        """Reseed so offsets are redrawn this epoch (call once per epoch)."""
+        self._epoch = epoch
+        self._gen = torch.Generator().manual_seed(self.seed * 1_000_003 + epoch)
+
+    def __len__(self) -> int:
+        return self._len
+
+    def _locate(self, idx: int) -> int:
+        # binary search the cumulative window counts -> owning doc index
+        import bisect
+
+        return bisect.bisect_right(self._cum, idx)
+
+    def __getitem__(self, idx: int):
+        doc = self._locate(idx)
+        s, e = self._doc_start[doc], self._doc_end[doc]
+        # Valid window starts run [s, e - seq_len] so the window stays inside the
+        # doc (last token index <= e, the doc's EOS). Start == s keeps the real
+        # BOS (aligned first window); any later start begins past it, so mid-doc
+        # windows carry no BOS. No interior EOS exists (EOS only at index e), so a
+        # window contains one only when it reaches the true doc end.
+        lo = s
+        hi = e - self.seq_len
+        if hi <= lo:
+            start = s
+        else:
+            start = int(torch.randint(lo, hi + 1, (1,), generator=self._gen).item())
+        window = self.data[start : start + self.seq_len + 1]
+        x = window[:-1].long()
+        y = window[1:].long()
+        return x, y
+
+
+def window_worker_init_fn(worker_id: int) -> None:
+    """Decorrelate :class:`WindowSampledDataset` offsets across DataLoader workers.
+
+    Each worker gets its own copy of the dataset; folding the worker id into the
+    per-item seed keeps the same-index draws from lining up across workers.
+    """
+    info = torch.utils.data.get_worker_info()
+    if info is None:
+        return
+    # ConcatDataset wraps the pools; reseed any WindowSampledDataset inside it.
+    datasets = getattr(info.dataset, "datasets", [info.dataset])
+    for ds in datasets:
+        if isinstance(ds, WindowSampledDataset):
+            ds._gen = torch.Generator().manual_seed(
+                (ds.seed * 1_000_003 + ds._epoch) * 1_000_003 + worker_id + 1
+            )
+
+
 class MaskedTokenDataset(Dataset):
     """Like :class:`TokenDataset` but with a parallel per-token label stream.
 

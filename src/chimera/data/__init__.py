@@ -7,6 +7,7 @@ from .chat_sft import (
 )
 from .cifar100 import CIFAR100DataModule
 from .concat_text import ConcatTextDataModule
+from .context_mix import ContextMixDataModule
 from .coqa import CoQADataModule
 from .cosmopedia_v2 import CosmopediaV2DataModule
 from .fineweb_edu import FineWebEduDataModule
@@ -33,6 +34,7 @@ __all__ = [
     "GooAQChatDataModule",
     "SQuADChatDataModule",
     "ConcatTextDataModule",
+    "ContextMixDataModule",
     "CoQADataModule",
     "CosmopediaV2DataModule",
     "FineWebEduDataModule",
