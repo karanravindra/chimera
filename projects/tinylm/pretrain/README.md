@@ -70,6 +70,12 @@ source `id`s are defined in Datasets above.
 
 5-way stderr: blimp 0.16, lambada 0.51, piqa 1.16, sciq 1.57, arc_easy 0.98.
 
+gpt2 val_bpb reference: **0.5932**, scored by `bpb_gpt2.py` on the exact same fixed
+held-out (tiny-textbooks test, 500 docs) and byte-normalized formula as every run's
+`val_bpb` above — tokenizer-agnostic, so it's directly comparable across gpt2's BPE and
+our own vocabs despite the different token counts. Script is self-contained (repo-tracked
+held-out text at `eval_data/bpb_heldout.txt`, CPU-only) — runnable on any machine.
+
 Notes: all rows are 5k steps (matched). The knowledge/reasoning tasks (piqa/sciq/arc)
 sit within noise across every mix including tt-alone — capacity-bound at 6M, not
 data-bound. The trainable axes are blimp (grammar) and lambada (long-range), driven
