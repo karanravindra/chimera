@@ -54,13 +54,14 @@ source `id`s are defined in Datasets above.
 
 | run     | steps | mix                               | blimp     | lambada   | piqa      | sciq      | arc_easy  |
 | ------- | ----- | --------------------------------- | --------- | --------- | --------- | --------- | --------- |
-| vwn+mhc | 5k    | curric + VWN(2,3) 1.5× + mHC-Lite | **71.01** | **18.36** | 56.31     | 67.80     | **35.35** |
-| curric  | 5k    | qa-mix, sc30, cosine LR, cos20→40 | 69.86     | 17.47     | 56.47     | **68.10** | 35.23     |
+| tok16k_4b | 61k | 4BT true-mix (cos42 fw43 ts11 gq3 sq1), pinned 16k vocab, plain | **71.29** | **19.62** | **58.32** | **69.10** | **37.71** |
+| vwn+mhc | 5k    | curric + VWN(2,3) 1.5× + mHC-Lite | 71.01     | 18.36     | 56.31     | 67.80     | 35.35     |
+| curric  | 5k    | qa-mix, sc30, cosine LR, cos20→40 | 69.86     | 17.47     | 56.47     | 68.10     | 35.23     |
 | sc30    | 5k    | qa-mix + logit softcap 30         | 69.18     | 16.86     | 55.93     | 67.70     | 34.93     |
 | qa-mix  | 5k    | cos30 fw34 ts30 gq5 sq1 +doc      | 69.53     | 17.27     | 57.24     | 67.40     | 34.76     |
 | cos     | 5k    | cos30 fw40 ts30                   | 70.09     | 16.94     | 55.44     | 54.50     | 33.96     |
 | 3-way   | 5k    | str30 fw40 ts30                   | 68.66     | 15.54     | 56.37     | 54.80     | 34.55     |
-| 4-way   | 5k    | tt30 str30 fw25 ts15              | 67.63     | 16.01     | **57.29** | 55.80     | 34.34     |
+| 4-way   | 5k    | tt30 str30 fw25 ts15              | 67.63     | 16.01     | 57.29     | 55.80     | 34.34     |
 | 5-way   | 5k    | tt30 str25 fw20 ts15 wt10         | 67.94     | 16.11     | 56.42     | 55.30     | 34.89     |
 | tt+ts   | 5k    | tt50 ts50                         | 65.03     | 12.59     | 56.53     | 54.70     | 31.99     |
 | tt      | 5k    | tt100                             | 63.72     | 6.95      | 56.96     | 55.10     | 33.63     |
@@ -76,7 +77,18 @@ held-out (tiny-textbooks test, 500 docs) and byte-normalized formula as every ru
 our own vocabs despite the different token counts. Script is self-contained (repo-tracked
 held-out text at `eval_data/bpb_heldout.txt`, CPU-only) — runnable on any machine.
 
-Notes: all rows are 5k steps (matched). The knowledge/reasoning tasks (piqa/sciq/arc)
+tok16k_4b (2026-07-21): the first full 4BT base run and the new best model — a
+**plain baseline** (no VWN, no mHC-Lite, no looping) on the pinned 16k vocab, 4.0B
+tokens over 61,035 steps at seq-512 with the true-4B mix (TinyStories capped at its
+~0.44B ceiling; cosmopedia/fineweb absorb the rest, ~single-pass). Best-in-table on
+every task and **best val_bpb 0.757** (vwn+mhc 0.830, 1BT-16k 0.781) — clean monotone
+descent, no forgetting. So 4B tokens + a pinned vocab beat the 1BT architecture tricks
+outright, and without VWN's +16% step cost. Caveat: this row crosses regimes (61k steps
++ pinned vocab), so it is NOT a like-for-like entry in the 5k mix-ablation cohort below
+— read the bold as "best model", not "best mix at 5k". This checkpoint
+(`chimera_gpt6m_tok16k_4b.pt`) is the 512 base the context-extension stages resume from.
+
+Notes: the 5k rows are step-matched (tok16k_4b excepted, see above). The knowledge/reasoning tasks (piqa/sciq/arc)
 sit within noise across every mix including tt-alone — capacity-bound at 6M, not
 data-bound. The trainable axes are blimp (grammar) and lambada (long-range), driven
 mainly by FineWeb. As the textbook source, `cos` (Cosmopedia v2) beats `str` on blimp
