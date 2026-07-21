@@ -827,6 +827,16 @@ class GPT(nn.Module):
         stop_token_ids = set(stop_token_ids or [])
         if eos_token_id is not None:
             stop_token_ids.add(eos_token_id)
+        # A chat reply ends with <|im_end|> (the per-TURN marker), not EOS (which
+        # ends the whole conversation and never appears in a single reply). Without
+        # this, generation runs past the answer into the next turn / a degenerate
+        # loop. Resolved from the tokenizer so base-LM sampling (no such token, or
+        # never emitted) is unaffected.
+        _tok = getattr(tokenizer, "_tok", None)
+        if _tok is not None:
+            im_end_id = _tok.token_to_id("<|im_end|>")
+            if im_end_id is not None:
+                stop_token_ids.add(im_end_id)
 
         past_kv = None
         model_input = generated_ids[:, -context_length:]
