@@ -720,6 +720,7 @@ class GPT(nn.Module):
         pos_ids=None,
         past_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         use_cache: bool = False,
+        last_only: bool = False,
     ):
         # block_mask + pos_ids enable packed-document FlexAttention with
         # per-document RoPE positions. Leave both None for eval/sampling.
@@ -744,6 +745,11 @@ class GPT(nn.Module):
                 )
                 if use_cache:
                     new_past_kv.append(new_kv)
+
+        # Sampling only consumes the final position's logits; slicing here skips
+        # the output stack + lm_head (T x V matmul + softcap) for the rest.
+        if last_only:
+            h = h[:, -1:]
 
         # VWN state D' -> optional GroupNorm -> learned reduce -> final RMSNorm.
         h = self.pre_reduce_norm(h)
@@ -824,13 +830,27 @@ class GPT(nn.Module):
 
         past_kv = None
         model_input = generated_ids[:, -context_length:]
+        # Absolute RoPE position of model_input's first token. Passed explicitly
+        # so sliding-window cache eviction keeps q/k relative offsets correct
+        # (positions are unbounded; see RotaryEmbedding).
+        pos_offset = 0
 
         for _ in range(max_new_tokens):
             if use_cache:
-                logits, past_kv = self(model_input, past_kv=past_kv, use_cache=True)
+                pos_ids = torch.arange(
+                    pos_offset, pos_offset + model_input.shape[1], device=device
+                ).unsqueeze(0)
+                logits, past_kv = self(
+                    model_input,
+                    pos_ids=pos_ids,
+                    past_kv=past_kv,
+                    use_cache=True,
+                    last_only=True,
+                )
+                pos_offset += model_input.shape[1]
             else:
                 model_input = generated_ids[:, -context_length:]
-                logits = self(model_input)
+                logits = self(model_input, last_only=True)
 
             next_token_logits = logits[:, -1, :].float()
 
@@ -902,9 +922,17 @@ class GPT(nn.Module):
             if next_token.item() in stop_token_ids:
                 break
 
-            if use_cache and generated_ids.shape[1] > context_length:
-                past_kv = None
-                model_input = generated_ids[:, -context_length:]
+            if use_cache and past_kv[0][0].shape[2] >= context_length:
+                # Sliding window: evict the oldest cache rows so the next
+                # one-token step sees at most context_length keys, instead of
+                # dropping the cache and re-prefilling the whole window every
+                # step (O(ctx) per token). The explicit pos_ids above keep q/k
+                # relative offsets exact. Note the streaming semantics: evicted-
+                # window tokens keep the K/V they were encoded with (full
+                # history at encode time), unlike a window re-prefill which
+                # re-encodes them against the truncated window.
+                keep = context_length - 1
+                past_kv = [(k[:, :, -keep:], v[:, :, -keep:]) for k, v in past_kv]
 
         token_ids = generated_ids[0].tolist()
 
