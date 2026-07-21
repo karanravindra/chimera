@@ -83,8 +83,35 @@ checkpoint noted per run (SFT shouldn't tank them).
 
 | run      | steps | base ckpt | mix              | val_loss  | notes                                                                                                   |
 | -------- | ----- | --------- | ---------------- | --------- | ------------------------------------------------------------------------------------------------------- |
-| full-ft  | 700   | curric    | gqc44 sqc55 evc1 | **2.975** | chat format lands; grounded extraction regressed (Tom's ball: base "red" → "white")                     |
+| gc-ctx4k | 700   | ctx4k     | grounded-core    | **2.49**  | **best assistant** — grounded ✓ ("red", "Mediterranean"); ctx keeps passage visible                     |
+| gc-ctx2k | 700   | ctx2k     | grounded-core    | 2.54      | grounded ✓ ("red"); seq-2048                                                                             |
+| gc-base  | 700   | tok16k_4b | grounded-core    | 2.93      | chat clean; grounded ✗ ("Tom's ball"→"white") — 512 truncates the passage                               |
+| gc-ctx8k | 700   | ctx8k     | grounded-core    | 3.79      | worst — overshoots; diverged at LR 0.005 (→ln V), stable at 0.002 but 8k base too eroded + sparse signal |
+| full-ft  | 700   | curric    | gqc44 sqc55 evc1 | 2.975     | chat format lands; grounded extraction regressed (Tom's ball: base "red" → "white")                     |
 | lora-r16 | 700   | curric    | gqc44 sqc55 evc1 | 3.293     | 3.3% trainable, AdamW 1e-3 no-wd; identical greeting behavior, same extraction regression ("blue kite") |
+
+grounded-core mix (`gc-*`, 2026-07-21): CoQA + QuAC (grounded multi-turn, lead) +
+SQuAD (capped below them, per the pilot's terse-span lesson) + a little GooAQ +
+everyday. All on the pinned 16k vocab + the 4BT `tok16k_4b` base or a context stage,
+SFT'd at each base's NATIVE seq_len (512/2k/4k/8k). Realized mix was QuAC-heavy (CoQA
+capped out at its full ~5M tokens — small dataset).
+
+**Headline: context extension pays off downstream even though it was a wash in
+pretraining.** Keeping the grounding passage inside a longer context window improves
+grounded extraction — base-512 SFT truncates the passage and hallucinates ("What color
+is Tom's ball?"→"white"✗, "Nile flows into?"→"Atlantic"✗), while ctx2k/ctx4k SFT read it
+correctly ("red"✓, "Mediterranean"✓). Masked val loss: base 2.93 → ctx2k 2.54 → **ctx4k
+2.49 (best)** → ctx8k 3.79. **There is a SWEET SPOT at ctx4k; 8k overshoots** — the 8k
+base is the most short-context-eroded (4× positional jump at 6M) and seq-8192 SFT on
+short grounded dialogs is mostly filler/sparse supervision. See
+[pretrain context-extension results](../pretrain/README.md#results-2026-07-21).
+
+Two fixes landed this round: (1) `GPT.sample` now stops at `<|im_end|>` (the per-turn
+marker) not just EOS (end-of-conversation, which never appears in a single reply) — the
+old behavior ran past the answer into a degenerate loop; residual is the 6M model not
+always emitting `<|im_end|>` on harder answers (→ run-ons, model-side). (2) `sft/train.py`
+gained `TINYLM_SEQ_LEN/BATCH_SIZE/BASE_CKPT/RUN_TAG/MUON_LR/ADAMW_LR` env knobs; the
+ctx8k SFT needed `MUON_LR=0.002` to avoid divergence at seq-8192.
 
 full-ft (2026-07-19): masked val 2.975. Generations: greeting canned-correct, closed-book
 fluent-but-circular (capacity), grounded extraction WORSE than base — suspect sqc's terse
