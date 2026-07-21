@@ -297,8 +297,39 @@ TINYLM_CTX_STAGE=2k TINYLM_SEQ_LEN=2048 TINYLM_PHYS_BATCH=16 TINYLM_GRAD_ACCUM=2
 ```
 
 Correctness is covered by `tests/test_window_dataset.py` (CPU: boundary recovery,
-single-doc windows, window-relative positions, per-epoch resampling, mixing shares). The
-GPU stage runs themselves are not yet done.
+single-doc windows, window-relative positions, per-epoch resampling, mixing shares).
+
+### Results (2026-07-21)
+
+Three stages, each resuming the prior checkpoint (2k from the 4BT `tok16k_4b` base; 8k
+was jumped directly from 2k, 4k filled in after) for **500MT** at a low continuation LR
+(muon 0.004) with the two-pool short/long mix. The gate metric is **banded BPB** — the
+same long held-out (Wikipedia) scored at increasing context widths; a stage trained only
+to length L collapses when scored beyond L, and training at L repairs it. Retrieval probe
+(bigram induction) stayed at chance for every stage — uninformative at 6M, ignore it.
+
+Banded BPB by scoring context width (lower = better; **bold** = best per width):
+
+| model | 512 | 2k | 4k | 8k | short benches (blimp/lam/piqa/sciq/arc) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| tok16k_4b (512 base) | 1.388 | 2.502 | — | — | 71.3 / 19.6 / 58.3 / 69.1 / 37.7 |
+| ctx2k | **1.297** | **1.292** | 1.611 | 2.812 | 72.1 / 20.9 / 57.7 / 73.2 / 38.1 |
+| ctx4k | 1.310 | 1.301 | **1.364** | 2.041 | 71.7 / 19.7 / 57.4 / 72.1 / 37.7 |
+| ctx8k | 1.331 | 1.329 | 1.391 | **1.586** | 71.6 / 18.9 / 56.4 / 70.7 / 37.0 |
+
+Verdict: the extension pipeline works — each stage repairs the collapse at its own length
+(base is catastrophic past 512: 2.50 @2k; ctx2k fixes ≤2k but cliffs at 4k/8k; ctx4k
+fixes 4k and halves the 8k gap 2.81→2.04; ctx8k flattens 8k to 1.59) and the cliff moves
+one rung right per stage. **But no genuine long-range gain**: within every stage, bpb
+still *rises* with context (e.g. ctx8k 1.33→1.59) — the model learns to *tolerate* long
+context, not *exploit* it. Cost: short-context erodes monotonically (512-band 1.297→1.331;
+benches peak at ctx2k then decline), so each doubling trades a little short-context ability
+for "doesn't break at length L". Consistent with the 6M capacity ceiling seen throughout —
+real long-range use is a model-scale lever, not a data one. Long pool is also thin at 8k
+(~9k windows / ~75M unique long tokens; Stack Exchange has no ≥8k docs), so 8k long windows
+repeat ~5×; enrich the long pool before any serious 8k run. Run logs:
+`/mnt/ai/runs/tinylm/pretrain/run_ctx{2k,4k,8k}_2026-07-21_*.log`; checkpoints
+`chimera_gpt6m_ctx{2k,4k,8k}.pt`.
 
 ## TODO
 
