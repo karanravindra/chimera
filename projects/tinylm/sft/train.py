@@ -28,8 +28,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "pretrain"))
 from model import GPT  # noqa: E402  (the pretrain model, single source of truth)
 
 from chimera.data import (  # noqa: E402
+    CoQAChatDataModule,
     EverydayConversationsDataModule,
     GooAQChatDataModule,
+    QuACChatDataModule,
     SQuADChatDataModule,
 )
 from chimera.data._text import MaskedTokenDataset  # noqa: E402
@@ -40,8 +42,11 @@ from chimera.optim import Muon, muon_param_groups  # noqa: E402
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 
-# architecture — MUST match the pretrain checkpoint
-SEQ_LEN = 512
+# architecture — MUST match the pretrain checkpoint. SEQ_LEN is env-driven so we
+# can SFT a context-extended base (ctx2k/4k/8k) at its native length; the model
+# has no baked context limit (RoPE on the fly), so only the data-window length
+# and batch change.
+SEQ_LEN = int(os.environ.get("TINYLM_SEQ_LEN", "512"))
 DIM = 384
 N_HEADS = 12
 MLP_MULT = 3
@@ -59,23 +64,34 @@ USE_LORA = os.environ.get("USE_LORA", "0") == "1"  # USE_LORA=1 uv run python tr
 LORA_R = 16
 LORA_ALPHA = 32.0
 LORA_LR = 1e-3  # LoRA convention: well above the full-FT AdamW lr
-BATCH_SIZE = 128
+# On-device batch; env-driven so long-context SFT (2k/4k/8k) can shrink it to fit
+# (SFT has no grad accum). ~65k tokens/batch at 512; drop proportionally for ctx.
+BATCH_SIZE = int(os.environ.get("TINYLM_BATCH_SIZE", "128"))
 MAX_TRAIN_STEPS = 700
 VALIDATE_EVERY_N_STEPS = 100
 N_EPOCHS = 2  # small pool; MAX_TRAIN_STEPS is the real cap
 WARMUP_STEPS = 50
 FINAL_LR_FRAC = 0.1
 
-# the pretrain vocab (chat specials already reserved); SFT never retrains it
-TOKENIZER_PATH = (
-    "/mnt/ai/data/mixture_tokenizers/tok_hf_v16384_c1000000000_371c2bf05f53.json"
+# the pinned 16k pretrain vocab (chat specials reserved at fixed ids); SFT never
+# retrains it. MUST match the base checkpoint's vocab — the current base
+# (tok16k_4b) was trained on this frozen tokenizer, not the old per-mixture one.
+TOKENIZER_PATH = os.environ.get(
+    "TINYLM_TOKENIZER_PATH",
+    "/root/Code/chimera/projects/tinylm/data/tokenizers/16k/tokenizer.json",
 )
-BASE_CHECKPOINT = "/mnt/ai/runs/tinylm/pretrain/chimera_gpt6m.pt"
+# The 4BT plain base (best pretrain checkpoint, pinned-vocab). Override via env.
+BASE_CHECKPOINT = os.environ.get(
+    "TINYLM_BASE_CKPT", "/mnt/ai/runs/tinylm/pretrain/chimera_gpt6m_tok16k_4b.pt"
+)
 
 RUN_DIR = Path("/mnt/ai/runs/tinylm/sft")
-CHECKPOINT_PATH = RUN_DIR / (
-    "chimera_gpt6m_sft_lora.pt" if USE_LORA else "chimera_gpt6m_sft.pt"
-)
+# Optional tag so SFT runs off different bases (e.g. context stages) save under
+# distinct names instead of clobbering the base-SFT checkpoint.
+_SFT_TAG = os.environ.get("TINYLM_RUN_TAG", "").strip()
+_SFT_TAG = f"_{_SFT_TAG}" if _SFT_TAG else ""
+_LORA_TAG = "_lora" if USE_LORA else ""
+CHECKPOINT_PATH = RUN_DIR / f"chimera_gpt6m_sft{_LORA_TAG}{_SFT_TAG}.pt"
 
 GENERATION_PROMPTS = [
     [{"role": "user", "content": "What color is the sky?"}],
@@ -102,9 +118,15 @@ def make_datamodules() -> list:
         seq_len=SEQ_LEN,
         max_val_tokens=250_000,
     )
+    # Phase-1 grounded-QA core: CoQA + QuAC (grounded multi-turn, the model's
+    # strength) lead; SQuAD kept moderate (the pilot's terse-span dominance
+    # regressed extraction), GooAQ a little closed-book, everyday for chat style.
+    # Shares governed by max_train_tokens (stream tokens incl. the passage).
     dms = [
-        GooAQChatDataModule(max_train_tokens=15_000_000, **common),
-        SQuADChatDataModule(max_train_tokens=None, **common),
+        CoQAChatDataModule(max_train_tokens=15_000_000, **common),
+        QuACChatDataModule(max_train_tokens=12_000_000, **common),
+        SQuADChatDataModule(max_train_tokens=6_000_000, **common),
+        GooAQChatDataModule(max_train_tokens=3_000_000, **common),
         EverydayConversationsDataModule(max_train_tokens=None, **common),
     ]
     for dm in dms:
@@ -138,6 +160,9 @@ def make_model(vocab_size: int) -> GPT:
         mlp_mult=MLP_MULT,
         n_layers=N_LAYERS,
         logit_softcap=LOGIT_SOFTCAP,
+        # plain baseline (VWN off) — MUST match the tok16k_4b base checkpoint
+        vwn_m=1,
+        vwn_n=1,
     )
 
 

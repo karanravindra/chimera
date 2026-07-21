@@ -1,8 +1,10 @@
 from .celebahq import CelebAHQDataModule
 from .chat_sft import (
     ChatSFTDataModule,
+    CoQAChatDataModule,
     EverydayConversationsDataModule,
     GooAQChatDataModule,
+    QuACChatDataModule,
     SQuADChatDataModule,
 )
 from .cifar100 import CIFAR100DataModule
@@ -30,8 +32,10 @@ __all__ = [
     "CIFAR100DataModule",
     "CelebAHQDataModule",
     "ChatSFTDataModule",
+    "CoQAChatDataModule",
     "EverydayConversationsDataModule",
     "GooAQChatDataModule",
+    "QuACChatDataModule",
     "SQuADChatDataModule",
     "ConcatTextDataModule",
     "ContextMixDataModule",
