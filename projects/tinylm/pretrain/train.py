@@ -77,8 +77,11 @@ MLP_MULT = 3
 N_LAYERS = 6
 N_LOOPS = 1
 
-# optimization
-MUON_LR = 0.02
+# optimization. Env-overridable so a continuation stage (context extension) can
+# resume a converged checkpoint at a LOWER peak LR — a fresh full-0.02 rewarm
+# perturbs the base (the 2k stage spiked short val_bpb 0.757->0.834 before
+# recovering); ~0.2x avoids that while still adapting.
+MUON_LR = float(os.environ.get("TINYLM_MUON_LR", "0.02"))
 # Warmup + cosine decay to FINAL_LR_FRAC (None -> constant LR). The late-run
 # decay doubles as the anti-forgetting lever: high-lr updates near the end are
 # what erase early-seen data.
@@ -109,7 +112,7 @@ RATIOS_PHASE2 = {
 # training AND eval so both see the same distribution; None = off. Must be a
 # train-time setting — capping an uncapped model at inference only hurts.
 LOGIT_SOFTCAP = 30.0
-ADAMW_LR = 1e-3
+ADAMW_LR = float(os.environ.get("TINYLM_ADAMW_LR", "1e-3"))
 ADAMW_WEIGHT_DECAY = 0.0
 
 # Virtual Width Networks: residual state runs at (VWN_N/VWN_M)*dim while
@@ -436,10 +439,11 @@ def make_curriculum_loaders(dm: ConcatTextDataModule):
     return loader(phase1), loader(phase2)
 
 
-def make_model(vocab_size: int) -> GPT:
+
+def make_model(vocab_size: int, seq_len: int = SEQ_LEN) -> GPT:
     return GPT(
         vocab_size=vocab_size,
-        seq_len=SEQ_LEN,
+        seq_len=seq_len,
         dim=DIM,
         n_heads=N_HEADS,
         mlp_mult=MLP_MULT,
