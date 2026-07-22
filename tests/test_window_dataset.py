@@ -30,7 +30,7 @@ def _stream(lengths):
 def test_boundary_recovery_filters_short_docs():
     # lengths: 3 (short), 50, 5 (short at ctx=8), 40
     data = _stream([3, 50, 5, 40])
-    ds = WindowSampledDataset(data, seq_len=8, eos_id=EOS, bos_id=BOS)
+    ds = WindowSampledDataset(data, seq_len=8, eos_id=EOS)
     # only docs with >= seq_len+1 (=9) content+EOS tokens qualify; the 50 and 40
     assert len(ds._doc_start) == 2
     assert len(ds) == sum(ds._doc_nwin)
@@ -38,7 +38,7 @@ def test_boundary_recovery_filters_short_docs():
 
 def test_window_shape_and_shift():
     data = _stream([60])
-    ds = WindowSampledDataset(data, seq_len=8, eos_id=EOS, bos_id=BOS, seed=0)
+    ds = WindowSampledDataset(data, seq_len=8, eos_id=EOS, seed=0)
     ds.set_epoch(0)
     for k in range(len(ds)):
         x, y = ds[k]
@@ -49,7 +49,7 @@ def test_window_shape_and_shift():
 
 def test_single_document_windows_only():
     data = _stream([80])
-    ds = WindowSampledDataset(data, seq_len=8, eos_id=EOS, bos_id=BOS, seed=1)
+    ds = WindowSampledDataset(data, seq_len=8, eos_id=EOS, seed=1)
     ds.set_epoch(0)
     for k in range(len(ds) * 4):
         x, _ = ds[k % len(ds)]
@@ -62,7 +62,7 @@ def test_single_document_windows_only():
 def test_window_relative_positions():
     # a mid-doc window has no interior EOS -> build_block_mask_and_pos gives 0..N-1
     data = _stream([100])
-    ds = WindowSampledDataset(data, seq_len=16, eos_id=EOS, bos_id=BOS, seed=2)
+    ds = WindowSampledDataset(data, seq_len=16, eos_id=EOS, seed=2)
     ds.set_epoch(0)
     x, _ = ds[0]
     _, pos_ids = build_block_mask_and_pos(x.unsqueeze(0), EOS)
@@ -71,7 +71,7 @@ def test_window_relative_positions():
 
 def test_per_epoch_resampling_changes_offsets():
     data = _stream([500])  # one long doc -> many possible offsets
-    ds = WindowSampledDataset(data, seq_len=16, eos_id=EOS, bos_id=BOS, seed=3)
+    ds = WindowSampledDataset(data, seq_len=16, eos_id=EOS, seed=3)
     ds.set_epoch(0)
     first_e0 = ds[0][0].clone()
     ds.set_epoch(1)
@@ -82,9 +82,7 @@ def test_per_epoch_resampling_changes_offsets():
 
 def test_windows_per_doc_cap():
     data = _stream([1000])  # could yield many windows; capped
-    ds = WindowSampledDataset(
-        data, seq_len=8, eos_id=EOS, bos_id=BOS, max_windows_per_doc=3
-    )
+    ds = WindowSampledDataset(data, seq_len=8, eos_id=EOS, max_windows_per_doc=3)
     assert len(ds) == 3
 
 
@@ -93,7 +91,7 @@ def test_mixing_share_matches_weights():
 
     long = _stream([200] * 10)
     # emulate the two pools: short = a plain index range, long = window ds
-    long_ds = WindowSampledDataset(long, seq_len=8, eos_id=EOS, bos_id=BOS)
+    long_ds = WindowSampledDataset(long, seq_len=8, eos_id=EOS)
 
     class _Range(torch.utils.data.Dataset):
         def __len__(self):
@@ -115,7 +113,7 @@ def test_mixing_share_matches_weights():
 
 def test_worker_init_fn_no_crash():
     data = _stream([100])
-    ds = WindowSampledDataset(data, seq_len=8, eos_id=EOS, bos_id=BOS)
+    ds = WindowSampledDataset(data, seq_len=8, eos_id=EOS)
     # no worker context -> no-op, must not raise
     window_worker_init_fn(0)
     assert len(ds) >= 1

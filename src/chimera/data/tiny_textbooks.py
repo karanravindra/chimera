@@ -33,15 +33,3 @@ class TinyTextbooksDataModule(HFTextDataModule):
     TEXT_COLUMN = "textbook"
     VAL_SPLIT = "test"
     UNIT = "doc"
-
-
-if __name__ == "__main__":
-    import os
-
-    os.environ.setdefault("HF_HOME", "/mnt/ai/data/hf")
-    dm = TinyTextbooksDataModule(data_dir="/mnt/ai/data")
-    dm.prepare_data()
-    dm.setup("fit")
-    x, y = next(iter(dm.train_dataloader()))
-    print(f"vocab_size={dm.vocab_size}")
-    print(f"train batch: x={x.shape}, y={y.shape}")

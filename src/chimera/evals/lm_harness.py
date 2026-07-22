@@ -4,6 +4,7 @@ import hashlib
 import os
 import pickle
 from pathlib import Path
+import tempfile
 
 import torch
 import torch.nn.functional as F
@@ -86,8 +87,13 @@ class ChimeraLM(TemplateLM):
     def loglikelihood(self, requests, disable_tqdm=False):
         # Replace the base "Tokenizing inputs" pass (re-encodes every request in Python
         # on every run) with a batched, disk-cached encode.
-        new_reqs = self._encode_pairs_cached([req.args for req in requests])
-        return self._loglikelihood_tokens(new_reqs, disable_tqdm=disable_tqdm)
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            new_reqs = self._encode_pairs_cached([req.args for req in requests])
+            return self._loglikelihood_tokens(new_reqs, disable_tqdm=disable_tqdm)
+        finally:
+            self.model.train(was_training)
 
     def _encode_pairs_cached(self, pairs):
         # Key on the tokenizer + the exact (ctx, cont) pairs. Independent of model
@@ -107,7 +113,19 @@ class ChimeraLM(TemplateLM):
             print(f"[bench] loaded pretokenized eval inputs from {cache_file.name}")
             return pickle.loads(cache_file.read_bytes())
         new_reqs = self._encode_pairs_batched(pairs)
-        cache_file.write_bytes(pickle.dumps(new_reqs))
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            dir=cache_dir,
+            prefix=f".{cache_file.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            tmp_path.write_bytes(pickle.dumps(new_reqs))
+            os.replace(tmp_path, cache_file)
+        finally:
+            tmp_path.unlink(missing_ok=True)
         print(f"[bench] pretokenized + cached {len(pairs)} inputs -> {cache_file.name}")
         return new_reqs
 
@@ -143,11 +161,14 @@ class ChimeraLM(TemplateLM):
         for context, continuation, is_empty in shifted:
             if is_empty:
                 cont_enc = enc.encode(continuation, add_special_tokens=False).ids
-                if self.prefix_token_id != cont_enc[0]:
+                if not cont_enc:
+                    new_reqs.append((("", continuation), [self.prefix_token_id], []))
+                elif self.prefix_token_id != cont_enc[0]:
                     context_enc, continuation_enc = [self.prefix_token_id], cont_enc
+                    new_reqs.append((("", continuation), context_enc, continuation_enc))
                 else:
                     context_enc, continuation_enc = cont_enc[:1], cont_enc[1:]
-                new_reqs.append((("", continuation), context_enc, continuation_enc))
+                    new_reqs.append((("", continuation), context_enc, continuation_enc))
                 continue
             context_enc = ctx_encs[j]
             continuation_enc = whole_encs[j][len(context_enc) :]
@@ -159,18 +180,26 @@ class ChimeraLM(TemplateLM):
 
     def _loglikelihood_tokens(self, requests, disable_tqdm=False):
         prepared = []
+        results = [[0.0, True] for _ in requests]
         for idx, (_, context_enc, continuation_enc) in enumerate(requests):
-            whole = list(context_enc) + list(continuation_enc)
-            if len(whole) > self.block_size + 1:
-                whole = whole[-(self.block_size + 1) :]  # left-truncate context only
-            inp = whole[:-1]
-            prepared.append((idx, inp, continuation_enc))
+            context = list(context_enc) or [self.prefix_token_id]
+            continuation = list(continuation_enc)
+            whole = context + continuation
+            context_len = len(context)
+            # Score every continuation token. Long continuations are split into
+            # rolling windows instead of being silently truncated or indexed with
+            # a negative continuation start.
+            for offset in range(0, len(continuation), self.block_size):
+                end = min(len(continuation), offset + self.block_size)
+                target_end = context_len + end
+                input_start = max(0, target_end - self.block_size - 1)
+                inp = whole[input_start:target_end][:-1]
+                prepared.append((idx, inp, continuation[offset:end]))
 
         prepared.sort(
             key=lambda x: len(x[1]), reverse=True
         )  # largest first -> OOM early
 
-        results = [None] * len(requests)
         batch, batch_max_len = [], 0
         pbar = tqdm(total=len(prepared), disable=disable_tqdm, desc="loglikelihood")
         for idx, inp, continuation_enc in prepared:
@@ -185,7 +214,7 @@ class ChimeraLM(TemplateLM):
             self._score_batch(batch, results)
             pbar.update(len(batch))
         pbar.close()
-        return results
+        return [(score, greedy) for score, greedy in results]
 
     @torch.inference_mode()
     def _score_batch(self, batch, results):
@@ -208,4 +237,5 @@ class ChimeraLM(TemplateLM):
             cont_ids = torch.tensor(continuation_enc, device=log_probs.device)
             token_logprobs = log_probs.gather(-1, cont_ids.unsqueeze(-1)).squeeze(-1)
             is_greedy = bool((log_probs.argmax(-1) == cont_ids).all().item())
-            results[idx] = (token_logprobs.sum().item(), is_greedy)
+            results[idx][0] += token_logprobs.sum().item()
+            results[idx][1] = results[idx][1] and is_greedy

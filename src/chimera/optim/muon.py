@@ -119,15 +119,13 @@ class Muon(torch.optim.Optimizer):
                 for b in buckets.values():
                     # Per-slice sqrt(rows/cols) scale from each param's
                     # ORIGINAL orientation (transposing must not change it).
-                    # momentum_buf stays None until first step(): allocating
-                    # at construction time would fix its dtype before
-                    # Lightning's precision plugin casts the model (e.g.
-                    # bf16-true), mismatching p.grad on the first real step.
                     b["scale"] = [
                         max(1, p.size(-2) / p.size(-1)) ** 0.5 for p in b["params"]
                     ]
                     b["scale_t"] = None  # cached device tensor, built lazily
-                    b["momentum_buf"] = None
+                    # The stacked bucket buffer lives in Optimizer.state under
+                    # one stable parameter so state_dict includes it.
+                    b["state_param"] = b["params"][0]
                 self._delegates.append((i, "muon", list(buckets.values())))
             else:
                 opt = torch.optim.AdamW(
@@ -137,7 +135,18 @@ class Muon(torch.optim.Optimizer):
                     eps=group["eps"],
                     weight_decay=group["weight_decay"],
                 )
+                # AdamW writes directly into the parent optimizer's canonical
+                # state mapping, so checkpoints contain its moments too.
+                opt.state = self.state
                 self._delegates.append((i, "adamw", opt))
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        # Optimizer.load_state_dict replaces ``self.state``; restore the shared
+        # reference used by each AdamW delegate after loading.
+        for _, kind, delegate in self._delegates:
+            if kind == "adamw":
+                delegate.state = self.state
 
     @torch.no_grad()
     def add_adamw_param(self, new_p, copy_state_from=None):
@@ -154,10 +163,10 @@ class Muon(torch.optim.Optimizer):
                 continue
             self.param_groups[i]["params"].append(new_p)
             delegate.param_groups[0]["params"].append(new_p)
-            if copy_state_from is not None and copy_state_from in delegate.state:
-                delegate.state[new_p] = {
+            if copy_state_from is not None and copy_state_from in self.state:
+                self.state[new_p] = {
                     k: (v.clone() if torch.is_tensor(v) else v)
-                    for k, v in delegate.state[copy_state_from].items()
+                    for k, v in self.state[copy_state_from].items()
                 }
             return
         raise RuntimeError("no AdamW param group to add to (all groups use Muon)")
@@ -202,9 +211,10 @@ class Muon(torch.optim.Optimizer):
                     grads = torch.stack(
                         [p.grad.mT if t else p.grad for p, t in zip(params, trans)]
                     )
-                buf = b["momentum_buf"]
+                state = self.state[b["state_param"]]
+                buf = state.get("momentum_buffer")
                 if buf is None:
-                    buf = b["momentum_buf"] = torch.zeros_like(grads)
+                    buf = state["momentum_buffer"] = torch.zeros_like(grads)
                 buf.lerp_(grads, 1 - momentum)
                 update = grads.lerp(buf, momentum) if nesterov else buf
                 update = zeropower_via_newtonschulz5(update, steps=ns_steps)

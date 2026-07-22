@@ -1,40 +1,35 @@
 [project]
 name = "chimera"
 version = "0.1.0"
-description = "Add your description here"
+description = "TinyLM training data, tokenizer, model components, and evaluation tools"
 readme = "README.md"
 authors = [
     { name = "Karan Ravindra", email = "21176108+karanravindra@users.noreply.github.com" }
 ]
 requires-python = ">=3.13"
 dependencies = [
-    "accelerate>=1.14.0",
-    "boto3>=1.43.47",
     "cut-cross-entropy>=25.1.1",
     "datasets>=3.0.0",
-    "ipykernel>=7.3.0",
-    "ipywidgets>=8.1.8",
     "lightning>=2.6.5",
-    "lm-eval>=0.4.12",
-    "matplotlib>=3.11.0",
-    "ollama>=0.6.2",
-    "openai>=2.45.0",
-    "pandas>=3.0.3",
-    "peft>=0.19.1",
-    "tabulate>=0.10.0",
     "tokenizers>=0.20.0",
     "torch>=2.12.1",
     "torchinfo>=1.8.0",
-    "torchvision>=0.27.1",
     "tqdm>=4.66.0",
-    "transformers>=5.13.1",
-    "trl>=1.8.0",
-    "tyro>=1.0.15",
-    "wandb>=0.28.0",
 ]
 
-[project.scripts]
-chimera = "chimera:main"
+[project.optional-dependencies]
+eval = [
+    "lm-eval>=0.4.12",
+    "pandas>=3.0.3",
+    "transformers>=5.13.1",
+]
+notebook = [
+    "ipykernel>=7.3.0",
+    "ipywidgets>=8.1.8",
+    "matplotlib>=3.11.0",
+    "ollama>=0.6.2",
+    "pandas>=3.0.3",
+]
 
 [build-system]
 requires = ["uv_build>=0.11.26,<0.12.0"]
@@ -48,3 +43,6 @@ dev = [
     "nbconvert>=7.17.1",
     "pytest>=9.1.1",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

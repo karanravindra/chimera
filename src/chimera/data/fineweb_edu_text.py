@@ -6,9 +6,7 @@ corpus for language-model pretraining — real-world knowledge and register that
 the synthetic story/textbook corpora lack. This is the
 :class:`chimera.data.hf_text.HFTextDataModule` variant, so it shares the mixture
 owner's tokenizer and drops straight into a
-:class:`chimera.data.ConcatTextDataModule` blend (unlike the standalone
-:class:`chimera.data.fineweb_edu.FineWebEduDataModule`, which trains its own
-tokenizer and carves its own val split).
+:class:`chimera.data.ConcatTextDataModule` blend.
 
 The ``sample-10BT`` config is ~28GB across ten ~2.1GB parquet shards (~1B tokens
 each). A single shard already exceeds a tiny model's token budget, so
@@ -35,15 +33,3 @@ class FineWebEduTextDataModule(HFTextDataModule):
     # model's cap, without pulling the full ~28GB config.
     DATA_FILES = "sample/10BT/000_00000.parquet"
     VAL_FROM_TRAIN = 0.01
-
-
-if __name__ == "__main__":
-    import os
-
-    os.environ.setdefault("HF_HOME", "/mnt/ai/data/hf")
-    dm = FineWebEduTextDataModule(data_dir="/mnt/ai/data", max_train_tokens=5_000_000)
-    dm.prepare_data()
-    dm.setup("fit")
-    x, y = next(iter(dm.train_dataloader()))
-    print(f"vocab_size={dm.vocab_size}")
-    print(f"train batch: x={x.shape}, y={y.shape}")

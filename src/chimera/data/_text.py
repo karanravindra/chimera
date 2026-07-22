@@ -1,6 +1,8 @@
 """Shared helpers for character/token-level text DataModules."""
 
+import os
 from pathlib import Path
+import tempfile
 from typing import Iterable, Optional, Union
 
 import numpy as np
@@ -96,7 +98,7 @@ class TokenDataset(Dataset):
 
 
 class WindowSampledDataset(Dataset):
-    """Document-aware random-window dataset over a flat int16 token stream.
+    """Document-aware random-window dataset over a flat integer token stream.
 
     :class:`TokenDataset` slices fixed non-overlapping windows that cross document
     boundaries freely — fine for short-context training, but useless for teaching
@@ -129,7 +131,6 @@ class WindowSampledDataset(Dataset):
         data: torch.Tensor,
         seq_len: int,
         eos_id: int,
-        bos_id: Optional[int] = None,
         min_doc_len: Optional[int] = None,
         max_windows_per_doc: int = 4,
         seed: int = 0,
@@ -137,7 +138,6 @@ class WindowSampledDataset(Dataset):
         self.data = data
         self.seq_len = seq_len
         self.eos_id = eos_id
-        self.bos_id = bos_id
         # A window needs seq_len + 1 tokens (input + shifted target); a qualifying
         # document must hold at least that. Callers can raise the floor to demand
         # "genuinely long" docs (e.g. only score the tail of the length band).
@@ -226,9 +226,16 @@ def window_worker_init_fn(worker_id: int) -> None:
     info = torch.utils.data.get_worker_info()
     if info is None:
         return
-    # ConcatDataset wraps the pools; reseed any WindowSampledDataset inside it.
-    datasets = getattr(info.dataset, "datasets", [info.dataset])
-    for ds in datasets:
+
+    def descendants(dataset):
+        children = getattr(dataset, "datasets", None)
+        if children is None:
+            yield dataset
+            return
+        for child in children:
+            yield from descendants(child)
+
+    for ds in descendants(info.dataset):
         if isinstance(ds, WindowSampledDataset):
             ds._gen = torch.Generator().manual_seed(
                 (ds.seed * 1_000_003 + ds._epoch) * 1_000_003 + worker_id + 1
@@ -286,7 +293,7 @@ def tokenize_with_progress(
     batch_size: int = 1024,
     chunk_tokens: int = 20_000_000,
 ) -> torch.Tensor:
-    """Encode an iterable of texts into one flat int16 token tensor, with a tqdm bar.
+    """Encode texts into a compact flat token tensor while preserving documents.
 
     Texts are encoded in batches via ``tokenizer.encode_batch`` (parallel on the
     fast backends), which is much faster than encoding one at a time. Optionally
@@ -295,45 +302,72 @@ def tokenize_with_progress(
     collected — so with a cap we never tokenize more than the last batch beyond
     it, and the surplus is trimmed off at the end.
 
-    Memory: the running ids are flushed to an int16 tensor chunk every
-    ``chunk_tokens`` and the Python buffer cleared, so peak RAM stays ~chunk-sized
-    regardless of corpus size. A flat Python ``list[int]`` of the whole stream (the
-    old behavior) is ~18 bytes/token and OOMs the box on multi-billion-token
-    sources; the int16 chunks are 2 bytes/token. Returns the concatenated int16
-    tensor (``vocab < 32767``, so int16 is lossless).
+    Memory: the running ids are flushed to a compact tensor chunk every
+    ``chunk_tokens`` and the Python buffer cleared, so peak RAM stays ~chunk-sized.
+    ``int16`` is used only when every tokenizer id fits; larger vocabularies use
+    ``int32``. When a total cap lands inside a document, the document is truncated
+    before its EOS rather than dropping that boundary marker.
     """
+    dtype = (
+        torch.int16
+        if tokenizer.vocab_size - 1 <= torch.iinfo(torch.int16).max
+        else torch.int32
+    )
     bar = tqdm(total=total, desc=desc, unit=unit)
     chunks: list[torch.Tensor] = []
     buf: list[int] = []
-    n_total = 0  # ids committed to chunks + still in buf
+    n_total = 0
 
     def spill() -> None:
         # move the Python buffer into a compact int16 chunk and free it
         if buf:
-            chunks.append(torch.tensor(buf, dtype=torch.int16))
+            chunks.append(torch.tensor(buf, dtype=dtype))
             buf.clear()
 
-    def flush(batch: list[str]) -> None:
+    def flush(batch: list[str]) -> bool:
         nonlocal n_total
-        for enc in tokenizer.encode_batch(batch):
-            if bos_id is not None:
-                buf.append(bos_id)
-            buf.extend(enc)
+        consumed = 0
+        for enc in tokenizer.encode_batch(batch, add_special_tokens=False):
+            doc = ([bos_id] if bos_id is not None else []) + list(enc)
             if eos_id is not None:
-                buf.append(eos_id)
-        n_total = sum(c.numel() for c in chunks) + len(buf)
-        bar.update(len(batch))
+                doc.append(eos_id)
+
+            if max_tokens is not None and n_total + len(doc) > max_tokens:
+                remaining = max_tokens - n_total
+                # If nothing has been emitted, retain a capped first document so
+                # a single very long row cannot produce an empty dataset.
+                if n_total == 0 and remaining > 0:
+                    prefix = [bos_id] if bos_id is not None else []
+                    suffix = [eos_id] if eos_id is not None else []
+                    room = max(0, remaining - len(prefix) - len(suffix))
+                    doc = prefix + list(enc[:room]) + suffix
+                    doc = doc[:remaining]
+                    if eos_id is not None and doc:
+                        doc[-1] = eos_id
+                    buf.extend(doc)
+                    n_total += len(doc)
+                    consumed += 1
+                bar.update(consumed)
+                bar.set_postfix(tokens=n_total)
+                return True
+
+            buf.extend(doc)
+            n_total += len(doc)
+            consumed += 1
+            if len(buf) >= chunk_tokens:
+                spill()
+
+        bar.update(consumed)
         bar.set_postfix(tokens=n_total)
-        if len(buf) >= chunk_tokens:
-            spill()
+        return max_tokens is not None and n_total >= max_tokens
 
     batch: list[str] = []
     for text in texts:
         batch.append(text)
         if len(batch) >= batch_size:
-            flush(batch)
+            capped = flush(batch)
             batch = []
-            if max_tokens is not None and n_total >= max_tokens:
+            if capped:
                 break
     else:
         # only reached if the loop wasn't cut short by the cap
@@ -342,22 +376,31 @@ def tokenize_with_progress(
     spill()
     bar.close()
 
-    data = torch.cat(chunks) if chunks else torch.empty(0, dtype=torch.int16)
-    if max_tokens is not None and data.numel() > max_tokens:
-        data = data[:max_tokens]
-    return data
+    return torch.cat(chunks) if chunks else torch.empty(0, dtype=dtype)
 
 
-def load_cached_ids(path: Union[str, Path]) -> Optional[torch.Tensor]:
-    """Return the cached 1D token tensor at ``path``, or ``None`` if absent."""
+def load_cached_ids(path: Union[str, Path]):
+    """Load a versioned cache payload; legacy unversioned caches are ignored."""
     path = Path(path)
     if path.exists():
-        return torch.load(path)
+        payload = torch.load(path, weights_only=False)
+        if isinstance(payload, dict) and payload.get("version") == 2:
+            return payload["data"]
     return None
 
 
-def save_cached_ids(path: Union[str, Path], data: torch.Tensor) -> None:
-    """Persist a 1D token tensor so future ``setup()`` calls skip tokenization."""
+def save_cached_ids(
+    path: Union[str, Path], data, metadata: Optional[dict] = None
+) -> None:
+    """Atomically persist a versioned token cache."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(data, path)
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+    ) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        torch.save({"version": 2, "metadata": metadata or {}, "data": data}, tmp_path)
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)

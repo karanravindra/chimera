@@ -1,63 +1,55 @@
-from .celebahq import CelebAHQDataModule
-from .chat_sft import (
-    ChatSFTDataModule,
-    CoQAChatDataModule,
-    EverydayConversationsDataModule,
-    GooAQChatDataModule,
-    NoRobotsChatDataModule,
-    QuACChatDataModule,
-    SODAChatDataModule,
-    SQuADChatDataModule,
-)
-from .cifar100 import CIFAR100DataModule
-from .concat_text import ConcatTextDataModule
-from .context_mix import ContextMixDataModule
-from .coqa import CoQADataModule
-from .cosmopedia_v2 import CosmopediaV2DataModule
-from .fineweb_edu import FineWebEduDataModule
-from .fineweb_edu_text import FineWebEduTextDataModule
-from .gooaq import GooAQDataModule
-from .imagenet1k import ImageNet1kDataModule
-from .local_documents import LocalDocumentsDataModule
-from .squad_text import SQuADTextDataModule
-from .stackexchange import StackExchangeDataModule
-from .text8 import Text8DataModule
-from .tinyshakespeare import TinyShakespeareDataModule
-from .tiny_strange_textbooks import TinyStrangeTextbooksDataModule
-from .tiny_textbooks import TinyTextbooksDataModule
-from .tiny_webtext import TinyWebTextDataModule
-from .tinystories_v2 import TinyStoriesV2DataModule
-from .ultrachat import UltraChatDataModule
-from .wikipedia import WikipediaDataModule
+"""TinyLM data API with lazy imports for optional runtime dependencies."""
 
-__all__ = [
-    "CIFAR100DataModule",
-    "CelebAHQDataModule",
-    "ChatSFTDataModule",
-    "CoQAChatDataModule",
-    "EverydayConversationsDataModule",
-    "GooAQChatDataModule",
-    "NoRobotsChatDataModule",
-    "QuACChatDataModule",
-    "SODAChatDataModule",
-    "SQuADChatDataModule",
-    "ConcatTextDataModule",
-    "ContextMixDataModule",
-    "CoQADataModule",
-    "CosmopediaV2DataModule",
-    "FineWebEduDataModule",
-    "FineWebEduTextDataModule",
-    "GooAQDataModule",
-    "ImageNet1kDataModule",
-    "LocalDocumentsDataModule",
-    "SQuADTextDataModule",
-    "StackExchangeDataModule",
-    "Text8DataModule",
-    "TinyShakespeareDataModule",
-    "TinyStoriesV2DataModule",
-    "TinyStrangeTextbooksDataModule",
-    "TinyTextbooksDataModule",
-    "TinyWebTextDataModule",
-    "UltraChatDataModule",
-    "WikipediaDataModule",
-]
+from importlib import import_module
+
+_EXPORTS = {
+    "ChatSFTDataModule": ("chat_sft", "ChatSFTDataModule"),
+    "CoQAChatDataModule": ("chat_sft", "CoQAChatDataModule"),
+    "EverydayConversationsDataModule": ("chat_sft", "EverydayConversationsDataModule"),
+    "GooAQChatDataModule": ("chat_sft", "GooAQChatDataModule"),
+    "NoRobotsChatDataModule": ("chat_sft", "NoRobotsChatDataModule"),
+    "QuACChatDataModule": ("chat_sft", "QuACChatDataModule"),
+    "SODAChatDataModule": ("chat_sft", "SODAChatDataModule"),
+    "SQuADChatDataModule": ("chat_sft", "SQuADChatDataModule"),
+    "ConcatTextDataModule": ("concat_text", "ConcatTextDataModule"),
+    "ContextMixDataModule": ("context_mix", "ContextMixDataModule"),
+    "CoQADataModule": ("coqa", "CoQADataModule"),
+    "CosmopediaV2DataModule": ("cosmopedia_v2", "CosmopediaV2DataModule"),
+    "FineWebEduTextDataModule": ("fineweb_edu_text", "FineWebEduTextDataModule"),
+    "GooAQDataModule": ("gooaq", "GooAQDataModule"),
+    "LocalDocumentsDataModule": ("local_documents", "LocalDocumentsDataModule"),
+    "SQuADTextDataModule": ("squad_text", "SQuADTextDataModule"),
+    "StackExchangeDataModule": ("stackexchange", "StackExchangeDataModule"),
+    "TinyStoriesV2DataModule": ("tinystories_v2", "TinyStoriesV2DataModule"),
+    "TinyStrangeTextbooksDataModule": (
+        "tiny_strange_textbooks",
+        "TinyStrangeTextbooksDataModule",
+    ),
+    "TinyTextbooksDataModule": ("tiny_textbooks", "TinyTextbooksDataModule"),
+    "TinyWebTextDataModule": ("tiny_webtext", "TinyWebTextDataModule"),
+    "WikipediaDataModule": ("wikipedia", "WikipediaDataModule"),
+    "MaskedTokenDataset": ("_text", "MaskedTokenDataset"),
+    "MemmapMaskedTokenDataset": ("_text", "MemmapMaskedTokenDataset"),
+    "MemmapTokenDataset": ("_text", "MemmapTokenDataset"),
+    "TokenDataset": ("_text", "TokenDataset"),
+    "WindowSampledDataset": ("_text", "WindowSampledDataset"),
+    "window_worker_init_fn": ("_text", "window_worker_init_fn"),
+}
+
+__all__ = sorted(_EXPORTS)
+
+
+def __getattr__(name: str):
+    try:
+        module_name, attribute = _EXPORTS[name]
+    except KeyError as error:
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}"
+        ) from error
+    value = getattr(import_module(f"{__name__}.{module_name}"), attribute)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted([*globals(), *__all__])

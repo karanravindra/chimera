@@ -28,6 +28,8 @@ concatenate their (ids, labels) streams — every stream ends on an EOS boundary
 """
 
 import hashlib
+import inspect
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -106,7 +108,33 @@ class ChatSFTDataModule(pl.LightningDataModule):
 
     def _stream_path(self, split: str, max_tokens: Optional[int]) -> Path:
         cap = "all" if max_tokens is None else str(max_tokens)
-        return self._dir / f"sft_{split}_tok-{self._fingerprint()}_{cap}.pt"
+        return self._dir / (
+            f"sft_v2_{split}_src-{self._dataset_fingerprint()}_"
+            f"tok-{self._fingerprint()}_{cap}.pt"
+        )
+
+    def _dataset_fingerprint(self) -> str:
+        payload = {
+            "schema": 2,
+            "class": f"{type(self).__module__}.{type(self).__qualname__}",
+            "repo": self.HF_REPO,
+            "config": self.CONFIG_NAME,
+            "data_files": self.DATA_FILES,
+            "train_split": self._hf_split(self.TRAIN_SPLIT),
+            "val_split": self._hf_split(self.VAL_SPLIT),
+            "renderer": self._renderer_fingerprint(),
+        }
+        encoded = json.dumps(payload, sort_keys=True, default=str).encode()
+        return hashlib.blake2b(encoded, digest_size=6).hexdigest()
+
+    def _renderer_fingerprint(self) -> str:
+        parts = []
+        for function in (type(self).row_to_messages, render_masked):
+            try:
+                parts.append(inspect.getsource(function))
+            except (OSError, TypeError):
+                parts.append(f"{function.__module__}.{function.__qualname__}")
+        return hashlib.blake2b("\n".join(parts).encode(), digest_size=6).hexdigest()
 
     def _hf_split(self, split: str) -> str:
         if self.VAL_FROM_TRAIN is None:
@@ -131,13 +159,14 @@ class ChatSFTDataModule(pl.LightningDataModule):
 
     def prepare_data(self):
         self._dir.mkdir(parents=True, exist_ok=True)
-        if (
-            self._stream_path(self.TRAIN_SPLIT, self.max_train_tokens).exists()
-            and self._stream_path(self.VAL_SPLIT, self.max_val_tokens).exists()
-        ):
-            return
-        self._load_dataset(self.TRAIN_SPLIT)
-        self._load_dataset(self.VAL_SPLIT)
+        self.tokenizer = BPETokenizer.load(self.tokenizer_path, backend="hf")
+        self.vocab_size = self.tokenizer.vocab_size
+        self.eos_id = self.tokenizer._tok.token_to_id(EOS)
+        self.bos_id = self.tokenizer._tok.token_to_id(BOS)
+        if self.eos_id is None or self.bos_id is None:
+            raise ValueError("SFT tokenizer must reserve the BOS/EOS special tokens")
+        self._build_split(self.TRAIN_SPLIT, self.max_train_tokens)
+        self._build_split(self.VAL_SPLIT, self.max_val_tokens)
 
     def _build_split(self, split: str, max_tokens: Optional[int]):
         path = self._stream_path(split, max_tokens)
@@ -158,8 +187,19 @@ class ChatSFTDataModule(pl.LightningDataModule):
             )
             conv_ids = [self.bos_id] + conv_ids
             conv_mask = [0] + conv_mask
+            conv_labels = [i if m else -100 for i, m in zip(conv_ids, conv_mask)]
+            if max_tokens is not None and len(ids) + len(conv_ids) > max_tokens:
+                remaining = max_tokens - len(ids)
+                if not ids and remaining > 0:
+                    conv_ids = conv_ids[:remaining]
+                    conv_labels = conv_labels[:remaining]
+                    conv_ids[-1] = self.eos_id
+                    conv_labels[-1] = -100
+                    ids.extend(conv_ids)
+                    labels.extend(conv_labels)
+                break
             ids.extend(conv_ids)
-            labels.extend(i if m else -100 for i, m in zip(conv_ids, conv_mask))
+            labels.extend(conv_labels)
             pbar.set_postfix(tokens=len(ids))
             if max_tokens is not None and len(ids) >= max_tokens:
                 break
@@ -171,13 +211,23 @@ class ChatSFTDataModule(pl.LightningDataModule):
                 torch.tensor(labels, dtype=torch.int32),
             ]
         )
-        save_cached_ids(path, data)
+        save_cached_ids(
+            path,
+            data,
+            metadata={
+                "source": self._dataset_fingerprint(),
+                "tokenizer": self._fingerprint(),
+                "split": split,
+                "max_tokens": max_tokens,
+            },
+        )
         return data[0], data[1]
 
     def setup(self, stage: Optional[str] = None):
         if self.train_dataset is not None:
             return
-        self.tokenizer = BPETokenizer.load(self.tokenizer_path, backend="hf")
+        if self.tokenizer is None:
+            self.tokenizer = BPETokenizer.load(self.tokenizer_path, backend="hf")
         self.vocab_size = self.tokenizer.vocab_size
         self.eos_id = self.tokenizer._tok.token_to_id(EOS)
         self.bos_id = self.tokenizer._tok.token_to_id(BOS)
@@ -185,8 +235,16 @@ class ChatSFTDataModule(pl.LightningDataModule):
             "SFT tokenizer must reserve the BOS/EOS special tokens"
         )
 
-        tr_ids, tr_labels = self._build_split(self.TRAIN_SPLIT, self.max_train_tokens)
-        va_ids, va_labels = self._build_split(self.VAL_SPLIT, self.max_val_tokens)
+        train = load_cached_ids(
+            self._stream_path(self.TRAIN_SPLIT, self.max_train_tokens)
+        )
+        val = load_cached_ids(self._stream_path(self.VAL_SPLIT, self.max_val_tokens))
+        if train is None or val is None:
+            raise RuntimeError(
+                "token caches are missing; run prepare_data() once before setup()"
+            )
+        tr_ids, tr_labels = train[0], train[1]
+        va_ids, va_labels = val[0], val[1]
         self.train_dataset = MaskedTokenDataset(tr_ids, tr_labels, self.seq_len)
         self.val_dataset = MaskedTokenDataset(va_ids, va_labels, self.seq_len)
 

@@ -1,10 +1,10 @@
 """
-ConcatTextDataModule — mix any HFTextDataModule sources into one token stream.
+ConcatTextDataModule — mix HFTextDataModule sources without copying their streams.
 
 Composes submodules instead of subclassing per combination: pass a list of
-:class:`chimera.data.hf_text.HFTextDataModule` instances and this module
-concatenates their flat token streams into a single training stream. The
-DataLoader's chunk-level shuffle then interleaves the sources within every
+:class:`chimera.data.hf_text.HFTextDataModule` instances and this module wraps
+their datasets in :class:`torch.utils.data.ConcatDataset`. The DataLoader's
+chunk-level shuffle then interleaves the sources within every
 epoch, so no separate sampling/weighting machinery is needed — a source's
 weight is simply how many tokens it contributes (cap per source via its own
 ``max_train_tokens``).
@@ -18,7 +18,7 @@ tokenizer. Put the source whose text should define the vocab first.
 Document convention (EOS/BOS wrapping) comes from each submodule's own
 ``add_eos`` / ``add_bos`` — they must agree across sources (asserted) so the
 doc mask and per-document position reset see one consistent stream. Every
-source stream ends on a document boundary, so the seams are clean.
+source remains a separate tensor, avoiding a full-corpus copy and source seams.
 
 Validation: ``val_dataloader()`` serves the concatenation of all sources' val
 streams (the overall mixture val); per-source loaders are available via
@@ -37,17 +37,16 @@ Usage:
 """
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
-import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 import lightning as pl
 
 from chimera.tokenizers import BPETokenizer
 
-from ._text import TokenDataset
 from .chat_template import SPECIAL_TOKENS
 from .hf_text import HFTextDataModule
 
@@ -119,8 +118,30 @@ class ConcatTextDataModule(pl.LightningDataModule):
         self.source_train_tokens: dict[str, int] = {}
 
     def prepare_data(self):
-        for dm in self.datamodules:
-            dm.prepare_data()
+        owner = self.datamodules[0]
+        if self.tokenizer_path is not None:
+            tokenizer = BPETokenizer.load(
+                self.tokenizer_path, backend=owner.tokenizer_backend
+            )
+            fingerprint = hashlib.blake2b(
+                self.tokenizer_path.read_bytes(), digest_size=6
+            ).hexdigest()
+            for dm in self.datamodules:
+                dm.set_shared_tokenizer(tokenizer, fingerprint)
+                dm.prepare_data()
+        elif (
+            self.train_tokenizer_on_mixture and owner.tokenizer_backend != "pretrained"
+        ):
+            tokenizer, fingerprint = self._train_or_load_blended_tokenizer()
+            for dm in self.datamodules:
+                dm.set_shared_tokenizer(tokenizer, fingerprint)
+                dm.prepare_data()
+        else:
+            owner.prepare_data()
+            fingerprint = owner._tokenizer_fingerprint()
+            for dm in self.datamodules[1:]:
+                dm.set_shared_tokenizer(owner.tokenizer, fingerprint)
+                dm.prepare_data()
 
     def _tokenizer_sources(self) -> list[HFTextDataModule]:
         """Submodules the mixture tokenizer is trained on.
@@ -138,13 +159,6 @@ class ConcatTextDataModule(pl.LightningDataModule):
         assert srcs, "every source is excluded from the mixture tokenizer"
         return srcs
 
-    def _tokenizer_source_names(self) -> list[str]:
-        return [
-            name
-            for name, dm in zip(self.source_names, self.datamodules)
-            if not getattr(dm, "exclude_from_mixture_tokenizer", False)
-        ]
-
     def _blended_tokenizer_path(self):
         """Cache path for the mixture-trained tokenizer.
 
@@ -154,8 +168,14 @@ class ConcatTextDataModule(pl.LightningDataModule):
         tokenizer paths in :class:`HFTextDataModule`).
         """
         owner = self.datamodules[0]
-        names = "+".join(sorted(self._tokenizer_source_names()))
-        key = hashlib.blake2b(names.encode(), digest_size=6).hexdigest()
+        sources = [
+            {"name": name, "source": dm._dataset_fingerprint()}
+            for name, dm in zip(self.source_names, self.datamodules)
+            if not getattr(dm, "exclude_from_mixture_tokenizer", False)
+        ]
+        key = hashlib.blake2b(
+            json.dumps(sources, sort_keys=True).encode(), digest_size=6
+        ).hexdigest()
         tag = f"{owner.tokenizer_backend}_v{owner.vocab_size}_c{self.tokenizer_sample_chars}"
         return owner.data_dir / "mixture_tokenizers" / f"tok_{tag}_{key}.json"
 
@@ -206,9 +226,6 @@ class ConcatTextDataModule(pl.LightningDataModule):
 
         owner = self.datamodules[0]
         if self.tokenizer_path is not None:
-            # Pinned shared vocab: load the file and hand it to every source.
-            # The fingerprint is the file's own bytes, so ids caches are keyed
-            # on the pinned tokenizer, never on any per-source retrain.
             tokenizer = BPETokenizer.load(
                 self.tokenizer_path, backend=owner.tokenizer_backend
             )
@@ -218,15 +235,20 @@ class ConcatTextDataModule(pl.LightningDataModule):
             for dm in self.datamodules:
                 dm.set_shared_tokenizer(tokenizer, fingerprint)
                 dm.setup(stage)
-        elif self.train_tokenizer_on_mixture and owner.tokenizer_backend != "pretrained":
-            # One vocab trained on the whole mixture: build it first, then hand
-            # every source (owner included) the same tokenizer + fingerprint.
-            tokenizer, fingerprint = self._train_or_load_blended_tokenizer()
+        elif (
+            self.train_tokenizer_on_mixture and owner.tokenizer_backend != "pretrained"
+        ):
+            path = self._blended_tokenizer_path()
+            if not path.exists():
+                raise RuntimeError("prepare_data() must run before setup()")
+            tokenizer = BPETokenizer.load(path, backend=owner.tokenizer_backend)
+            fingerprint = hashlib.blake2b(path.read_bytes(), digest_size=6).hexdigest()
             for dm in self.datamodules:
                 dm.set_shared_tokenizer(tokenizer, fingerprint)
                 dm.setup(stage)
         else:
-            # Owner first: it resolves the tokenizer everything else encodes with.
+            # Loading and sharing here is read-only, so every DDP rank receives
+            # the same tokenizer object after rank-zero prepare_data built caches.
             owner.setup(stage)
             fingerprint = owner._tokenizer_fingerprint()
             for dm in self.datamodules[1:]:
@@ -238,22 +260,19 @@ class ConcatTextDataModule(pl.LightningDataModule):
         self.eos_id = owner.eos_id
         self.bos_id = owner.bos_id
 
-        # Concatenate the train streams; every source stream ends on a document
-        # boundary (EOS), so each seam is a clean doc break and the chunk-level
-        # shuffle interleaves sources within every epoch.
         train_streams = [dm.train_dataset.data for dm in self.datamodules]
         self.source_train_tokens = {
             name: len(s) for name, s in zip(self.source_names, train_streams)
         }
-        self.train_dataset = TokenDataset(torch.cat(train_streams), self.seq_len)
+        self.train_dataset = ConcatDataset(
+            [dm.train_dataset for dm in self.datamodules]
+        )
 
         self.val_datasets = {
             name: dm.val_dataset
             for name, dm in zip(self.source_names, self.datamodules)
         }
-        self.val_dataset = TokenDataset(
-            torch.cat([dm.val_dataset.data for dm in self.datamodules]), self.seq_len
-        )
+        self.val_dataset = ConcatDataset([dm.val_dataset for dm in self.datamodules])
 
     def decode(self, ids) -> str:
         return self.tokenizer.decode(ids)
@@ -283,24 +302,3 @@ class ConcatTextDataModule(pl.LightningDataModule):
     def val_dataloaders_by_source(self) -> dict[str, DataLoader]:
         """One val loader per source, for per-domain val metrics."""
         return {name: self._val_dl(ds) for name, ds in self.val_datasets.items()}
-
-
-if __name__ == "__main__":
-    import os
-
-    os.environ.setdefault("HF_HOME", "/mnt/ai/data/hf")
-    from .tiny_textbooks import TinyTextbooksDataModule
-    from .tinystories_v2 import TinyStoriesV2DataModule
-
-    dm = ConcatTextDataModule(
-        [
-            TinyStoriesV2DataModule(data_dir="/mnt/ai/data", add_bos=True),
-            TinyTextbooksDataModule(data_dir="/mnt/ai/data", add_bos=True),
-        ],
-        batch_size=8,
-    )
-    dm.prepare_data()
-    dm.setup("fit")
-    x, y = next(iter(dm.train_dataloader()))
-    print(f"vocab_size={dm.vocab_size}  sources={dm.source_train_tokens}")
-    print(f"train batch: x={x.shape}, y={y.shape}")

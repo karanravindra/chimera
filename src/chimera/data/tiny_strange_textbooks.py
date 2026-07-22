@@ -43,17 +43,3 @@ class TinyStrangeTextbooksDataModule(HFTextDataModule):
         "data_part_3.parquet",
     ]
     VAL_FROM_TRAIN = 0.01
-
-
-if __name__ == "__main__":
-    import os
-
-    os.environ.setdefault("HF_HOME", "/mnt/ai/data/hf")
-    dm = TinyStrangeTextbooksDataModule(
-        data_dir="/mnt/ai/data", max_train_tokens=5_000_000
-    )
-    dm.prepare_data()
-    dm.setup("fit")
-    x, y = next(iter(dm.train_dataloader()))
-    print(f"vocab_size={dm.vocab_size}")
-    print(f"train batch: x={x.shape}, y={y.shape}")

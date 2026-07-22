@@ -8,7 +8,7 @@ vocabulary, a common toy corpus for tiny language models. All machinery
 caches, dataloaders) lives in :class:`chimera.data.hf_text.HFTextDataModule`;
 this class just points it at the dataset.
 
-Unlike :class:`FineWebEduDataModule`, TinyStoriesV2 ships native ``train`` and
+TinyStoriesV2 ships native ``train`` and
 ``validation`` splits, so each is tokenized into its own stream rather than
 carving a validation fraction off the train tokens.
 
@@ -28,12 +28,3 @@ class TinyStoriesV2DataModule(HFTextDataModule):
     TEXT_COLUMN = "text"
     VAL_SPLIT = "validation"
     UNIT = "story"
-
-
-if __name__ == "__main__":
-    dm = TinyStoriesV2DataModule()
-    dm.prepare_data()
-    dm.setup("fit")
-    x, y = next(iter(dm.train_dataloader()))
-    print(f"vocab_size={dm.vocab_size}")
-    print(f"train batch: x={x.shape}, y={y.shape}")

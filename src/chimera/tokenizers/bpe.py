@@ -28,7 +28,9 @@ Usage:
 """
 
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Iterable, Literal, Optional, Union
 
 Backend = Literal["scratch", "hf", "pretrained"]
@@ -186,9 +188,13 @@ class BPETokenizer:
 
     # -- encode / decode --------------------------------------------------
 
-    def encode(self, text: str) -> list[int]:
+    def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+        """Encode text without injecting a backend post-processor by default."""
         if self.backend in _FAST_BACKENDS:
-            return self._tok.encode(text).ids
+            return self._tok.encode(text, add_special_tokens=add_special_tokens).ids
+
+        if add_special_tokens:
+            raise ValueError("the scratch backend has no named special tokens")
 
         ids = list(text.encode("utf-8"))
         while len(ids) >= 2:
@@ -199,7 +205,9 @@ class BPETokenizer:
             ids = _merge(ids, pair, self.merges[pair])
         return ids
 
-    def encode_batch(self, texts: list[str]) -> list[list[int]]:
+    def encode_batch(
+        self, texts: list[str], *, add_special_tokens: bool = False
+    ) -> list[list[int]]:
         """Encode many texts at once.
 
         For the fast backends this dispatches to the Rust tokenizer's parallel
@@ -212,13 +220,19 @@ class BPETokenizer:
             encode_batch = getattr(self._tok, "encode_batch_fast", None)
             if encode_batch is None:
                 encode_batch = self._tok.encode_batch
-            return [enc.ids for enc in encode_batch(texts)]
-        return [self.encode(t) for t in texts]
+            return [
+                enc.ids
+                for enc in encode_batch(texts, add_special_tokens=add_special_tokens)
+            ]
+        return [self.encode(t, add_special_tokens=add_special_tokens) for t in texts]
 
-    def decode(self, ids) -> str:
+    def decode(self, ids, *, skip_special_tokens: bool = False) -> str:
+        """Decode losslessly by default, including any explicit special tokens."""
         ids = [int(i) for i in ids]
         if self.backend in _FAST_BACKENDS:
-            return self._tok.decode(ids)
+            return self._tok.decode(ids, skip_special_tokens=skip_special_tokens)
+        if skip_special_tokens:
+            raise ValueError("the scratch backend has no named special tokens")
         tokens = b"".join(self.vocab[i] for i in ids)
         return tokens.decode("utf-8", errors="replace")
 
@@ -232,14 +246,23 @@ class BPETokenizer:
 
     def save(self, path: Union[str, Path]):
         path = Path(path)
-        if self.backend in _FAST_BACKENDS:
-            self._tok.save(str(path))
-            return
-        payload = {
-            "backend": "scratch",
-            "merges": [[a, b, idx] for (a, b), idx in self.merges.items()],
-        }
-        path.write_text(json.dumps(payload))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            if self.backend in _FAST_BACKENDS:
+                self._tok.save(str(tmp_path))
+            else:
+                payload = {
+                    "backend": "scratch",
+                    "merges": [[a, b, idx] for (a, b), idx in self.merges.items()],
+                }
+                tmp_path.write_text(json.dumps(payload))
+            os.replace(tmp_path, path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     @classmethod
     def load(cls, path: Union[str, Path], backend: Optional[Backend] = None):

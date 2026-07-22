@@ -110,8 +110,6 @@ SPECIAL_TOKENS: list[str] = [
     TOOL_RESPONSE_END,
 ]
 
-# roles the model itself produces -> supervised at SFT time
-ASSISTANT_ROLES = {"assistant", "gpt", "function_call", "model", "chatbot"}
 # normalize source-specific role names to canonical ChatML roles
 ROLE_MAP = {
     "human": "user",

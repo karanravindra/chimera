@@ -5,7 +5,7 @@ tiny-strange-textbooks 25 / fineweb-edu 20 / tinystories-v2 15 / tiny-webtext 10
 The 16k BPE vocab is trained on a round-robin sample of all five, so it
 compresses the whole mixture rather than the owner's register alone.
 
-Raw PyTorch loop (deliberately not on the chimera.train Lightning rails):
+Raw PyTorch loop (deliberately independent of the archived Lightning harness):
 FlexAttention causal+document masking with per-doc RoPE positions, Cut Cross
 Entropy, Muon+AdamW, torch.compile. Run from this directory:
 
@@ -604,7 +604,23 @@ def run_benchmarks(model, dm, step=None):
     still climbing, or plateaued?). At the end (``step=None``) prints the full
     table + a copy-paste README Results row. Scored on the UNCOMPILED net (varied
     eval shapes would otherwise thrash torch.compile). Mirrors main.ipynb's eval cell."""
-    from chimera.evals import CHANCE, GPT2_SMALL, TASKS, ChimeraLM, headline, run_eval
+    try:
+        from chimera.evals import (
+            CHANCE,
+            GPT2_SMALL,
+            TASKS,
+            ChimeraLM,
+            headline,
+            run_eval,
+        )
+    except ModuleNotFoundError as error:
+        if error.name in {"lm_eval", "pandas", "transformers"}:
+            print(
+                "[bench] skipped: install optional evaluation dependencies with "
+                "`uv sync --extra eval`"
+            )
+            return {}
+        raise
 
     net = getattr(model, "_orig_mod", model)
     net.eval()

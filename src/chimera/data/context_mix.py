@@ -32,12 +32,11 @@ Usage:
 
 from typing import Optional
 
-import torch
 from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
 
 import lightning as pl
 
-from ._text import TokenDataset, WindowSampledDataset, window_worker_init_fn
+from ._text import WindowSampledDataset, window_worker_init_fn
 from .concat_text import ConcatTextDataModule
 
 
@@ -96,8 +95,8 @@ class ContextMixDataModule(pl.LightningDataModule):
         self.vocab_size: Optional[int] = None
         self.eos_id: Optional[int] = None
         self.bos_id: Optional[int] = None
-        self.short_dataset: Optional[TokenDataset] = None
-        self.long_dataset: Optional[WindowSampledDataset] = None
+        self.short_dataset: Optional[ConcatDataset] = None
+        self.long_dataset: Optional[ConcatDataset] = None
         self.train_dataset: Optional[ConcatDataset] = None
 
     def prepare_data(self):
@@ -122,15 +121,21 @@ class ContextMixDataModule(pl.LightningDataModule):
 
         # short pool: packed windows, already built at ctx by ConcatTextDataModule
         self.short_dataset = self.short_pool.train_dataset
-        # long pool: window-sample single documents from the concatenated stream
-        self.long_dataset = WindowSampledDataset(
-            self.long_pool.train_dataset.data,
-            seq_len=self.ctx,
-            eos_id=self.eos_id,
-            bos_id=self.bos_id,
-            min_doc_len=self.min_doc_len,
-            max_windows_per_doc=self.max_windows_per_doc,
-            seed=self.seed,
+        # Keep source tensors separate: no multi-gigabyte torch.cat copy, and no
+        # synthetic document can ever span a source seam.
+        windows = [
+            WindowSampledDataset(
+                dm.train_dataset.data,
+                seq_len=self.ctx,
+                eos_id=self.eos_id,
+                min_doc_len=self.min_doc_len,
+                max_windows_per_doc=self.max_windows_per_doc,
+                seed=self.seed + i,
+            )
+            for i, dm in enumerate(self.long_pool.datamodules)
+        ]
+        self.long_dataset = ConcatDataset(
+            [dataset for dataset in windows if len(dataset) > 0]
         )
         assert len(self.long_dataset) > 0, (
             "long pool has no documents >= min_doc_len; check the long sources / "
@@ -141,7 +146,8 @@ class ContextMixDataModule(pl.LightningDataModule):
     def set_epoch(self, epoch: int) -> None:
         """Resample long-window offsets for a new epoch."""
         if self.long_dataset is not None:
-            self.long_dataset.set_epoch(epoch)
+            for dataset in self.long_dataset.datasets:
+                dataset.set_epoch(epoch)
 
     def _sampler(self) -> WeightedRandomSampler:
         n_short, n_long = len(self.short_dataset), len(self.long_dataset)

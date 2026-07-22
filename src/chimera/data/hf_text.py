@@ -36,6 +36,8 @@ none, so they are no-ops there.
 """
 
 import hashlib
+import inspect
+import json
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -148,7 +150,10 @@ class HFTextDataModule(pl.LightningDataModule):
         if hp.tokenizer_backend == "pretrained":
             tag = "pretrained_" + hp.pretrained_id.replace("/", "_")
         else:
-            tag = f"{hp.tokenizer_backend}_v{hp.vocab_size}_c{hp.tokenizer_train_chars}"
+            tag = (
+                f"{hp.tokenizer_backend}_v{hp.vocab_size}_"
+                f"c{hp.tokenizer_train_chars}_src-{self._dataset_fingerprint()}"
+            )
         return self._dir / f"tokenizer_{tag}.json"
 
     def set_shared_tokenizer(self, tokenizer: BPETokenizer, fingerprint: str):
@@ -190,7 +195,41 @@ class HFTextDataModule(pl.LightningDataModule):
         # only tagged when on, so pre-existing (no-bos) caches keep matching
         bos = "_bos" if self.hparams.add_bos else ""
         cap = "all" if max_tokens is None else str(max_tokens)
-        return self._dir / f"ids_{split}_tok-{fingerprint}_{eos}{bos}_{cap}.pt"
+        source = self._dataset_fingerprint()
+        return self._dir / (
+            f"ids_v2_{split}_src-{source}_tok-{fingerprint}_{eos}{bos}_{cap}.pt"
+        )
+
+    def _dataset_fingerprint(self) -> str:
+        """Hash every source/rendering option that can change token ids."""
+        payload = {
+            "schema": 2,
+            "class": f"{type(self).__module__}.{type(self).__qualname__}",
+            "repo": getattr(self, "HF_REPO", None),
+            "config": self.CONFIG_NAME,
+            "data_files": self.DATA_FILES,
+            "text_column": self.TEXT_COLUMN,
+            "text_columns": self.TEXT_COLUMNS,
+            "text_join": self.TEXT_JOIN,
+            "train_split": self._hf_split(self.TRAIN_SPLIT),
+            "val_split": self._hf_split(self.VAL_SPLIT),
+            "eos_token": self.eos_token if self.add_eos else None,
+            "bos_token": self.bos_token if self.add_bos else None,
+            "renderer": self._renderer_fingerprint(),
+        }
+        encoded = json.dumps(payload, sort_keys=True, default=str).encode()
+        return hashlib.blake2b(encoded, digest_size=6).hexdigest()
+
+    def _renderer_fingerprint(self) -> str:
+        """Hash subclass text-rendering hooks so code changes invalidate caches."""
+        parts = []
+        for name in ("_row_text", "iter_texts"):
+            method = getattr(type(self), name)
+            try:
+                parts.append(inspect.getsource(method))
+            except (OSError, TypeError):
+                parts.append(f"{method.__module__}.{method.__qualname__}")
+        return hashlib.blake2b("\n".join(parts).encode(), digest_size=6).hexdigest()
 
     def _row_text(self, row) -> str:
         """The document text for one row (single column, or joined columns)."""
@@ -247,22 +286,18 @@ class HFTextDataModule(pl.LightningDataModule):
         )
 
     def prepare_data(self):
-        # download + cache only, called once on a single process
+        # Lightning runs prepare_data on one process. All downloading, tokenizer
+        # training, tokenization, and cache writes therefore belong here—not setup,
+        # which runs independently on every DDP rank.
         self._dir.mkdir(parents=True, exist_ok=True)
-        # The ids caches are keyed on the tokenizer's content hash, so we can
-        # only match them once the tokenizer exists (own file or shared). If
-        # both streams are already cached for it, skip the download entirely;
-        # otherwise fetch the raw data (needed to train the tokenizer and/or
-        # tokenize the splits).
-        if self._shared_fingerprint is not None or self._tokenizer_path.exists():
-            fp = self._tokenizer_fingerprint()
-            if (
-                self._ids_path(self.TRAIN_SPLIT, self.max_train_tokens, fp).exists()
-                and self._ids_path(self.VAL_SPLIT, self.max_val_tokens, fp).exists()
-            ):
-                return
-        self._load_dataset(self.TRAIN_SPLIT)
-        self._load_dataset(self.VAL_SPLIT)
+        if self.tokenizer is None:
+            self.tokenizer = self._load_or_train_tokenizer()
+        self.vocab_size = self.tokenizer.vocab_size
+        self.eos_id = self._resolve_special_id(self.add_eos, self.eos_token)
+        self.bos_id = self._resolve_special_id(self.add_bos, self.bos_token)
+        fingerprint = self._tokenizer_fingerprint()
+        self._build_split(self.TRAIN_SPLIT, self.max_train_tokens, fingerprint)
+        self._build_split(self.VAL_SPLIT, self.max_val_tokens, fingerprint)
 
     def _load_or_train_tokenizer(self) -> BPETokenizer:
         if self._tokenizer_path.exists():
@@ -326,10 +361,9 @@ class HFTextDataModule(pl.LightningDataModule):
 
         # tokenize_with_progress batches these for encode_batch and stops early
         # once max_tokens is reached.
-        # Returns a flat int16 tensor (vocab << 32767), built via bounded chunks
-        # so multi-billion-token sources don't OOM. int16 = 4x less RAM than int64
-        # for the stream, which matters once several capped sources concatenate
-        # into one pool. Datasets cast per-item via TokenDataset.__getitem__().long().
+        # Returns a flat int16/int32 tensor selected from the tokenizer's vocab,
+        # built via bounded chunks so large sources do not need Python-list RAM.
+        # Datasets cast each item via TokenDataset.__getitem__().long().
         data = tokenize_with_progress(
             self.tokenizer,
             self.iter_texts(ds),
@@ -340,7 +374,16 @@ class HFTextDataModule(pl.LightningDataModule):
             bos_id=self.bos_id,
             max_tokens=max_tokens,
         )
-        save_cached_ids(ids_path, data)
+        save_cached_ids(
+            ids_path,
+            data,
+            metadata={
+                "source": self._dataset_fingerprint(),
+                "tokenizer": fingerprint,
+                "split": split,
+                "max_tokens": max_tokens,
+            },
+        )
         return data
 
     def setup(self, stage: Optional[str] = None):
@@ -348,7 +391,11 @@ class HFTextDataModule(pl.LightningDataModule):
             return
 
         if self.tokenizer is None:
-            self.tokenizer = self._load_or_train_tokenizer()
+            if not self._tokenizer_path.exists():
+                raise RuntimeError("prepare_data() must run before setup()")
+            self.tokenizer = BPETokenizer.load(
+                self._tokenizer_path, backend=self.tokenizer_backend
+            )
         self.vocab_size = self.tokenizer.vocab_size
         self.eos_id = self._resolve_special_id(self.add_eos, self.eos_token)
         self.bos_id = self._resolve_special_id(self.add_bos, self.bos_token)
@@ -367,10 +414,16 @@ class HFTextDataModule(pl.LightningDataModule):
 
         # Bind both streams to this exact tokenizer via its content hash.
         fingerprint = self._tokenizer_fingerprint()
-        train_data = self._build_split(
+        train_path = self._ids_path(
             self.TRAIN_SPLIT, self.max_train_tokens, fingerprint
         )
-        val_data = self._build_split(self.VAL_SPLIT, self.max_val_tokens, fingerprint)
+        val_path = self._ids_path(self.VAL_SPLIT, self.max_val_tokens, fingerprint)
+        train_data = load_cached_ids(train_path)
+        val_data = load_cached_ids(val_path)
+        if train_data is None or val_data is None:
+            raise RuntimeError(
+                "token caches are missing; run prepare_data() once before setup()"
+            )
         self.train_dataset = TokenDataset(train_data, self.seq_len)
         self.val_dataset = TokenDataset(val_data, self.seq_len)
 
