@@ -4,7 +4,9 @@ from .chat_sft import (
     CoQAChatDataModule,
     EverydayConversationsDataModule,
     GooAQChatDataModule,
+    NoRobotsChatDataModule,
     QuACChatDataModule,
+    SODAChatDataModule,
     SQuADChatDataModule,
 )
 from .cifar100 import CIFAR100DataModule
@@ -35,7 +37,9 @@ __all__ = [
     "CoQAChatDataModule",
     "EverydayConversationsDataModule",
     "GooAQChatDataModule",
+    "NoRobotsChatDataModule",
     "QuACChatDataModule",
+    "SODAChatDataModule",
     "SQuADChatDataModule",
     "ConcatTextDataModule",
     "ContextMixDataModule",

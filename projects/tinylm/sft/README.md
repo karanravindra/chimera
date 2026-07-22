@@ -106,6 +106,19 @@ base is the most short-context-eroded (4× positional jump at 6M) and seq-8192 S
 short grounded dialogs is mostly filler/sparse supervision. See
 [pretrain context-extension results](../pretrain/README.md#results-2026-07-21).
 
+Phase-2 breadth (`gc-ctx4k-p2`, 2026-07-21): added instruction breadth to the ctx4k
+base — No Robots (summarize/rewrite/extract, CC BY-NC) + a light SODA sample (social
+dialog). **Negative result at 6M: breadth diluted rather than added.** The grounded probe
+regressed ("Tom's ball" went from "red" to ignoring the question), summarize/rewrite still
+fail (model too small), so the focused grounded-only ctx4k-SFT stays the best assistant.
+Masked val 3.66 is NOT comparable to the grounded runs' ~2.5 — No Robots/SODA are 40–66%
+supervised (long generative targets) vs the grounded core's short extractive spans, so
+absolute loss is higher by task, not by quality. Also: the high-supervision mix **diverged
+at the default LR 0.005** (collapsed to ln(V) in <100 steps — the large gradients from long
+supervised spans); needed `MUON_LR=0.002`. OASST1 (→ preference tuning) and Tulu (needs
+source filtering) were deferred. Verdict: don't broaden SFT at 6M — it's a scale lever, not
+a data one. Modules (`NoRobots/SODAChatDataModule`) are kept for a larger base.
+
 Two fixes landed this round: (1) `GPT.sample` now stops at `<|im_end|>` (the per-turn
 marker) not just EOS (end-of-conversation, which never appears in a single reply) — the
 old behavior ran past the answer into a degenerate loop; residual is the 6M model not

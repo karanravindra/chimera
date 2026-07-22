@@ -31,7 +31,9 @@ from chimera.data import (  # noqa: E402
     CoQAChatDataModule,
     EverydayConversationsDataModule,
     GooAQChatDataModule,
+    NoRobotsChatDataModule,
     QuACChatDataModule,
+    SODAChatDataModule,
     SQuADChatDataModule,
 )
 from chimera.data._text import MaskedTokenDataset  # noqa: E402
@@ -120,14 +122,17 @@ def make_datamodules() -> list:
         seq_len=SEQ_LEN,
         max_val_tokens=250_000,
     )
-    # Phase-1 grounded-QA core: CoQA + QuAC (grounded multi-turn, the model's
-    # strength) lead; SQuAD kept moderate (the pilot's terse-span dominance
-    # regressed extraction), GooAQ a little closed-book, everyday for chat style.
-    # Shares governed by max_train_tokens (stream tokens incl. the passage).
+    # Phase-2 mix: the grounded-QA core (CoQA+QuAC lead, SQuAD/GooAQ moderate)
+    # PLUS instruction breadth — No Robots (summarize/rewrite/extract/classify,
+    # the transformation-instruction target) and a light SODA sample (social
+    # dialog; synthetic, capped low to avoid style imprint). OASST1 (-> preference
+    # tuning) and Tulu (needs source-filtering) deferred. Shares via max_train_tokens.
     dms = [
         CoQAChatDataModule(max_train_tokens=15_000_000, **common),
         QuACChatDataModule(max_train_tokens=12_000_000, **common),
+        NoRobotsChatDataModule(max_train_tokens=8_000_000, **common),
         SQuADChatDataModule(max_train_tokens=6_000_000, **common),
+        SODAChatDataModule(max_train_tokens=4_000_000, **common),
         GooAQChatDataModule(max_train_tokens=3_000_000, **common),
         EverydayConversationsDataModule(max_train_tokens=None, **common),
     ]
