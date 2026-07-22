@@ -26,11 +26,9 @@ Usage:
 
 from .hf_text import HFTextDataModule
 
-HF_REPO = "nampdn-ai/tiny-strange-textbooks"
-
 
 class TinyStrangeTextbooksDataModule(HFTextDataModule):
-    HF_REPO = HF_REPO
+    HF_REPO = "nampdn-ai/tiny-strange-textbooks"
     DIR_NAME = "tiny-strange-textbooks"
     TEXT_COLUMN = "text"
     UNIT = "doc"

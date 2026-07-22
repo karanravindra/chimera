@@ -33,8 +33,3 @@ class GooAQDataModule(HFTextDataModule):
 
     def _row_text(self, row) -> str:
         return f"Question: {row['question']}\nAnswer: {row['answer']}"
-
-    def iter_texts(self, ds, batch_size: int = 1024):
-        for batch in ds.iter(batch_size=batch_size):
-            for q, a in zip(batch["question"], batch["answer"]):
-                yield f"Question: {q}\nAnswer: {a}"

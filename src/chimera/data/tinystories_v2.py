@@ -19,11 +19,9 @@ Usage:
 
 from .hf_text import HFTextDataModule
 
-HF_REPO = "noanabeshima/TinyStoriesV2"
-
 
 class TinyStoriesV2DataModule(HFTextDataModule):
-    HF_REPO = HF_REPO
+    HF_REPO = "noanabeshima/TinyStoriesV2"
     DIR_NAME = "tinystories-v2"
     TEXT_COLUMN = "text"
     VAL_SPLIT = "validation"

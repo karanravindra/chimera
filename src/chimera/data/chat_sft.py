@@ -28,34 +28,22 @@ concatenate their (ids, labels) streams — every stream ends on an EOS boundary
 """
 
 import hashlib
-import inspect
-import json
 from pathlib import Path
 from typing import Optional
 
 import torch
-from torch.utils.data import DataLoader, Dataset
-
-import lightning as pl
 
 from tqdm import tqdm
 
 from chimera.tokenizers import BPETokenizer
 
-from ._text import MaskedTokenDataset, load_cached_ids, save_cached_ids
+from ._hf_base import _HFCorpusBase
+from ._text import MaskedTokenDataset
 from .chat_template import BOS, EOS, render_masked
 
 
-class ChatSFTDataModule(pl.LightningDataModule):
-    HF_REPO: str
-    DIR_NAME: str
-    TRAIN_SPLIT: str = "train"
-    VAL_SPLIT: str = "validation"
+class ChatSFTDataModule(_HFCorpusBase):
     UNIT: str = "conv"
-    CONFIG_NAME: Optional[str] = None
-    DATA_FILES = None
-    # carve validation off the head of train when there is no native val split
-    VAL_FROM_TRAIN: Optional[float] = None
 
     def __init__(
         self,
@@ -68,116 +56,59 @@ class ChatSFTDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         pin_memory: bool = True,
     ):
-        super().__init__()
+        super().__init__(
+            data_dir=data_dir,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            max_train_tokens=max_train_tokens,
+            max_val_tokens=max_val_tokens,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
         self.save_hyperparameters()
-
         self.tokenizer_path = Path(tokenizer_path)
-        self.data_dir = Path(data_dir)
-        self.batch_size = batch_size
-        self.seq_len = seq_len
-        self.max_train_tokens = max_train_tokens
-        self.max_val_tokens = max_val_tokens
-        self.num_workers = num_workers
-        self.pin_memory = pin_memory
-
-        self.tokenizer: Optional[BPETokenizer] = None
-        self.vocab_size: Optional[int] = None
-        self.eos_id: Optional[int] = None
-        self.bos_id: Optional[int] = None
-
-        self.train_dataset: Optional[Dataset] = None
-        self.val_dataset: Optional[Dataset] = None
 
     # -- subclass hook -------------------------------------------------------
     def row_to_messages(self, row) -> list[dict]:
         raise NotImplementedError
 
-    # -- shared machinery ----------------------------------------------------
-    @property
-    def name(self) -> str:
-        return self.DIR_NAME
-
-    @property
-    def _dir(self) -> Path:
-        return self.data_dir / self.DIR_NAME
-
-    def _fingerprint(self) -> str:
+    # -- tokenizer -----------------------------------------------------------
+    def _tokenizer_fingerprint(self) -> str:
         return hashlib.blake2b(
             self.tokenizer_path.read_bytes(), digest_size=6
         ).hexdigest()
 
-    def _stream_path(self, split: str, max_tokens: Optional[int]) -> Path:
-        cap = "all" if max_tokens is None else str(max_tokens)
-        return self._dir / (
-            f"sft_v2_{split}_src-{self._dataset_fingerprint()}_"
-            f"tok-{self._fingerprint()}_{cap}.pt"
-        )
-
-    def _dataset_fingerprint(self) -> str:
-        payload = {
-            "schema": 2,
-            "class": f"{type(self).__module__}.{type(self).__qualname__}",
-            "repo": self.HF_REPO,
-            "config": self.CONFIG_NAME,
-            "data_files": self.DATA_FILES,
-            "train_split": self._hf_split(self.TRAIN_SPLIT),
-            "val_split": self._hf_split(self.VAL_SPLIT),
-            "renderer": self._renderer_fingerprint(),
-        }
-        encoded = json.dumps(payload, sort_keys=True, default=str).encode()
-        return hashlib.blake2b(encoded, digest_size=6).hexdigest()
-
-    def _renderer_fingerprint(self) -> str:
-        parts = []
-        for function in (type(self).row_to_messages, render_masked):
-            try:
-                parts.append(inspect.getsource(function))
-            except (OSError, TypeError):
-                parts.append(f"{function.__module__}.{function.__qualname__}")
-        return hashlib.blake2b("\n".join(parts).encode(), digest_size=6).hexdigest()
-
-    def _hf_split(self, split: str) -> str:
-        if self.VAL_FROM_TRAIN is None:
-            return split
-        pct = max(1, round(self.VAL_FROM_TRAIN * 100))
-        if split == self.VAL_SPLIT:
-            return f"{self.TRAIN_SPLIT}[:{pct}%]"
-        if split == self.TRAIN_SPLIT:
-            return f"{self.TRAIN_SPLIT}[{pct}%:]"
-        return split
-
-    def _load_dataset(self, split: str):
-        from datasets import load_dataset
-
-        kwargs = {"cache_dir": str(self.data_dir / "hf_cache")}
-        if self.DATA_FILES is not None:
-            kwargs["data_files"] = self.DATA_FILES
-            kwargs["verification_mode"] = "no_checks"
-        if self.CONFIG_NAME is not None:
-            kwargs["name"] = self.CONFIG_NAME
-        return load_dataset(self.HF_REPO, split=self._hf_split(split), **kwargs)
-
-    def prepare_data(self):
-        self._dir.mkdir(parents=True, exist_ok=True)
+    def _load_tokenizer(self):
         self.tokenizer = BPETokenizer.load(self.tokenizer_path, backend="hf")
         self.vocab_size = self.tokenizer.vocab_size
         self.eos_id = self.tokenizer._tok.token_to_id(EOS)
         self.bos_id = self.tokenizer._tok.token_to_id(BOS)
         if self.eos_id is None or self.bos_id is None:
             raise ValueError("SFT tokenizer must reserve the BOS/EOS special tokens")
-        self._build_split(self.TRAIN_SPLIT, self.max_train_tokens)
-        self._build_split(self.VAL_SPLIT, self.max_val_tokens)
 
-    def _build_split(self, split: str, max_tokens: Optional[int]):
-        path = self._stream_path(split, max_tokens)
-        cached = load_cached_ids(path)
-        if cached is not None:
-            return cached[0], cached[1]
+    def _prepare_tokenizer(self):
+        self._load_tokenizer()
 
+    def _setup_tokenizer(self):
+        if self.tokenizer is None:
+            self._load_tokenizer()
+
+    # -- rendering fingerprint -----------------------------------------------
+    def _renderer_methods(self):
+        return (type(self).row_to_messages, render_masked)
+
+    # -- cache / tokenize / datasets -----------------------------------------
+    def _cache_path(self, split: str, max_tokens: Optional[int]) -> Path:
+        cap = "all" if max_tokens is None else str(max_tokens)
+        return self._dir / (
+            f"sft_v2_{split}_src-{self._dataset_fingerprint()}_"
+            f"tok-{self._tokenizer_fingerprint()}_{cap}.pt"
+        )
+
+    def _tokenize_split(self, ds, split: str, max_tokens: Optional[int]):
         enc = self.tokenizer._tok
         encode = lambda text: enc.encode(text, add_special_tokens=False).ids  # noqa: E731
 
-        ds = self._load_dataset(split)
         ids: list[int] = []
         labels: list[int] = []
         pbar = tqdm(ds, desc=f"Rendering {self.DIR_NAME} [{split}]", unit=self.UNIT)
@@ -205,192 +136,15 @@ class ChatSFTDataModule(pl.LightningDataModule):
                 break
 
         # int32 not int16: labels carry -100 alongside ids up to the vocab size
-        data = torch.stack(
+        return torch.stack(
             [
                 torch.tensor(ids, dtype=torch.int32),
                 torch.tensor(labels, dtype=torch.int32),
             ]
         )
-        save_cached_ids(
-            path,
-            data,
-            metadata={
-                "source": self._dataset_fingerprint(),
-                "tokenizer": self._fingerprint(),
-                "split": split,
-                "max_tokens": max_tokens,
-            },
+
+    def _make_datasets(self, train_payload, val_payload):
+        return (
+            MaskedTokenDataset(train_payload[0], train_payload[1], self.seq_len),
+            MaskedTokenDataset(val_payload[0], val_payload[1], self.seq_len),
         )
-        return data[0], data[1]
-
-    def setup(self, stage: Optional[str] = None):
-        if self.train_dataset is not None:
-            return
-        if self.tokenizer is None:
-            self.tokenizer = BPETokenizer.load(self.tokenizer_path, backend="hf")
-        self.vocab_size = self.tokenizer.vocab_size
-        self.eos_id = self.tokenizer._tok.token_to_id(EOS)
-        self.bos_id = self.tokenizer._tok.token_to_id(BOS)
-        assert self.eos_id is not None and self.bos_id is not None, (
-            "SFT tokenizer must reserve the BOS/EOS special tokens"
-        )
-
-        train = load_cached_ids(
-            self._stream_path(self.TRAIN_SPLIT, self.max_train_tokens)
-        )
-        val = load_cached_ids(self._stream_path(self.VAL_SPLIT, self.max_val_tokens))
-        if train is None or val is None:
-            raise RuntimeError(
-                "token caches are missing; run prepare_data() once before setup()"
-            )
-        tr_ids, tr_labels = train[0], train[1]
-        va_ids, va_labels = val[0], val[1]
-        self.train_dataset = MaskedTokenDataset(tr_ids, tr_labels, self.seq_len)
-        self.val_dataset = MaskedTokenDataset(va_ids, va_labels, self.seq_len)
-
-    def decode(self, ids) -> str:
-        return self.tokenizer.decode(ids)
-
-    def _dl(self, dataset: Dataset, shuffle: bool) -> DataLoader:
-        return DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=shuffle,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            drop_last=shuffle,
-        )
-
-    def train_dataloader(self):
-        return self._dl(self.train_dataset, shuffle=True)
-
-    def val_dataloader(self):
-        return self._dl(self.val_dataset, shuffle=False)
-
-
-class GooAQChatDataModule(ChatSFTDataModule):
-    """Closed-book simple QA: GooAQ pairs as single-turn chat."""
-
-    HF_REPO = "sentence-transformers/gooaq"
-    DIR_NAME = "gooaq-chat"
-    UNIT = "pair"
-    DATA_FILES = ["pair/train-00000-of-00002.parquet"]
-    VAL_FROM_TRAIN = 0.01
-
-    def row_to_messages(self, row) -> list[dict]:
-        return [
-            {"role": "user", "content": row["question"]},
-            {"role": "assistant", "content": row["answer"]},
-        ]
-
-
-class SQuADChatDataModule(ChatSFTDataModule):
-    """Grounded QA: passage + question in the user turn, span answer back."""
-
-    HF_REPO = "rajpurkar/squad"
-    DIR_NAME = "squad-chat"
-    UNIT = "qa"
-
-    def row_to_messages(self, row) -> list[dict]:
-        return [
-            {"role": "user", "content": f"{row['context']}\n\n{row['question']}"},
-            {"role": "assistant", "content": row["answers"]["text"][0]},
-        ]
-
-
-class EverydayConversationsDataModule(ChatSFTDataModule):
-    """Multi-turn small-talk (smoltalk/everyday-conversations): chat style."""
-
-    HF_REPO = "HuggingFaceTB/smoltalk"
-    DIR_NAME = "everyday-conversations"
-    CONFIG_NAME = "everyday-conversations"
-    VAL_SPLIT = "test"
-
-    def row_to_messages(self, row) -> list[dict]:
-        return row["messages"]
-
-
-class CoQAChatDataModule(ChatSFTDataModule):
-    """Grounded conversational QA (CoQA): a passage then a multi-turn Q/A dialog,
-    all answers grounded in the passage. The story goes in the FIRST user turn
-    (the proven SQuAD-chat pattern) so grounding is visible; follow-up questions
-    are bare turns that reference earlier context. At seq-512 long dialogs get
-    split across windows — the story stays visible for the turns within ~512 tok
-    of it, which covers most CoQA conversations (short answers)."""
-
-    HF_REPO = "stanfordnlp/coqa"
-    DIR_NAME = "coqa-chat"
-    UNIT = "passage"
-    VAL_FROM_TRAIN = 0.01  # carve val off train (robust vs relying on a split)
-
-    def row_to_messages(self, row) -> list[dict]:
-        story = row["story"]
-        questions = row["questions"]
-        answers = row["answers"]["input_text"]
-        msgs: list[dict] = []
-        for i, (q, a) in enumerate(zip(questions, answers)):
-            user = f"{story}\n\n{q}" if i == 0 else q
-            msgs.append({"role": "user", "content": user})
-            msgs.append({"role": "assistant", "content": a})
-        return msgs
-
-
-class QuACChatDataModule(ChatSFTDataModule):
-    """Grounded information-seeking dialog (QuAC) with explicit unanswerable
-    questions — teaches the model NOT to guess beyond the passage. Parquet mirror
-    (``yairfeldman/quac``; the official ``allenai/quac`` is a broken load script).
-    Section passage in the first user turn; ``CANNOTANSWER`` spans are rewritten to
-    a natural refusal so the model learns to decline rather than emit a sentinel."""
-
-    HF_REPO = "yairfeldman/quac"
-    DIR_NAME = "quac-chat"
-    UNIT = "dialog"
-    VAL_FROM_TRAIN = 0.01
-
-    _CANNOT = "CANNOTANSWER"
-    _REFUSAL = "I don't know based on the passage."
-
-    def row_to_messages(self, row) -> list[dict]:
-        context = row["context"]
-        questions = row["questions"]
-        answers = row["orig_answers"]["texts"]
-        msgs: list[dict] = []
-        for i, (q, a) in enumerate(zip(questions, answers)):
-            a = self._REFUSAL if a.strip() == self._CANNOT else a
-            user = f"{context}\n\n{q}" if i == 0 else q
-            msgs.append({"role": "user", "content": user})
-            msgs.append({"role": "assistant", "content": a})
-        return msgs
-
-
-class NoRobotsChatDataModule(ChatSFTDataModule):
-    """Human-authored instruction breadth (No Robots): summarize, rewrite,
-    extract, classify, brainstorm, open-ended. The ``messages`` column is already
-    ChatML-shaped. NOTE: CC BY-NC 4.0 — review before any non-research use."""
-
-    HF_REPO = "HuggingFaceH4/no_robots"
-    DIR_NAME = "no-robots"
-    UNIT = "conv"
-    VAL_SPLIT = "test"
-
-    def row_to_messages(self, row) -> list[dict]:
-        return row["messages"]
-
-
-class SODAChatDataModule(ChatSFTDataModule):
-    """Social-commonsense dialog (SODA). Two speakers alternate; rendered as a
-    user/assistant chat (turn 0 = user). Synthetic — sample lightly (a low cap)
-    to avoid imprinting its repetitive conversational style."""
-
-    HF_REPO = "allenai/soda"
-    DIR_NAME = "soda-chat"
-    UNIT = "dialog"
-    VAL_FROM_TRAIN = 0.01
-
-    def row_to_messages(self, row) -> list[dict]:
-        # alternate roles by turn (SODA dialogs strictly alternate two speakers)
-        return [
-            {"role": "user" if i % 2 == 0 else "assistant", "content": t}
-            for i, t in enumerate(row["dialogue"])
-            if t and t.strip()
-        ]

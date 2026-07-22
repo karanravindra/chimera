@@ -44,10 +44,3 @@ class CoQADataModule(HFTextDataModule):
 
     def _row_text(self, row) -> str:
         return _render(row["story"], row["questions"], row["answers"]["input_text"])
-
-    def iter_texts(self, ds, batch_size: int = 1024):
-        for batch in ds.iter(batch_size=batch_size):
-            for story, questions, answers in zip(
-                batch["story"], batch["questions"], batch["answers"]
-            ):
-                yield _render(story, questions, answers["input_text"])

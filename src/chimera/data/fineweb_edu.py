@@ -21,11 +21,9 @@ Usage:
 
 from .hf_text import HFTextDataModule
 
-HF_REPO = "HuggingFaceFW/fineweb-edu"
-
 
 class FineWebEduTextDataModule(HFTextDataModule):
-    HF_REPO = HF_REPO
+    HF_REPO = "HuggingFaceFW/fineweb-edu"
     DIR_NAME = "fineweb-edu"
     TEXT_COLUMN = "text"
     UNIT = "doc"

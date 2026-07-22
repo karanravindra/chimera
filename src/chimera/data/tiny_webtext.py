@@ -26,11 +26,9 @@ Usage:
 
 from .hf_text import HFTextDataModule
 
-HF_REPO = "nampdn-ai/tiny-webtext"
-
 
 class TinyWebTextDataModule(HFTextDataModule):
-    HF_REPO = HF_REPO
+    HF_REPO = "nampdn-ai/tiny-webtext"
     DIR_NAME = "tiny-webtext"
     # No single text column: join the prompt and reasoned response per row.
     TEXT_COLUMNS = ["human", "bot"]

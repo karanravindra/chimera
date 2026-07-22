@@ -1,12 +1,14 @@
 """
-Generic HF text-corpus BPE DataModule base.
+Generic HF text-corpus BPE DataModule (pretrain).
 
-Machinery shared by the flat-token-stream text DataModules (TinyStoriesV2,
-tiny-textbooks, ...): download a Hugging Face dataset, train (or load) a
-byte-level BPE tokenizer on its text, tokenize each split into one flat token
-stream with per-document EOS/BOS markers, cache the streams keyed on the
-tokenizer's content hash, and serve non-overlapping next-token ``(input,
-target)`` chunks.
+The flat-token-stream loader for the pretrain corpora (TinyStoriesV2,
+tiny-textbooks, ...): train (or load) a byte-level BPE tokenizer on the dataset's
+text, tokenize each split into one flat token stream with per-document EOS/BOS
+markers, cache the streams keyed on the tokenizer's content hash, and serve
+non-overlapping next-token ``(input, target)`` chunks. The dataset loading,
+split carving, fingerprinting, cache round-trip, and dataloader scaffolding live
+in :class:`chimera.data._hf_base._HFCorpusBase`; this class supplies the
+tokenizer and the flat-stream tokenization.
 
 Subclasses configure the dataset via class attributes::
 
@@ -17,69 +19,44 @@ Subclasses configure the dataset via class attributes::
         VAL_SPLIT = "validation"      # HF split used for validation
         UNIT = "story"                # tqdm unit
 
+Rendering: one document per row is produced by :meth:`_row_text` (a single
+``TEXT_COLUMN`` or joined ``TEXT_COLUMNS``). :meth:`iter_texts` streams
+``_row_text`` over the dataset in Arrow batches; subclasses that need cross-row
+grouping (e.g. SQuAD passages) override ``iter_texts`` directly.
+
 Tokenizer sharing (for :class:`chimera.data.ConcatTextDataModule`): a module
-normally trains/loads its own tokenizer in ``setup()``, but
-``set_shared_tokenizer(tok, fingerprint)`` lets a mixture hand every source the
-same tokenizer — the module then tokenizes its text with it and keys its ids
-caches on the shared fingerprint, so one vocab spans the whole mixture and
-caches can never pair with the wrong tokenizer.
+normally trains/loads its own tokenizer, but ``set_shared_tokenizer(tok,
+fingerprint)`` lets a mixture hand every source the same tokenizer — the module
+then tokenizes with it and keys its ids caches on the shared fingerprint, so one
+vocab spans the whole mixture and caches can never pair with the wrong tokenizer.
 
 The ``hf`` tokenizer backend is trained with the canonical chat/tool special
-tokens (:data:`chimera.data.chat_template.SPECIAL_TOKENS`) reserved at fixed
-low ids, so a base tokenizer carries straight into chat / tool-call SFT
-without a vocab change. Documents are concatenated into a single stream with
-an end-of-document token (``eos_token``) appended after each one; ``add_bos``
-additionally prepends a start token so every document begins with an explicit
-anchor at position 0. Both require a tokenizer that defines the token — the
-``hf`` and ``pretrained`` backends do; the from-scratch byte-level BPE has
-none, so they are no-ops there.
+tokens (:data:`chimera.data.chat_template.SPECIAL_TOKENS`) reserved at fixed low
+ids, so a base tokenizer carries straight into chat / tool-call SFT without a
+vocab change. Documents are concatenated with an ``eos_token`` after each one;
+``add_bos`` additionally prepends a start token. Both require a tokenizer that
+defines the token — the ``hf`` and ``pretrained`` backends do; the from-scratch
+byte-level BPE has none, so they are no-ops there.
 """
 
 import hashlib
-import inspect
-import json
 from pathlib import Path
 from typing import Optional, Sequence
 
-import torch
-from torch.utils.data import DataLoader, Dataset
-
-import lightning as pl
+from ._hf_base import _HFCorpusBase
+from ._text import TokenDataset, tokenize_with_progress
+from .chat_template import BOS, EOS, SPECIAL_TOKENS
 
 from chimera.tokenizers import BPETokenizer
 
-from ._text import (
-    TokenDataset,
-    load_cached_ids,
-    save_cached_ids,
-    tokenize_with_progress,
-)
-from .chat_template import BOS, EOS, SPECIAL_TOKENS
 
-
-class HFTextDataModule(pl.LightningDataModule):
-    HF_REPO: str
-    DIR_NAME: str
+class HFTextDataModule(_HFCorpusBase):
     TEXT_COLUMN: str = "text"
     # Corpora with no single text column (e.g. human/bot QA pairs) instead set
     # TEXT_COLUMNS to join those fields into one document per row, TEXT_JOIN
     # between them. None => use the single TEXT_COLUMN.
     TEXT_COLUMNS: Optional[Sequence[str]] = None
     TEXT_JOIN: str = "\n\n"
-    TRAIN_SPLIT: str = "train"
-    VAL_SPLIT: str = "validation"
-    UNIT: str = "doc"
-
-    # HF dataset config passed as ``name=`` (e.g. FineWeb-Edu's "sample-10BT").
-    CONFIG_NAME: Optional[str] = None
-    # Repo-relative parquet file(s) to build from, passed as ``data_files=``.
-    # Bounds the download to a few shards instead of pulling a whole config —
-    # essential for the multi-billion-token web corpora, where a couple of
-    # shards already exceed a small model's token budget.
-    DATA_FILES = None
-    # Fraction of the train split carved off its head for validation, for
-    # corpora with no native validation split. None => use VAL_SPLIT verbatim.
-    VAL_FROM_TRAIN: Optional[float] = None
 
     def __init__(
         self,
@@ -99,12 +76,17 @@ class HFTextDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         pin_memory: bool = True,
     ):
-        super().__init__()
+        super().__init__(
+            data_dir=data_dir,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            max_train_tokens=max_train_tokens,
+            max_val_tokens=max_val_tokens,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
         self.save_hyperparameters()
 
-        self.data_dir = Path(data_dir)
-        self.batch_size = batch_size
-        self.seq_len = seq_len
         self.vocab_size = vocab_size
         self.tokenizer_backend = tokenizer_backend
         self.pretrained_id = pretrained_id
@@ -112,31 +94,12 @@ class HFTextDataModule(pl.LightningDataModule):
         self.eos_token = eos_token
         self.add_bos = add_bos
         self.bos_token = bos_token
-        self.max_train_tokens = max_train_tokens
-        self.max_val_tokens = max_val_tokens
         self.tokenizer_train_chars = tokenizer_train_chars
-        self.num_workers = num_workers
-        self.pin_memory = pin_memory
 
-        self.tokenizer: Optional[BPETokenizer] = None
         # set via set_shared_tokenizer(); overrides the own-file fingerprint
         self._shared_fingerprint: Optional[str] = None
-        # ids of the document separator / start tokens, resolved in setup()
-        self.eos_id: Optional[int] = None
-        self.bos_id: Optional[int] = None
 
-        self.train_dataset: Optional[Dataset] = None
-        self.val_dataset: Optional[Dataset] = None
-
-    @property
-    def name(self) -> str:
-        """Short per-source key (mixture labels, per-source metrics)."""
-        return self.DIR_NAME
-
-    @property
-    def _dir(self) -> Path:
-        return self.data_dir / self.DIR_NAME
-
+    # -- tokenizer -----------------------------------------------------------
     @property
     def _tokenizer_path(self) -> Path:
         """Tokenizer cache path, keyed on everything that defines the tokenizer.
@@ -173,131 +136,13 @@ class HFTextDataModule(pl.LightningDataModule):
         The ids caches are keyed on this so a token stream can never be paired
         with a different tokenizer than the one that produced it: any change to
         the tokenizer yields a new fingerprint -> a new ids path -> a forced,
-        consistent rebuild. (This is exactly the desync that silently corrupted
-        validation — the val ids were tokenized with a tokenizer that was later
-        retrained, and nothing forced them to rebuild.)
+        consistent rebuild.
         """
         if self._shared_fingerprint is not None:
             return self._shared_fingerprint
         return hashlib.blake2b(
             self._tokenizer_path.read_bytes(), digest_size=6
         ).hexdigest()
-
-    def _ids_path(
-        self, split: str, max_tokens: Optional[int], fingerprint: str
-    ) -> Path:
-        """Path of the cached flat token stream for ``split`` and this config.
-
-        Bound to ``fingerprint`` (the tokenizer's content hash) so ids and
-        tokenizer can never drift apart.
-        """
-        eos = "eos" if self.hparams.add_eos else "noeos"
-        # only tagged when on, so pre-existing (no-bos) caches keep matching
-        bos = "_bos" if self.hparams.add_bos else ""
-        cap = "all" if max_tokens is None else str(max_tokens)
-        source = self._dataset_fingerprint()
-        return self._dir / (
-            f"ids_v2_{split}_src-{source}_tok-{fingerprint}_{eos}{bos}_{cap}.pt"
-        )
-
-    def _dataset_fingerprint(self) -> str:
-        """Hash every source/rendering option that can change token ids."""
-        payload = {
-            "schema": 2,
-            "class": f"{type(self).__module__}.{type(self).__qualname__}",
-            "repo": getattr(self, "HF_REPO", None),
-            "config": self.CONFIG_NAME,
-            "data_files": self.DATA_FILES,
-            "text_column": self.TEXT_COLUMN,
-            "text_columns": self.TEXT_COLUMNS,
-            "text_join": self.TEXT_JOIN,
-            "train_split": self._hf_split(self.TRAIN_SPLIT),
-            "val_split": self._hf_split(self.VAL_SPLIT),
-            "eos_token": self.eos_token if self.add_eos else None,
-            "bos_token": self.bos_token if self.add_bos else None,
-            "renderer": self._renderer_fingerprint(),
-        }
-        encoded = json.dumps(payload, sort_keys=True, default=str).encode()
-        return hashlib.blake2b(encoded, digest_size=6).hexdigest()
-
-    def _renderer_fingerprint(self) -> str:
-        """Hash subclass text-rendering hooks so code changes invalidate caches."""
-        parts = []
-        for name in ("_row_text", "iter_texts"):
-            method = getattr(type(self), name)
-            try:
-                parts.append(inspect.getsource(method))
-            except (OSError, TypeError):
-                parts.append(f"{method.__module__}.{method.__qualname__}")
-        return hashlib.blake2b("\n".join(parts).encode(), digest_size=6).hexdigest()
-
-    def _row_text(self, row) -> str:
-        """The document text for one row (single column, or joined columns)."""
-        if self.TEXT_COLUMNS is None:
-            return row[self.TEXT_COLUMN]
-        return self.TEXT_JOIN.join(str(row[c]) for c in self.TEXT_COLUMNS)
-
-    def iter_texts(self, ds, batch_size: int = 1024):
-        """Yield document strings from a HF dataset, reading columns in batches.
-
-        Batched column reads are far faster than per-row access on the Arrow
-        dataset; handles both the single-column and joined-columns cases.
-        """
-        for batch in ds.iter(batch_size=batch_size):
-            if self.TEXT_COLUMNS is None:
-                yield from batch[self.TEXT_COLUMN]
-            else:
-                cols = [batch[c] for c in self.TEXT_COLUMNS]
-                for parts in zip(*cols):
-                    yield self.TEXT_JOIN.join(str(p) for p in parts)
-
-    def _hf_split(self, split: str) -> str:
-        """Translate a logical split name to the HF split spec to load.
-
-        Logical names (:attr:`TRAIN_SPLIT` / :attr:`VAL_SPLIT`) are what the ids
-        caches and progress labels are keyed on. When :attr:`VAL_FROM_TRAIN` is
-        set the corpus has no native validation split, so validation is carved
-        off the head of the train split and train takes the remainder — while
-        the cache/label names stay clean.
-        """
-        if self.VAL_FROM_TRAIN is None:
-            return split
-        pct = max(1, round(self.VAL_FROM_TRAIN * 100))
-        if split == self.VAL_SPLIT:
-            return f"{self.TRAIN_SPLIT}[:{pct}%]"
-        if split == self.TRAIN_SPLIT:
-            return f"{self.TRAIN_SPLIT}[{pct}%:]"
-        return split
-
-    def _load_dataset(self, split: str):
-        from datasets import load_dataset
-
-        kwargs = {"cache_dir": str(self.data_dir / "hf_cache")}
-        if self.DATA_FILES is not None:
-            kwargs["data_files"] = self.DATA_FILES
-            # a shard subset can't match the repo's declared full-split sizes
-            kwargs["verification_mode"] = "no_checks"
-        if self.CONFIG_NAME is not None:
-            kwargs["name"] = self.CONFIG_NAME
-        return load_dataset(
-            self.HF_REPO,
-            split=self._hf_split(split),
-            **kwargs,
-        )
-
-    def prepare_data(self):
-        # Lightning runs prepare_data on one process. All downloading, tokenizer
-        # training, tokenization, and cache writes therefore belong here—not setup,
-        # which runs independently on every DDP rank.
-        self._dir.mkdir(parents=True, exist_ok=True)
-        if self.tokenizer is None:
-            self.tokenizer = self._load_or_train_tokenizer()
-        self.vocab_size = self.tokenizer.vocab_size
-        self.eos_id = self._resolve_special_id(self.add_eos, self.eos_token)
-        self.bos_id = self._resolve_special_id(self.add_bos, self.bos_token)
-        fingerprint = self._tokenizer_fingerprint()
-        self._build_split(self.TRAIN_SPLIT, self.max_train_tokens, fingerprint)
-        self._build_split(self.VAL_SPLIT, self.max_val_tokens, fingerprint)
 
     def _load_or_train_tokenizer(self) -> BPETokenizer:
         if self._tokenizer_path.exists():
@@ -348,48 +193,14 @@ class HFTextDataModule(pl.LightningDataModule):
             return None
         return tok.token_to_id(token)
 
-    def _build_split(
-        self, split: str, max_tokens: Optional[int], fingerprint: str
-    ) -> torch.Tensor:
-        """Return the cached (or freshly tokenized) token stream for ``split``."""
-        ids_path = self._ids_path(split, max_tokens, fingerprint)
-        data = load_cached_ids(ids_path)
-        if data is not None:
-            return data
+    def _prepare_tokenizer(self):
+        if self.tokenizer is None:
+            self.tokenizer = self._load_or_train_tokenizer()
+        self.vocab_size = self.tokenizer.vocab_size
+        self.eos_id = self._resolve_special_id(self.add_eos, self.eos_token)
+        self.bos_id = self._resolve_special_id(self.add_bos, self.bos_token)
 
-        ds = self._load_dataset(split)
-
-        # tokenize_with_progress batches these for encode_batch and stops early
-        # once max_tokens is reached.
-        # Returns a flat int16/int32 tensor selected from the tokenizer's vocab,
-        # built via bounded chunks so large sources do not need Python-list RAM.
-        # Datasets cast each item via TokenDataset.__getitem__().long().
-        data = tokenize_with_progress(
-            self.tokenizer,
-            self.iter_texts(ds),
-            desc=f"Tokenizing {self.DIR_NAME} [{split}]",
-            total=len(ds),
-            unit=self.UNIT,
-            eos_id=self.eos_id,
-            bos_id=self.bos_id,
-            max_tokens=max_tokens,
-        )
-        save_cached_ids(
-            ids_path,
-            data,
-            metadata={
-                "source": self._dataset_fingerprint(),
-                "tokenizer": fingerprint,
-                "split": split,
-                "max_tokens": max_tokens,
-            },
-        )
-        return data
-
-    def setup(self, stage: Optional[str] = None):
-        if self.train_dataset is not None:
-            return
-
+    def _setup_tokenizer(self):
         if self.tokenizer is None:
             if not self._tokenizer_path.exists():
                 raise RuntimeError("prepare_data() must run before setup()")
@@ -412,39 +223,73 @@ class HFTextDataModule(pl.LightningDataModule):
                 "without a start marker."
             )
 
-        # Bind both streams to this exact tokenizer via its content hash.
+    # -- rendering -----------------------------------------------------------
+    def _row_text(self, row) -> str:
+        """The document text for one row (single column, or joined columns)."""
+        if self.TEXT_COLUMNS is None:
+            return row[self.TEXT_COLUMN]
+        return self.TEXT_JOIN.join(str(row[c]) for c in self.TEXT_COLUMNS)
+
+    def iter_texts(self, ds, batch_size: int = 1024):
+        """Yield document strings from a HF dataset, reading columns in batches.
+
+        Batched column reads are far faster than per-row access on the Arrow
+        dataset; each row is rebuilt into a small dict and rendered by
+        :meth:`_row_text`, so a subclass customizes rendering by overriding only
+        ``_row_text``. Subclasses needing cross-row grouping override this.
+        """
+        for batch in ds.iter(batch_size=batch_size):
+            cols = list(batch.keys())
+            n = len(batch[cols[0]])
+            for i in range(n):
+                yield self._row_text({c: batch[c][i] for c in cols})
+
+    def _renderer_methods(self):
+        return (type(self)._row_text, type(self).iter_texts)
+
+    def _fingerprint_extra(self) -> dict:
+        return {
+            "text_column": self.TEXT_COLUMN,
+            "text_columns": self.TEXT_COLUMNS,
+            "text_join": self.TEXT_JOIN,
+            "eos_token": self.eos_token if self.add_eos else None,
+            "bos_token": self.bos_token if self.add_bos else None,
+        }
+
+    # -- cache / tokenize / datasets -----------------------------------------
+    def _cache_path(self, split: str, max_tokens: Optional[int]) -> Path:
+        """Path of the cached flat token stream for ``split`` and this config.
+
+        Bound to the tokenizer's content hash so ids and tokenizer can never
+        drift apart.
+        """
         fingerprint = self._tokenizer_fingerprint()
-        train_path = self._ids_path(
-            self.TRAIN_SPLIT, self.max_train_tokens, fingerprint
-        )
-        val_path = self._ids_path(self.VAL_SPLIT, self.max_val_tokens, fingerprint)
-        train_data = load_cached_ids(train_path)
-        val_data = load_cached_ids(val_path)
-        if train_data is None or val_data is None:
-            raise RuntimeError(
-                "token caches are missing; run prepare_data() once before setup()"
-            )
-        self.train_dataset = TokenDataset(train_data, self.seq_len)
-        self.val_dataset = TokenDataset(val_data, self.seq_len)
-
-    def decode(self, ids) -> str:
-        return self.tokenizer.decode(ids)
-
-    def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            drop_last=True,
+        eos = "eos" if self.hparams.add_eos else "noeos"
+        # only tagged when on, so pre-existing (no-bos) caches keep matching
+        bos = "_bos" if self.hparams.add_bos else ""
+        cap = "all" if max_tokens is None else str(max_tokens)
+        source = self._dataset_fingerprint()
+        return self._dir / (
+            f"ids_v2_{split}_src-{source}_tok-{fingerprint}_{eos}{bos}_{cap}.pt"
         )
 
-    def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
+    def _tokenize_split(self, ds, split: str, max_tokens: Optional[int]):
+        # tokenize_with_progress batches these for encode_batch and stops early
+        # once max_tokens is reached; returns a flat int16/int32 tensor built via
+        # bounded chunks so large sources do not need Python-list RAM.
+        return tokenize_with_progress(
+            self.tokenizer,
+            self.iter_texts(ds),
+            desc=f"Tokenizing {self.DIR_NAME} [{split}]",
+            total=len(ds),
+            unit=self.UNIT,
+            eos_id=self.eos_id,
+            bos_id=self.bos_id,
+            max_tokens=max_tokens,
+        )
+
+    def _make_datasets(self, train_payload, val_payload):
+        return (
+            TokenDataset(train_payload, self.seq_len),
+            TokenDataset(val_payload, self.seq_len),
         )

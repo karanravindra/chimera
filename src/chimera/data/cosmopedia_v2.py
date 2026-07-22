@@ -26,11 +26,9 @@ Usage:
 
 from .hf_text import HFTextDataModule
 
-HF_REPO = "HuggingFaceTB/smollm-corpus"
-
 
 class CosmopediaV2DataModule(HFTextDataModule):
-    HF_REPO = HF_REPO
+    HF_REPO = "HuggingFaceTB/smollm-corpus"
     DIR_NAME = "cosmopedia-v2"
     TEXT_COLUMN = "text"
     UNIT = "doc"

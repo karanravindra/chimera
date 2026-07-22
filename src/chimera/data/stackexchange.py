@@ -36,8 +36,3 @@ class StackExchangeDataModule(HFTextDataModule):
 
     def _row_text(self, row) -> str:
         return f"{row['INSTRUCTION']}\n\n{row['RESPONSE']}"
-
-    def iter_texts(self, ds, batch_size: int = 1024):
-        for batch in ds.iter(batch_size=batch_size):
-            for q, a in zip(batch["INSTRUCTION"], batch["RESPONSE"]):
-                yield f"{q}\n\n{a}"
