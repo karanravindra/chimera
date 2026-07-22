@@ -5,14 +5,17 @@ tiny-strange-textbooks 25 / fineweb-edu 20 / tinystories-v2 15 / tiny-webtext 10
 The 16k BPE vocab is trained on a round-robin sample of all five, so it
 compresses the whole mixture rather than the owner's register alone.
 
-Raw PyTorch loop (deliberately independent of the archived Lightning harness):
-FlexAttention causal+document masking with per-doc RoPE positions, Cut Cross
-Entropy, Muon+AdamW, torch.compile. Run from this directory:
+PyTorch Lightning loop: FlexAttention causal+document masking with per-doc RoPE
+positions, Cut Cross Entropy, Muon+AdamW under one warmup-cosine schedule,
+torch.compile. The training math lives in the shared chimera.modules.
+LanguageModelModule (reused by ../sft); this file wires the datamodule, model,
+optimizer, callbacks (checkpoint / progress / token axis / held-out BPB +
+benchmarks), and Trainer. Run from this directory:
 
     uv run python train.py
 
-Saves the final checkpoint to /mnt/ai/runs/tinylm/pretrain/. main.ipynb is
-analysis-only and loads that checkpoint.
+Saves a full-state Lightning checkpoint under /mnt/ai/runs/tinylm/pretrain/ AND a
+legacy weights-only .pt (the SFT base + main.ipynb analysis load that .pt).
 """
 
 import math
@@ -25,12 +28,13 @@ os.environ.setdefault("HF_HOME", "/mnt/ai/data/hf")  # datasets cache
 # Persist inductor/autotune artifacts: cold max-autotune costs ~4 min, warm ~seconds.
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/mnt/ai/data/torchinductor_cache")
 
+import lightning.pytorch as pl
 import torch
 import torch.nn as nn
-from cut_cross_entropy import linear_cross_entropy
+from lightning.pytorch import Trainer
+from lightning.pytorch.callbacks import ModelCheckpoint
 from model import GPT
 from torchinfo import summary
-from tqdm import tqdm
 
 from chimera.data import (
     ConcatTextDataModule,
@@ -46,8 +50,12 @@ from chimera.data import (
     TinyWebTextDataModule,
     WikipediaDataModule,
 )
-from chimera.models.attention import build_block_mask_and_pos
-from chimera.optim import Muon, muon_param_groups
+from chimera.modules import LanguageModelModule
+from chimera.optim import LinearWarmupCosineAnnealingLR, Muon, muon_param_groups
+from chimera.utils import ProgressPrinter, TokenAxisCallback, build_run_loggers
+
+# only needed for the CPU cross-entropy fallback in the held-out BPB yardstick
+from cut_cross_entropy import linear_cross_entropy
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
@@ -121,14 +129,16 @@ ADAMW_WEIGHT_DECAY = 0.0
 VWN_M = int(os.environ.get("TINYLM_VWN_M", "2"))
 VWN_N = int(os.environ.get("TINYLM_VWN_N", "3"))
 # The VWN state at batch 128 hits VRAM pressure on the 16GB card (-31% tok/s vs
-# 2x64); split each global batch into PHYS_BATCH-row microbatches with gradient
-# accumulation — same global batch / identical gradients up to fp rounding. The
+# 2x64); the dataloader yields PHYS_BATCH-row MICRObatches and Lightning's
+# accumulate_grad_batches=GRAD_ACCUM_STEPS accumulates them into one optimizer
+# step — same global batch / identical gradients up to fp rounding (Lightning
+# divides the per-microbatch loss by GRAD_ACCUM_STEPS before backward). The
 # long-context stages drop PHYS_BATCH (attention is O(N^2); a genuine 8k doc has
 # no block-sparsity to exploit) and raise GRAD_ACCUM to hold tokens/step ~= 65k:
 # 512->64x2, 2k->16x2, 4k->8x2, 8k->8x1 (all TINYLM_SEQ_LEN * BATCH_SIZE ~= 65536).
 PHYS_BATCH = int(os.environ.get("TINYLM_PHYS_BATCH", "64"))
 GRAD_ACCUM_STEPS = int(os.environ.get("TINYLM_GRAD_ACCUM", "2"))
-BATCH_SIZE = PHYS_BATCH * GRAD_ACCUM_STEPS  # global batch (split into microbatches)
+BATCH_SIZE = PHYS_BATCH * GRAD_ACCUM_STEPS  # global batch (accumulated by Lightning)
 MAX_TRAIN_STEPS = int(os.environ.get("TINYLM_MAX_STEPS", "5000"))
 # Context-extension stage: "base" (flat 512 TokenDataset, unchanged) or
 # 2k/4k/8k (ContextMixDataModule: broad-short pool + long-window pool). Each
@@ -148,6 +158,9 @@ BENCH_EVERY_MTOKENS = float(os.environ.get("TINYLM_BENCH_EVERY_MT", "0")) or Non
 VALIDATE_EVERY_N_STEPS = 1000
 BENCH_EVERY_N_STEPS = 2500  # in-training benchmark curve (0/None to disable)
 N_EPOCHS = 1
+# Seed everything (Lightning) for reproducibility. The old raw loop was unseeded,
+# so trajectories won't match a pre-migration run bit-for-bit — only in aggregate.
+SEED = int(os.environ.get("TINYLM_SEED", "1234"))
 
 RUN_DIR = Path("/mnt/ai/runs/tinylm/pretrain")
 # Looped runs save under their own name so the baseline checkpoint survives.
@@ -294,7 +307,7 @@ def make_datamodule() -> ConcatTextDataModule:
                 else []
             ),
         ],
-        batch_size=BATCH_SIZE,
+        batch_size=PHYS_BATCH,
         # Pin the frozen tokenizer when given; otherwise train one on the mixture.
         train_tokenizer_on_mixture=TOKENIZER_PATH is None,
         tokenizer_sample_chars=1_000_000_000,
@@ -357,7 +370,7 @@ def make_context_datamodule() -> ContextMixDataModule:
                 max_train_tokens=_cap(SHORT_TOKENS, 0.01), max_val_tokens=VAL_TOKENS,
             ),
         ],
-        batch_size=BATCH_SIZE,
+        batch_size=PHYS_BATCH,
         tokenizer_path=TOKENIZER_PATH,
     )
     long_pool = ConcatTextDataModule(
@@ -377,7 +390,7 @@ def make_context_datamodule() -> ContextMixDataModule:
                 max_train_tokens=_cap(LONG_TOKENS, 0.15), max_val_tokens=VAL_TOKENS,
             ),
         ],
-        batch_size=BATCH_SIZE,
+        batch_size=PHYS_BATCH,
         tokenizer_path=TOKENIZER_PATH,
     )
     dm = ContextMixDataModule(
@@ -386,7 +399,7 @@ def make_context_datamodule() -> ContextMixDataModule:
         ctx=ctx,
         short_share=short_share,
         long_share=long_share,
-        batch_size=BATCH_SIZE,
+        batch_size=PHYS_BATCH,
         # bound the sampler to exactly this run's length (one item == one ctx row)
         num_samples=MAX_TRAIN_STEPS * BATCH_SIZE,
     )
@@ -484,33 +497,6 @@ def _split_no_decay_group(model, groups, no_decay_names: set[str]) -> None:
             continue
         group["params"] = keep
         groups.append({**group, "params": move, "weight_decay": 0.0})
-
-
-def compute_loss(model, x, y, eos_id: int, vocab_size: int):
-    if USE_CCE:
-        # FlexAttention block mask (causal + document) + per-document RoPE position
-        # ids — rebuilt per batch. Note: the smaller last validation batch triggers a
-        # one-time torch.compile recompile on the first val pass, then it's cached.
-        block_mask, pos_ids = build_block_mask_and_pos(x, eos_id)
-        hidden = model(x, return_hidden=True, block_mask=block_mask, pos_ids=pos_ids)
-        weight = getattr(model, "_orig_mod", model).token_emb.weight  # tied lm_head
-        return linear_cross_entropy(hidden, weight, y, softcap=LOGIT_SOFTCAP)
-    logits = model(x)  # CPU fallback: plain causal, no doc masking / flex
-    return nn.CrossEntropyLoss()(logits.view(-1, vocab_size), y.view(-1))
-
-
-@torch.no_grad()
-def evaluate(model, dm) -> float:
-    """Mean validation loss over the full val set."""
-    model.eval()
-    total, n = 0.0, 0
-    for val_x, val_y in dm.val_dataloader():
-        total += compute_loss(
-            model, val_x.to(DEVICE), val_y.to(DEVICE), dm.eos_id, dm.vocab_size
-        ).item()
-        n += 1
-    model.train()
-    return total / n
 
 
 def load_bpb_heldout() -> tuple[str, int]:
@@ -691,12 +677,90 @@ def print_model_stats(model: GPT, global_batch_size: int):
     print("=" * 90)
 
 
+class PretrainEvalCallback(pl.Callback):
+    """Held-out BPB yardstick + (context) banded-BPB/retrieval + the in-training
+    lm-eval benchmark curve — the raw loop's periodic evals, moved into Lightning
+    hooks. All run on the eager ``_orig_mod`` under no_grad.
+
+    Keys are chosen so they never collide with what the module logs: the module
+    has no mix-wide bytes/token (so it never logs ``val/bpb``), leaving the
+    tokenizer-agnostic held-out BPB — the project's canonical yardstick — to own
+    ``val/bpb`` here.
+    """
+
+    def __init__(self, dm, *, is_context, seq_len, bench_every, band_every, max_steps):
+        super().__init__()
+        self.dm = dm
+        self.is_context = is_context
+        self.seq_len = seq_len
+        self.bench_every = bench_every
+        self.band_every = band_every
+        self.max_steps = max_steps
+        self._last_step = -1
+
+    def on_fit_start(self, trainer, pl_module):
+        # tokenizer-agnostic held-out, tokenized once for this run
+        self.bpb_X, self.bpb_Y, self.bpb_bytes = prepare_bpb(self.dm.tokenizer)
+        print(
+            f"bpb held-out: {len(self.bpb_X)} windows over {self.bpb_bytes:,} bytes",
+            flush=True,
+        )
+
+    def _log(self, trainer, metrics):
+        for lg in trainer.loggers:
+            lg.log_metrics(metrics, step=trainer.global_step)
+
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+        step = trainer.global_step
+        val_bpb = bits_per_byte(pl_module.model, self.bpb_X, self.bpb_Y, self.bpb_bytes)
+        self._log(trainer, {"val/bpb": val_bpb})
+        print(f"[eval @ step {step}] val/bpb (heldout)={val_bpb:.4f}", flush=True)
+        # length-banded BPB on long held-out docs: does widening the context
+        # actually lower bpb (long-range modelling) or flatline?
+        if self.is_context and self.band_every and step % self.band_every == 0:
+            from bpb_banded import (
+                CTX_WIDTHS,
+                PROBE_DISTANCES,
+                retrieval_probe,
+                score_banded,
+            )
+
+            net = getattr(pl_module.model, "_orig_mod", pl_module.model)
+            widths = [w for w in CTX_WIDTHS if w <= self.seq_len]
+            bands = score_banded(net, self.dm.tokenizer, DEVICE, widths=widths)
+            print("  banded bpb: " + "  ".join(f"{k}={v:.4f}" for k, v in bands.items()), flush=True)
+            dists = [d for d in PROBE_DISTANCES if d <= self.seq_len]
+            probe = retrieval_probe(net, DEVICE, distances=dists)
+            print("  retrieval: " + "  ".join(f"{k}={v:.2f}" for k, v in probe.items()), flush=True)
+            self._log(trainer, {f"val/banded/{k}": v for k, v in bands.items()})
+
+    def on_train_batch_end(self, trainer, pl_module, *args, **kwargs):
+        # cadence is in OPTIMIZER steps; this hook fires once per microbatch, so
+        # gate on global_step advancing (skip the accumulation microbatches).
+        step = trainer.global_step
+        if step == self._last_step:
+            return
+        self._last_step = step
+        if self.bench_every and 0 < step < self.max_steps and step % self.bench_every == 0:
+            run_benchmarks(pl_module.model, self.dm, step=step)
+
+
+def _cadence_steps(mtokens, global_batch_tokens, fallback):
+    """A token budget (millions) -> optimizer steps; else the fixed fallback."""
+    if mtokens:
+        return max(1, round(mtokens * 1e6 / global_batch_tokens))
+    return fallback
+
+
 def train():
+    pl.seed_everything(SEED, workers=True)
     is_context = CTX_STAGE != "base"
     dm = make_context_datamodule() if is_context else make_datamodule()
 
-    x, y = next(iter(dm.train_dataloader()))
-    global_batch_size = x.numel()
+    # One optimizer step consumes GRAD_ACCUM_STEPS microbatches = BATCH_SIZE rows.
+    global_batch_tokens = BATCH_SIZE * SEQ_LEN
     if is_context:
         # ContextMixDataModule.train_dataset is a ConcatDataset (no flat .data)
         train_tokens = (len(dm.short_dataset) + len(dm.long_dataset)) * dm.ctx
@@ -705,22 +769,10 @@ def train():
         train_tokens = len(dm.train_dataset.data)
         val_tokens = len(dm.val_dataset.data)
 
-    # token-budget cadence -> steps (fall back to the fixed step constants)
-    val_every = (
-        max(1, round(VAL_EVERY_MTOKENS * 1e6 / global_batch_size))
-        if VAL_EVERY_MTOKENS
-        else VALIDATE_EVERY_N_STEPS
-    )
-    bench_every = (
-        max(1, round(BENCH_EVERY_MTOKENS * 1e6 / global_batch_size))
-        if BENCH_EVERY_MTOKENS
-        else BENCH_EVERY_N_STEPS
-    )
-    band_every = (
-        max(1, round(BAND_EVAL_EVERY_MTOKENS * 1e6 / global_batch_size))
-        if BAND_EVAL_EVERY_MTOKENS
-        else bench_every
-    )
+    # token-budget cadence -> optimizer steps (fall back to the fixed step counts)
+    val_every = _cadence_steps(VAL_EVERY_MTOKENS, global_batch_tokens, VALIDATE_EVERY_N_STEPS)
+    bench_every = _cadence_steps(BENCH_EVERY_MTOKENS, global_batch_tokens, BENCH_EVERY_N_STEPS)
+    band_every = _cadence_steps(BAND_EVAL_EVERY_MTOKENS, global_batch_tokens, bench_every)
     print(f"cadence: val every {val_every} steps, bench every {bench_every} steps")
 
     print(f"vocab_size={dm.vocab_size}")
@@ -736,8 +788,10 @@ def train():
         f"train tokens={train_tokens:,}  val tokens={val_tokens:,}  "
         f"total={train_tokens + val_tokens:,}"
     )
-    print(f"train batch: x={x.shape}, y={y.shape}")
-    print(f"global batch size={global_batch_size:,}")
+    print(
+        f"micro batch={PHYS_BATCH} x grad_accum={GRAD_ACCUM_STEPS} = global {BATCH_SIZE} rows"
+        f"  ({global_batch_tokens:,} tokens/step)"
+    )
 
     model = make_model(dm.vocab_size)
     # Resume from a prior checkpoint (the 512 base, or the previous context
@@ -749,139 +803,104 @@ def train():
         model.load_state_dict(state)
         print(f"loaded init weights from {INIT_CKPT}")
     optimizer = make_optimizer(model)
-    base_lrs = [g["lr"] for g in optimizer.param_groups]
+    scheduler = (
+        LinearWarmupCosineAnnealingLR(
+            optimizer,
+            warmup_steps=WARMUP_STEPS,
+            max_steps=MAX_TRAIN_STEPS,
+            final_lr_frac=FINAL_LR_FRAC,
+        )
+        if LR_SCHEDULE is not None
+        else None
+    )
+    print_model_stats(model, global_batch_tokens)
 
-    def lr_factor(step: int) -> float:
-        if LR_SCHEDULE is None:
-            return 1.0
-        if step < WARMUP_STEPS:
-            return (step + 1) / WARMUP_STEPS
-        t = (step - WARMUP_STEPS) / max(1, MAX_TRAIN_STEPS - WARMUP_STEPS)
-        return FINAL_LR_FRAC + (1 - FINAL_LR_FRAC) * 0.5 * (1 + math.cos(math.pi * t))
-    print_model_stats(model, global_batch_size)
-
-    model.to(DEVICE, dtype=DTYPE)
     if DEVICE == "cuda":
         # max-autotune is REQUIRED with the fused GHC routing: default-mode
         # inductor picks pathological backward reduction kernels for the
         # broadcast-sum maps (bwd 174ms vs 52ms at batch 64). cudagraphs add
         # nothing here (per-batch block mask defeats capture), so skip them.
+        # Trainer(precision="bf16-true") casts to bf16 + moves to device.
         model = torch.compile(model, mode="max-autotune-no-cudagraphs")
 
-    # tokenizer-agnostic BPB yardstick (fixed held-out, tokenized once for this run)
-    bpb_X, bpb_Y, bpb_bytes = prepare_bpb(dm.tokenizer)
-    print(f"bpb held-out: {len(bpb_X)} windows over {bpb_bytes:,} bytes")
+    module = LanguageModelModule(
+        model,
+        optimizer,
+        scheduler,
+        use_cce=USE_CCE,
+        logit_softcap=LOGIT_SOFTCAP,
+        eos_id=dm.eos_id,
+        # NB: pretrain does NOT mask eos targets (only attention is doc-masked, via
+        # build_block_mask_and_pos) — keep doc_boundary_eos_id None for parity.
+    )
 
-    global_step = 1
-    for epoch in range(N_EPOCHS):
-        model.train()
-        # cap the epoch at MAX_TRAIN_STEPS batches (the pool is far larger) so
-        # the bar tracks the real run length, not the full dataloader.
-        if is_context:
-            # context stages: single mixed loader (short + long-window pools),
-            # no phase curriculum. Resample long-window offsets each epoch.
-            dm.set_epoch(epoch)
-            train_iter = islice(dm.train_dataloader(), MAX_TRAIN_STEPS)
-        elif CURRICULUM_PHASE_FRAC is not None:
-            p1_steps = int(MAX_TRAIN_STEPS * CURRICULUM_PHASE_FRAC)
-            loader1, loader2 = make_curriculum_loaders(dm)
-            train_iter = chain(
-                islice(loader1, p1_steps),
-                islice(loader2, MAX_TRAIN_STEPS - p1_steps),
-            )
-        else:
-            train_iter = islice(dm.train_dataloader(), MAX_TRAIN_STEPS)
-        pbar = tqdm(
-            train_iter,
-            desc=f"Epoch {epoch + 1}/{N_EPOCHS}",
-            total=MAX_TRAIN_STEPS,
-            dynamic_ncols=True,
+    # Train loader yields MICRObatches (PHYS_BATCH rows); Lightning accumulates
+    # GRAD_ACCUM_STEPS of them per optimizer step.
+    if is_context:
+        dm.set_epoch(0)
+        train_dl = dm.train_dataloader()
+    elif CURRICULUM_PHASE_FRAC is not None:
+        # Two-phase order swap: slice by microbatch count (= optimizer steps x
+        # grad_accum). A one-shot chained iterator is fine for the single epoch.
+        p1_steps = int(MAX_TRAIN_STEPS * CURRICULUM_PHASE_FRAC)
+        loader1, loader2 = make_curriculum_loaders(dm)
+        train_dl = chain(
+            islice(loader1, p1_steps * GRAD_ACCUM_STEPS),
+            islice(loader2, (MAX_TRAIN_STEPS - p1_steps) * GRAD_ACCUM_STEPS),
         )
+    else:
+        train_dl = dm.train_dataloader()
+    val_dl = dm.val_dataloader()
 
-        for x, y in pbar:
-            x, y = x.to(DEVICE), y.to(DEVICE)
-            for g, base in zip(optimizer.param_groups, base_lrs):
-                g["lr"] = base * lr_factor(global_step)
-            optimizer.zero_grad()
-            # Microbatches are equal-sized, so the mean of half-losses equals the
-            # global-batch mean loss and gradients match the unsplit batch.
-            micro = x.shape[0] // GRAD_ACCUM_STEPS
-            loss = torch.zeros((), device=DEVICE)
-            for mb in range(GRAD_ACCUM_STEPS):
-                sl = slice(mb * micro, (mb + 1) * micro)
-                mb_loss = (
-                    compute_loss(model, x[sl], y[sl], dm.eos_id, dm.vocab_size)
-                    / GRAD_ACCUM_STEPS
-                )
-                mb_loss.backward()
-                loss += mb_loss.detach()
-            optimizer.step()
+    run_name = CHECKPOINT_PATH.stem
+    ckpt = ModelCheckpoint(
+        dirpath=RUN_DIR / run_name / "checkpoints",
+        filename="gpt",
+        monitor="val/loss",
+        save_last=True,
+        enable_version_counter=False,
+    )
+    trainer = Trainer(
+        max_steps=MAX_TRAIN_STEPS,
+        max_epochs=N_EPOCHS,
+        accumulate_grad_batches=GRAD_ACCUM_STEPS,
+        precision="bf16-true" if DEVICE == "cuda" else "32-true",
+        # val_check_interval counts TRAINING BATCHES (microbatches), not optimizer
+        # steps — scale by grad_accum so a val fires every `val_every` opt steps.
+        val_check_interval=val_every * GRAD_ACCUM_STEPS,
+        num_sanity_val_steps=0,
+        enable_progress_bar=False,  # ProgressPrinter owns stdout
+        logger=build_run_loggers(RUN_DIR, "tinylm-pretrain", run_name),
+        callbacks=[
+            ckpt,
+            ProgressPrinter(
+                print_every=max(1, val_every // 10), tokens_per_step=global_batch_tokens
+            ),
+            TokenAxisCallback(global_batch_tokens),
+            PretrainEvalCallback(
+                dm,
+                is_context=is_context,
+                seq_len=SEQ_LEN,
+                bench_every=bench_every,
+                band_every=band_every,
+                max_steps=MAX_TRAIN_STEPS,
+            ),
+        ],
+    )
+    trainer.fit(module, train_dataloaders=train_dl, val_dataloaders=val_dl)
 
-            step_loss = loss.item()
-            step_perplexity = math.exp(min(step_loss, 10))
-
-            global_step += 1
-
-            if global_step % val_every == 0:
-                val_loss = evaluate(model, dm)
-                val_perplexity = math.exp(min(val_loss, 100))
-                val_bpb = bits_per_byte(model, bpb_X, bpb_Y, bpb_bytes)
-                print(
-                    f"\nStep {global_step}: train_loss={step_loss:.4f}, train_perplexity={step_perplexity:.2f}, val_loss={val_loss:.4f}, val_perplexity={val_perplexity:.2f}, val_bpb={val_bpb:.4f}"
-                )
-                # length-banded BPB on long held-out docs: does widening the
-                # context actually lower bpb (long-range modelling) or flatline?
-                if is_context and global_step % band_every == 0:
-                    from bpb_banded import (
-                        CTX_WIDTHS,
-                        PROBE_DISTANCES,
-                        retrieval_probe,
-                        score_banded,
-                    )
-
-                    net = getattr(model, "_orig_mod", model)
-                    widths = [w for w in CTX_WIDTHS if w <= SEQ_LEN]
-                    bands = score_banded(net, dm.tokenizer, DEVICE, widths=widths)
-                    print(
-                        "  banded bpb: "
-                        + "  ".join(f"{k}={v:.4f}" for k, v in bands.items())
-                    )
-                    # synthetic long-range recall (bigram induction) up to ctx
-                    dists = [d for d in PROBE_DISTANCES if d <= SEQ_LEN]
-                    probe = retrieval_probe(net, DEVICE, distances=dists)
-                    print(
-                        "  retrieval: "
-                        + "  ".join(f"{k}={v:.2f}" for k, v in probe.items())
-                    )
-
-            # in-training benchmark curve (skip the final step; the full table runs
-            # after the loop) — a few cheap points to see the trajectory.
-            if (
-                bench_every
-                and global_step % bench_every == 0
-                and global_step < MAX_TRAIN_STEPS
-            ):
-                run_benchmarks(model, dm, step=global_step)
-
-            # val metrics get their own `Step N:` line; keep the bar to live-changing fields
-            pbar.set_postfix(
-                step=global_step,
-                tokens=f"{global_step * global_batch_size / 1e6:.1f}M",
-                loss=f"{step_loss:.4f}",
-                ppl=f"{step_perplexity:.2f}",
-            )
-
-            if global_step >= MAX_TRAIN_STEPS:
-                break
-
+    # Legacy weights-only .pt (clean, un-compiled keys) — the SFT base checkpoint
+    # and main.ipynb analysis load this; Lightning's own ckpt (ckpt.best_model_path)
+    # carries full optimizer/scheduler state for resume.
     RUN_DIR.mkdir(parents=True, exist_ok=True)
-    # Unwrap torch.compile so the checkpoint has clean (no _orig_mod.) keys.
-    torch.save(getattr(model, "_orig_mod", model).state_dict(), CHECKPOINT_PATH)
+    net = getattr(module.model, "_orig_mod", module.model)
+    torch.save(net.state_dict(), CHECKPOINT_PATH)
     print(f"Checkpoint saved to {CHECKPOINT_PATH}")
+    print(f"best (val/loss) checkpoint: {ckpt.best_model_path}")
 
-    # Benchmarks run AFTER the checkpoint is on disk, so an eval hiccup can never
-    # cost the trained model.
-    run_benchmarks(model, dm)
+    # Full benchmark table AFTER the checkpoint is on disk, so an eval hiccup can
+    # never cost the trained model.
+    run_benchmarks(module.model, dm)
 
 
 if __name__ == "__main__":

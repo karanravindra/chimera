@@ -1,28 +1,29 @@
 """SFT the pretrained tinylm GPT (~6M params) on a simple-QA chat mixture.
 
-Mirrors ../pretrain/train.py: same model (imported from there), same packed
-FlexAttention doc-masking + CCE + Muon/AdamW rails — but the stream is
-ChatML conversations with loss only on assistant tokens (labels are -100
-elsewhere; CCE's ignore_index). Starts from the pretrain checkpoint and keeps
-its tokenizer (chat special tokens were reserved in the vocab from day one).
+Same rails as ../pretrain (shared chimera.modules.LanguageModelModule: packed
+FlexAttention doc-masking + CCE + Muon/AdamW under one warmup-cosine schedule),
+but the stream is ChatML conversations with loss only on assistant tokens (labels
+are -100 elsewhere; CCE's ignore_index). Starts from the pretrain checkpoint and
+keeps its tokenizer (chat special tokens were reserved in the vocab from day one).
 
 Run from this directory:
 
-    uv run python train.py
+    uv run python train.py            # full-FT (Muon)
+    USE_LORA=1 uv run python train.py # LoRA (AdamW on low-rank deltas)
 """
 
-import math
 import os
 import sys
-from itertools import islice
 from pathlib import Path
 
 os.environ.setdefault("CCE_AUTOTUNE", "1")
 os.environ.setdefault("HF_HOME", "/mnt/ai/data/hf")
 
+import lightning.pytorch as pl
 import torch
-from cut_cross_entropy import linear_cross_entropy
-from tqdm import tqdm
+from lightning.pytorch import Trainer
+from lightning.pytorch.callbacks import ModelCheckpoint
+from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "pretrain"))
 from model import GPT  # noqa: E402  (the pretrain model, single source of truth)
@@ -38,11 +39,11 @@ from chimera.data import (  # noqa: E402
 )
 from chimera.data._text import MaskedTokenDataset  # noqa: E402
 from chimera.data.chat_template import render  # noqa: E402
-from chimera.models.attention import build_block_mask_and_pos  # noqa: E402
-from chimera.optim import Muon, muon_param_groups  # noqa: E402
+from chimera.modules import LanguageModelModule  # noqa: E402
+from chimera.optim import LinearWarmupCosineAnnealingLR, Muon, muon_param_groups  # noqa: E402
+from chimera.utils import ProgressPrinter, TokenAxisCallback, build_run_loggers  # noqa: E402
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 
 # architecture — MUST match the pretrain checkpoint. SEQ_LEN is env-driven so we
 # can SFT a context-extended base (ctx2k/4k/8k) at its native length; the model
@@ -76,6 +77,7 @@ VALIDATE_EVERY_N_STEPS = 100
 N_EPOCHS = 2  # small pool; MAX_TRAIN_STEPS is the real cap
 WARMUP_STEPS = 50
 FINAL_LR_FRAC = 0.1
+SEED = int(os.environ.get("TINYLM_SEED", "1234"))
 
 # the pinned 16k pretrain vocab (chat specials reserved at fixed ids); SFT never
 # retrains it. MUST match the base checkpoint's vocab — the current base
@@ -173,24 +175,6 @@ def make_model(vocab_size: int) -> GPT:
     )
 
 
-def compute_loss(model, x, y, eos_id: int):
-    block_mask, pos_ids = build_block_mask_and_pos(x, eos_id)
-    hidden = model(x, return_hidden=True, block_mask=block_mask, pos_ids=pos_ids)
-    weight = getattr(model, "_orig_mod", model).token_emb.weight
-    return linear_cross_entropy(hidden, weight, y, softcap=LOGIT_SOFTCAP)
-
-
-@torch.no_grad()
-def evaluate(model, loader, eos_id: int) -> float:
-    model.eval()
-    losses = []
-    for x, y in loader:
-        x, y = x.to(DEVICE), y.to(DEVICE)
-        losses.append(compute_loss(model, x, y, eos_id).item())
-    model.train()
-    return sum(losses) / max(1, len(losses))
-
-
 @torch.no_grad()
 def print_generations(model, tokenizer, bos_id: int, eos_id: int, im_end_id: int):
     """Greedy continuation, sliced in TOKEN space (char-slicing the decoded text
@@ -216,6 +200,7 @@ def print_generations(model, tokenizer, bos_id: int, eos_id: int, im_end_id: int
 
 
 def train():
+    pl.seed_everything(SEED, workers=True)
     dms = make_datamodules()
     tok = dms[0].tokenizer
     eos_id, bos_id = dms[0].eos_id, dms[0].bos_id
@@ -229,8 +214,6 @@ def train():
     print(
         f"train tokens={total:,}  supervised={int((train_ds.labels != -100).sum()):,}"
     )
-
-    from torch.utils.data import DataLoader
 
     train_loader = DataLoader(
         train_ds,
@@ -259,13 +242,13 @@ def train():
             f"LoRA r={LORA_R}: {n_lora:,} trainable / {n_total:,} ({n_lora / n_total:.1%})"
         )
 
-    model.to(DEVICE, dtype=DTYPE)
     if DEVICE == "cuda":
         model = torch.compile(model)
 
     if USE_LORA:
         # only the LoRA A/B params; base weights keep requires_grad=True (the
-        # flex_attn wrapper breaks on no-grad q/k/v) but are never stepped
+        # flex_attn wrapper breaks on no-grad q/k/v) but are never stepped — the
+        # module zeros grads model-wide (zero_grad_all_params) so they don't stale.
         optimizer = torch.optim.AdamW(
             lora_params,
             lr=LORA_LR,
@@ -273,53 +256,59 @@ def train():
         )
     else:
         optimizer = Muon(muon_param_groups(model, muon_lr=MUON_LR, adamw_lr=ADAMW_LR))
-    base_lrs = [g["lr"] for g in optimizer.param_groups]
+    scheduler = LinearWarmupCosineAnnealingLR(
+        optimizer,
+        warmup_steps=WARMUP_STEPS,
+        max_steps=MAX_TRAIN_STEPS,
+        final_lr_frac=FINAL_LR_FRAC,
+    )
 
-    def lr_factor(step: int) -> float:
-        if step < WARMUP_STEPS:
-            return (step + 1) / WARMUP_STEPS
-        t = (step - WARMUP_STEPS) / max(1, MAX_TRAIN_STEPS - WARMUP_STEPS)
-        return FINAL_LR_FRAC + (1 - FINAL_LR_FRAC) * 0.5 * (1 + math.cos(math.pi * t))
+    module = LanguageModelModule(
+        model,
+        optimizer,
+        scheduler,
+        use_cce=(DEVICE == "cuda"),
+        logit_softcap=LOGIT_SOFTCAP,
+        eos_id=eos_id,
+        # assistant-only supervision is already in the labels (-100 elsewhere);
+        # no doc-boundary target mask needed.
+        zero_grad_all_params=USE_LORA,
+    )
 
-    global_step = 0
-    for epoch in range(N_EPOCHS):
-        steps_left = MAX_TRAIN_STEPS - global_step
-        if steps_left <= 0:
-            break
-        pbar = tqdm(
-            islice(train_loader, steps_left),
-            desc=f"Epoch {epoch + 1}/{N_EPOCHS}",
-            total=min(steps_left, len(train_loader)),
-            dynamic_ncols=True,
-        )
-        for x, y in pbar:
-            x, y = x.to(DEVICE), y.to(DEVICE)
-            for g, base in zip(optimizer.param_groups, base_lrs):
-                g["lr"] = base * lr_factor(global_step)
-            # model-wide (not optimizer-wide): in LoRA mode base weights still
-            # produce grads (see apply_lora) which must not accumulate
-            model.zero_grad(set_to_none=True)
-            loss = compute_loss(model, x, y, eos_id)
-            loss.backward()
-            optimizer.step()
-            global_step += 1
-
-            if global_step % VALIDATE_EVERY_N_STEPS == 0:
-                val_loss = evaluate(model, val_loader, eos_id)
-                print(
-                    f"\nStep {global_step}: train_loss={loss.item():.4f}, "
-                    f"val_loss={val_loss:.4f}, val_ppl={math.exp(min(val_loss, 20)):.2f}"
-                )
-            pbar.set_postfix(step=global_step, loss=f"{loss.item():.4f}")
+    tokens_per_step = BATCH_SIZE * SEQ_LEN
+    run_name = CHECKPOINT_PATH.stem
+    ckpt = ModelCheckpoint(
+        dirpath=RUN_DIR / run_name / "checkpoints",
+        filename="gpt",
+        monitor="val/loss",
+        save_last=True,
+        enable_version_counter=False,
+    )
+    trainer = Trainer(
+        max_steps=MAX_TRAIN_STEPS,
+        max_epochs=N_EPOCHS,
+        precision="bf16-true" if DEVICE == "cuda" else "32-true",
+        val_check_interval=VALIDATE_EVERY_N_STEPS,  # SFT has no grad accum (accum=1)
+        num_sanity_val_steps=0,
+        enable_progress_bar=False,  # ProgressPrinter owns stdout
+        logger=build_run_loggers(RUN_DIR, "tinylm-sft", run_name),
+        callbacks=[
+            ckpt,
+            ProgressPrinter(print_every=max(1, VALIDATE_EVERY_N_STEPS // 10), tokens_per_step=tokens_per_step),
+            TokenAxisCallback(tokens_per_step),
+        ],
+    )
+    trainer.fit(module, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
     RUN_DIR.mkdir(parents=True, exist_ok=True)
-    net = getattr(model, "_orig_mod", model)
+    net = getattr(module.model, "_orig_mod", module.model)
     if USE_LORA:
         from chimera.models.lora import merge_lora
 
         net = merge_lora(net)  # fold deltas back -> base-architecture state_dict
     torch.save(net.state_dict(), CHECKPOINT_PATH)
     print(f"Checkpoint saved to {CHECKPOINT_PATH}")
+    print(f"best (val/loss) checkpoint: {ckpt.best_model_path}")
 
     net = net.to(DEVICE)
     print_generations(net, tok, bos_id, eos_id, im_end_id)
