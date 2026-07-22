@@ -4,5 +4,8 @@
     "**/__pycache__": true,
     "**/.ruff_cache": true,
     "**/.uv-cache": true
+  },
+  "[markdown]": {
+    "editor.wordWrap": "on"
   }
 }
