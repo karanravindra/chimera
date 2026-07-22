@@ -5,7 +5,7 @@ TinyStoriesV2 (``noanabeshima/TinyStoriesV2``) is the GPT-4-only rebuild of
 roneneldan/TinyStories — ~2.7M short synthetic children's stories using a small
 vocabulary, a common toy corpus for tiny language models. All machinery
 (tokenizer training/caching, per-document EOS/BOS markers, flat-stream ids
-caches, dataloaders) lives in :class:`chimera.data.hf_text.HFTextDataModule`;
+caches, dataloaders) lives in :class:`chimera.data.text.hf_text.HFTextDataModule`;
 this class just points it at the dataset.
 
 TinyStoriesV2 ships native ``train`` and

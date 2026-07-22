@@ -4,7 +4,7 @@ Wikipedia BPE DataModule.
 Wikipedia (``wikimedia/wikipedia``, the community parquet rebuild, CC BY-SA) is
 clean long-form expository/reference prose — the register the tinylm roadmap
 wants for continued pretraining and for the tokenizer's "lifetime inputs"
-corpus. All machinery lives in :class:`chimera.data.hf_text.HFTextDataModule`;
+corpus. All machinery lives in :class:`chimera.data.text.hf_text.HFTextDataModule`;
 this class points it at the ``20231101.en`` snapshot.
 
 The English snapshot is ~41 ~230MB parquet shards; ``DATA_FILES`` bounds the

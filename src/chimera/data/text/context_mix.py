@@ -9,11 +9,11 @@ therefore keeps two pools and mixes them BY TOKENS:
 
 - **short pool** — a normal :class:`ConcatTextDataModule` over the broad sources
   (FineWeb / Cosmopedia / stories / QA), served as packed
-  :class:`~chimera.data._text.TokenDataset` windows (may cross doc boundaries;
+  :class:`~chimera.data.text.datasets.TokenDataset` windows (may cross doc boundaries;
   that's fine — this pool is for short-context retention).
 - **long pool** — a :class:`ConcatTextDataModule` over long-document sources
   (Wikipedia, Stack Exchange, a long-FineWeb slice), served as
-  :class:`~chimera.data._text.WindowSampledDataset` windows: a random contiguous
+  :class:`~chimera.data.text.datasets.WindowSampledDataset` windows: a random contiguous
   slice of a single long document, so every position is mutually visible.
 
 Both pools produce items of exactly ``ctx`` tokens, so **token share == item

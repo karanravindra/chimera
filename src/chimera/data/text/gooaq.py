@@ -10,7 +10,7 @@ of the textbook/web sources. Each pair is rendered as one document::
     Question: {question}
     Answer: {answer}
 
-All machinery lives in :class:`chimera.data.hf_text.HFTextDataModule`.
+All machinery lives in :class:`chimera.data.text.hf_text.HFTextDataModule`.
 ``DATA_FILES`` bounds the download to the first parquet shard (still far beyond
 a tiny model's slice); the corpus ships only a ``train`` split, so
 ``VAL_FROM_TRAIN`` carves validation off its head.

@@ -11,10 +11,10 @@ Hub: access is auto-granted but downloading needs an authenticated HF token.
 The ``textbook`` column holds the synthesized textbook (the ``text`` column is
 the raw web seed it was written from) — training uses the textbook only. The
 HF ``test`` split serves as validation. All machinery lives in
-:class:`chimera.data.hf_text.HFTextDataModule`.
+:class:`chimera.data.text.hf_text.HFTextDataModule`.
 
 Standalone it trains its own tokenizer on textbook text; mixed into a
-:class:`chimera.data.ConcatTextDataModule` it adopts the mixture owner's
+:class:`chimera.data.text.ConcatTextDataModule` it adopts the mixture owner's
 tokenizer instead.
 
 Usage:

@@ -2,7 +2,7 @@
 ConcatTextDataModule — mix HFTextDataModule sources without copying their streams.
 
 Composes submodules instead of subclassing per combination: pass a list of
-:class:`chimera.data.hf_text.HFTextDataModule` instances and this module wraps
+:class:`chimera.data.text.hf_text.HFTextDataModule` instances and this module wraps
 their datasets in :class:`torch.utils.data.ConcatDataset`. The DataLoader's
 chunk-level shuffle then interleaves the sources within every
 epoch, so no separate sampling/weighting machinery is needed — a source's

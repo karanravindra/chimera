@@ -11,7 +11,7 @@ Config (locked with the user):
     * split_digits=False        -> unsplit digits compress dates/numbers better;
       commonsense/grounding matter more than arithmetic here (README contract)
     * full canonical specials    -> chat/reasoning/tool markers reserved at fixed
-      low ids from the first run (chimera.data.chat_template.SPECIAL_TOKENS)
+      low ids from the first run (chimera.data.text.chat_template.SPECIAL_TOKENS)
     * 500M-char corpus, per-source shares below (README future-facing mix; the
       original fixed suite omitted QuAC and folded its share into CoQA + SQuAD)
 

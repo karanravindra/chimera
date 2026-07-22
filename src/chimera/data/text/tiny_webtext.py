@@ -9,7 +9,7 @@ analytical register rather than raw crawl text. Gated:auto on the Hub.
 Note the schema: this is NOT a single-column text corpus. Each row is a
 ``human`` prompt and a ``bot`` reasoned response (plus repeat-ratio / POS
 metadata). For base pretraining the two turns are concatenated into one document
-via :attr:`~chimera.data.hf_text.HFTextDataModule.TEXT_COLUMNS`, so the model
+via :attr:`~chimera.data.text.hf_text.HFTextDataModule.TEXT_COLUMNS`, so the model
 sees the prompt→reasoned-answer flow as running text. (It is closer to an
 instruction/QA corpus than raw web text — worth weighing when deciding its share
 of a base-pretraining mix.)
@@ -17,7 +17,7 @@ of a base-pretraining mix.)
 Files live under ``train/en/`` as many small shards; the whole English set is
 only ~1.3GB, so ``DATA_FILES`` globs all of them (the token cap stops
 tokenization early) and ``VAL_FROM_TRAIN`` carves validation off the head. All
-machinery lives in :class:`chimera.data.hf_text.HFTextDataModule`.
+machinery lives in :class:`chimera.data.text.hf_text.HFTextDataModule`.
 
 Usage:
     dm = TinyWebTextDataModule(data_dir="/mnt/ai/data", add_bos=True)

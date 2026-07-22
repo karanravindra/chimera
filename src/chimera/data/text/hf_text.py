@@ -7,7 +7,7 @@ text, tokenize each split into one flat token stream with per-document EOS/BOS
 markers, cache the streams keyed on the tokenizer's content hash, and serve
 non-overlapping next-token ``(input, target)`` chunks. The dataset loading,
 split carving, fingerprinting, cache round-trip, and dataloader scaffolding live
-in :class:`chimera.data._hf_base._HFCorpusBase`; this class supplies the
+in :class:`chimera.data.text._hf_base._HFCorpusBase`; this class supplies the
 tokenizer and the flat-stream tokenization.
 
 Subclasses configure the dataset via class attributes::
@@ -31,7 +31,7 @@ then tokenizes with it and keys its ids caches on the shared fingerprint, so one
 vocab spans the whole mixture and caches can never pair with the wrong tokenizer.
 
 The ``hf`` tokenizer backend is trained with the canonical chat/tool special
-tokens (:data:`chimera.data.chat_template.SPECIAL_TOKENS`) reserved at fixed low
+tokens (:data:`chimera.data.text.chat_template.SPECIAL_TOKENS`) reserved at fixed low
 ids, so a base tokenizer carries straight into chat / tool-call SFT without a
 vocab change. Documents are concatenated with an ``eos_token`` after each one;
 ``add_bos`` additionally prepends a start token. Both require a tokenizer that

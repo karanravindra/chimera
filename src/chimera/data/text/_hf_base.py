@@ -1,8 +1,8 @@
 """
 Shared base for the Hugging Face corpus DataModules.
 
-Both the pretrain text loader (:class:`chimera.data.hf_text.HFTextDataModule`)
-and the SFT loader (:class:`chimera.data.chat_sft.ChatSFTDataModule`) do the same
+Both the pretrain text loader (:class:`chimera.data.text.hf_text.HFTextDataModule`)
+and the SFT loader (:class:`chimera.data.text.chat_sft.ChatSFTDataModule`) do the same
 thing in outline: download an HF dataset, tokenize each split into a flat on-disk
 cache keyed on a tokenizer fingerprint + a source fingerprint, and serve
 non-overlapping ``(input, target)`` chunks. This base holds everything that is

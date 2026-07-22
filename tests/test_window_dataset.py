@@ -9,7 +9,7 @@ resampling, and token-share == item-share mixing.
 
 import torch
 
-from chimera.data._text import WindowSampledDataset, window_worker_init_fn
+from chimera.data.text.datasets import WindowSampledDataset, window_worker_init_fn
 from chimera.models.attention import build_block_mask_and_pos
 
 EOS, BOS = 0, 1

@@ -16,7 +16,7 @@ dataset, so they are grouped into one document per passage::
     Question: {question 2}
     Answer: {answer 2}
 
-All machinery lives in :class:`chimera.data.hf_text.HFTextDataModule`; the
+All machinery lives in :class:`chimera.data.text.hf_text.HFTextDataModule`; the
 corpus is small (~20M chars of unique passages) and ships a native
 ``validation`` split.
 

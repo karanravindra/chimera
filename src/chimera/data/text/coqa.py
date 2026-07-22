@@ -20,7 +20,7 @@ document::
     Question: {question 2}
     Answer: {answer 2}
 
-All machinery lives in :class:`chimera.data.hf_text.HFTextDataModule`; the
+All machinery lives in :class:`chimera.data.text.hf_text.HFTextDataModule`; the
 corpus ships native ``train`` and ``validation`` splits.
 
 Usage:

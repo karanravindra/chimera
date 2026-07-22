@@ -13,10 +13,10 @@ The document text is the single ``text`` column. The repo ships only a ``train``
 split (root-level ``data_part_N.parquet`` shards, ~200k docs each), so
 ``DATA_FILES`` bounds the download to the first four shards (~0.8B tokens, past a
 tiny model's cap) and ``VAL_FROM_TRAIN`` carves validation off the head. All
-machinery lives in :class:`chimera.data.hf_text.HFTextDataModule`.
+machinery lives in :class:`chimera.data.text.hf_text.HFTextDataModule`.
 
 Standalone it trains its own tokenizer on the text; mixed into a
-:class:`chimera.data.ConcatTextDataModule` it adopts the mixture owner's
+:class:`chimera.data.text.ConcatTextDataModule` it adopts the mixture owner's
 tokenizer instead.
 
 Usage:

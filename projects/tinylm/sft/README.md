@@ -3,7 +3,7 @@
 SFT of the pretrained ~6M GPT (`../pretrain`) into a simple-QA chat assistant.
 Same rails as pretrain — packed seq-512 streams, FlexAttention causal+document
 masking, CCE (+ logit softcap 30), Muon+AdamW with warmup+cosine — but the
-stream is ChatML conversations (`chimera.data.chat_template`) with loss ONLY on
+stream is ChatML conversations (`chimera.data.text.chat_template`) with loss ONLY on
 assistant tokens (labels -100 elsewhere), and the model/tokenizer come from the
 pretrain run (the chat special tokens were reserved in the vocab from day one).
 
@@ -11,7 +11,7 @@ pretrain run (the chat special tokens were reserved in the vocab from day one).
 
 - `train.py` — raw PyTorch SFT loop; loads `../pretrain`'s `model.py` + base
   checkpoint, saves to `/mnt/ai/runs/tinylm/sft/chimera_gpt6m_sft.pt`
-- Data layer: `chimera.data.chat_sft` (`ChatSFTDataModule` + per-dataset
+- Data layer: `chimera.data.text.chat_sft` (`ChatSFTDataModule` + per-dataset
   subclasses; packed loss-masked streams, cached keyed on tokenizer hash)
 
 ## Run

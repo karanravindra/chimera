@@ -4,9 +4,9 @@ FineWeb-Edu BPE DataModule (mixture-ready).
 FineWeb-Edu (``HuggingFaceFW/fineweb-edu``) is a large, high-quality English web
 corpus for language-model pretraining — real-world knowledge and register that
 the synthetic story/textbook corpora lack. This is the
-:class:`chimera.data.hf_text.HFTextDataModule` variant, so it shares the mixture
+:class:`chimera.data.text.hf_text.HFTextDataModule` variant, so it shares the mixture
 owner's tokenizer and drops straight into a
-:class:`chimera.data.ConcatTextDataModule` blend.
+:class:`chimera.data.text.ConcatTextDataModule` blend.
 
 The ``sample-10BT`` config is ~28GB across ten ~2.1GB parquet shards (~1B tokens
 each). A single shard already exceeds a tiny model's token budget, so

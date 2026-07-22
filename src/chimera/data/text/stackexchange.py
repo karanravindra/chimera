@@ -16,7 +16,7 @@ rendered as one document::
 
     {answer}
 
-All machinery lives in :class:`chimera.data.hf_text.HFTextDataModule`. The
+All machinery lives in :class:`chimera.data.text.hf_text.HFTextDataModule`. The
 corpus ships only a ``train`` split, so ``VAL_FROM_TRAIN`` carves validation
 off its head.
 

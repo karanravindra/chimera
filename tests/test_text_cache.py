@@ -1,7 +1,7 @@
 import torch
 
-from chimera.data._text import tokenize_with_progress
-from chimera.data.hf_text import HFTextDataModule
+from chimera.data.text.datasets import tokenize_with_progress
+from chimera.data.text.hf_text import HFTextDataModule
 
 
 class _Tokenizer:

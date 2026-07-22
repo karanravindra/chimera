@@ -151,11 +151,9 @@ chimera-data text build squad.sft --tokenizer tokenizer.json
 chimera-data text validate /mnt/ai/data/text/artifacts/v3/VIEW/HASH
 ```
 
-## Compatibility
+## Imports
 
-Existing imports such as `chimera.data.TinyStoriesV2DataModule` and
-`chimera.data.tinystories_v2` remain lazy compatibility forwards. Their
-implementations now live under `chimera.data.text`; new code should use catalog
-views and `TextDataModule`. This keeps old experiments importable while the
-active TinyLM pretraining, context-extension, SFT, and tokenizer-corpus paths use
-the unified pipeline.
+The supported module paths live under `chimera.data.text`; dataset-specific
+compatibility modules at the `chimera.data` package root have been removed.
+Public classes remain available as lazy attributes of `chimera.data`, while new
+code should use catalog views and `TextDataModule`.

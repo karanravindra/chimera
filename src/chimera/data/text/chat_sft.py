@@ -1,15 +1,15 @@
 """
 Chat-SFT DataModules: HF chat/QA datasets -> packed, loss-masked token streams.
 
-The SFT counterpart of :class:`chimera.data.hf_text.HFTextDataModule`. Each row
-becomes a ChatML conversation (:func:`chimera.data.chat_template.render_masked`),
+The SFT counterpart of :class:`chimera.data.text.hf_text.HFTextDataModule`. Each row
+becomes a ChatML conversation (:func:`chimera.data.text.chat_template.render_masked`),
 encoded with a FIXED tokenizer loaded from disk (the pretrain vocab — SFT never
 retrains it; the chat special tokens are already reserved at fixed low ids).
 Conversations are packed into one flat ids stream plus a parallel labels stream
 (token id on supervised/assistant positions, -100 elsewhere), separated by EOS
 so FlexAttention document masking sees one conversation per document. Served as
 non-overlapping ``(input, shifted-labels)`` chunks via
-:class:`chimera.data._text.MaskedTokenDataset`.
+:class:`chimera.data.text.datasets.MaskedTokenDataset`.
 
 Streams are cached keyed on the tokenizer's content hash + caps (same
 discipline as the pretrain ids caches). Subclasses configure the dataset via
