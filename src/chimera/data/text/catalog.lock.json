@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "sources": {
+    "coqa": {"repo": "stanfordnlp/coqa", "revision": "0d9e9952f1ef6e5415492d3d84b5873259137e3c", "gated": false, "license": ["other"]},
+    "cosmopedia-v2": {"repo": "HuggingFaceTB/smollm-corpus", "revision": "3ba9d605774198c5868892d7a8deda78031a781f", "gated": false, "license": "odc-by", "files": ["cosmopedia-v2/train-00000-of-00104.parquet", "cosmopedia-v2/train-00001-of-00104.parquet", "cosmopedia-v2/train-00002-of-00104.parquet", "cosmopedia-v2/train-00003-of-00104.parquet", "cosmopedia-v2/train-00004-of-00104.parquet", "cosmopedia-v2/train-00005-of-00104.parquet", "cosmopedia-v2/train-00006-of-00104.parquet"]},
+    "fineweb-edu": {"repo": "HuggingFaceFW/fineweb-edu", "revision": "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9", "gated": false, "license": "odc-by", "files": ["sample/10BT/000_00000.parquet", "sample/10BT/001_00000.parquet", "sample/10BT/002_00000.parquet", "sample/10BT/003_00000.parquet"]},
+    "gooaq": {"repo": "sentence-transformers/gooaq", "revision": "b089f728748a068b7bc5234e5bcf5b25e3c8279c", "gated": false, "license": "apache-2.0", "files": ["pair/train-00000-of-00002.parquet", "pair/train-00001-of-00002.parquet"]},
+    "no-robots": {"repo": "HuggingFaceH4/no_robots", "revision": "e6f9a4ac5c37faeb744ba9ecf0473184d7f8105b", "gated": false, "license": "cc-by-nc-4.0"},
+    "oasst1": {"repo": "OpenAssistant/oasst1", "revision": "fdf72ae0827c1cda404aff25b6603abec9e3399b", "gated": false, "license": "apache-2.0"},
+    "quac": {"repo": "yairfeldman/quac", "revision": "6582ae43cfabdfcbcfba5721b7d671021d1967f5", "gated": false, "license": "unknown"},
+    "smoltalk": {"repo": "HuggingFaceTB/smoltalk", "revision": "5feaf2fd3ffca7c237fc38d1861bc30365d48ffa", "gated": false, "license": "unknown"},
+    "soda": {"repo": "allenai/soda", "revision": "fdc848ab0183208ea7808206c91c724414d0a071", "gated": false, "license": ["cc-by-4.0"]},
+    "squad": {"repo": "rajpurkar/squad", "revision": "7b6d24c440a36b6815f21b70d25016731768db1f", "gated": false, "license": "cc-by-sa-4.0"},
+    "stackexchange": {"repo": "donfu/oa-stackexchange", "revision": "ae54b00b7c688866e86acf4605034ed2bded75f3", "gated": false, "license": "cc-by-sa-4.0"},
+    "tiny-strange-textbooks": {"repo": "nampdn-ai/tiny-strange-textbooks", "revision": "6066e9c6f9e75e18f3625a551087bd44fe8a84e0", "gated": true, "license": "apache-2.0", "files": ["data_part_0.parquet", "data_part_1.parquet", "data_part_2.parquet", "data_part_3.parquet"]},
+    "tiny-textbooks": {"repo": "nampdn-ai/tiny-textbooks", "revision": "1f88d0fe47109c17de0671cd8b8f2659f0a1c1ef", "gated": true, "license": "apache-2.0"},
+    "tiny-webtext": {"repo": "nampdn-ai/tiny-webtext", "revision": "ddaa7a28c60dd1606bedccec8c5993754c3261e0", "gated": true, "license": "mit"},
+    "tinystories-v2": {"repo": "noanabeshima/TinyStoriesV2", "revision": "50ffd6925642413b001a000bc30e1d90aed9f5da", "gated": false, "license": "cdla-sharing-1.0"},
+    "ultrachat-200k": {"repo": "HuggingFaceH4/ultrachat_200k", "revision": "8049631c405ae6576f93f445c6b8166f76f5505a", "gated": false, "license": "mit"},
+    "wikipedia": {"repo": "wikimedia/wikipedia", "revision": "b04c8d1ceb2f5cd4588862100d08de323dccfbaa", "gated": false, "license": ["cc-by-sa-3.0", "gfdl"], "files": ["20231101.en/train-00000-of-00041.parquet"]}
+  }
+}

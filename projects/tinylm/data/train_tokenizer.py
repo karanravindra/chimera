@@ -12,8 +12,8 @@ Config (locked with the user):
       commonsense/grounding matter more than arithmetic here (README contract)
     * full canonical specials    -> chat/reasoning/tool markers reserved at fixed
       low ids from the first run (chimera.data.chat_template.SPECIAL_TOKENS)
-    * 500M-char corpus, per-source shares below (README future-facing mix, minus
-      QuAC which has no loadable HF form — its share folds into CoQA + SQuAD)
+    * 500M-char corpus, per-source shares below (README future-facing mix; the
+      original fixed suite omitted QuAC and folded its share into CoQA + SQuAD)
 
 Sources are read through their chimera.data DataModules (same document rendering
 the pretraining stream uses) via streaming, so nothing is fully downloaded just
@@ -43,18 +43,11 @@ from pathlib import Path
 
 os.environ.setdefault("HF_HOME", "/mnt/ai/data/hf")
 
-from datasets import load_dataset  # noqa: E402
-
-from chimera.data import (  # noqa: E402
-    CoQADataModule,
-    CosmopediaV2DataModule,
-    FineWebEduTextDataModule,
-    SQuADTextDataModule,
-    StackExchangeDataModule,
-    TinyStoriesV2DataModule,
-    WikipediaDataModule,
+from chimera.data.text.catalog import (  # noqa: E402
+    get_view,
+    load_rows,
 )
-from chimera.data.chat_template import SPECIAL_TOKENS, render  # noqa: E402
+from chimera.data.text.chat_template import SPECIAL_TOKENS, render  # noqa: E402
 from chimera.tokenizers import BPETokenizer  # noqa: E402
 
 REPO_OUT = Path(__file__).resolve().parent / "tokenizers"  # git-tracked
@@ -64,17 +57,17 @@ DEFAULT_CHARS = 500_000_000
 SEED = 0
 
 # Per-source character shares of the fixed corpus (sum to 100). README
-# future-facing mix; QuAC dropped (no loadable HF form) and its share folded
-# into the CoQA/SQuAD grounded-QA group.
+# future-facing mix; the fixed suite omitted QuAC and folded its share into the
+# CoQA/SQuAD grounded-QA group.
 SHARES = {
     "fineweb-edu": 35.0,
     "cosmopedia-v2": 20.0,
     "tinystories-v2": 15.0,
     "stackexchange": 10.0,
     "wikipedia": 5.0,
-    "coqa": 3.75,          # grounded QA (7.5% split across coqa + squad)
+    "coqa": 3.75,  # grounded QA (7.5% split across coqa + squad)
     "squad": 3.75,
-    "oasst1": 2.5,         # ChatML conversations (7.5% split across the three)
+    "oasst1": 2.5,  # ChatML conversations (7.5% split across the three)
     "no_robots": 2.5,
     "ultrachat": 2.5,
 }
@@ -99,86 +92,31 @@ def _vocab_tag(v: int) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Streaming document iterators per source (same rendering as the pretrain stream)
+# Streaming document iterators per source (same catalog views as training)
 # --------------------------------------------------------------------------- #
-def _stream_ds(dm):
-    """Open a source's HF dataset in streaming mode, honoring its config/shards."""
-    kwargs = {"split": dm.TRAIN_SPLIT, "streaming": True}
-    if dm.DATA_FILES is not None:
-        kwargs["data_files"] = dm.DATA_FILES
-    if dm.CONFIG_NAME is not None:
-        kwargs["name"] = dm.CONFIG_NAME
-    return load_dataset(dm.HF_REPO, **kwargs)
-
-
-def _plain_docs(dm):
-    """Documents rendered exactly as the DataModule would render them."""
-    yield from dm.iter_texts(_stream_ds(dm))
-
-
-def _chatml_docs(repo: str, split: str, msg_col: str):
-    """Render each conversation with the canonical ChatML template."""
-    ds = load_dataset(repo, split=split, streaming=True)
-    for ex in ds:
-        msgs = ex[msg_col]
-        if msgs:
-            yield render(msgs)
-
-
-def _oasst1_docs():
-    """Reconstruct English root-to-leaf conversation paths from OASST1 trees.
-
-    OASST1 is a flat message table; group by tree, follow the highest-ranked
-    child at each turn from each root, keep reviewed English messages, and
-    render the resulting user/assistant path as ChatML.
-    """
-    ds = load_dataset("OpenAssistant/oasst1", split="train")
-    ds = ds.filter(lambda r: r["lang"] == "en" and r["review_result"])
-    by_id = {r["message_id"]: r for r in ds}
-    children: dict[str, list] = {}
-    roots = []
-    for r in by_id.values():
-        pid = r["parent_id"]
-        if pid is None or pid not in by_id:
-            roots.append(r)
-        else:
-            children.setdefault(pid, []).append(r)
-
-    def _rank(r):  # rank None (unranked) sorts last
-        return r["rank"] if r["rank"] is not None else 1e9
-
-    for root in roots:
-        msgs, node = [], root
-        while node is not None:
-            role = "user" if node["role"] == "prompter" else "assistant"
-            msgs.append({"role": role, "content": node["text"]})
-            kids = sorted(children.get(node["message_id"], []), key=_rank)
-            node = kids[0] if kids else None
-        if len(msgs) >= 2:
-            yield render(msgs)
+def _view_docs(key: str):
+    """Render a locked catalog view exactly as the compiler does."""
+    view = get_view(key)
+    rows = load_rows(view, "train", data_dir=Path("/mnt/ai/data"), streaming=True)
+    for example in view.adapter.iter_examples(rows):
+        yield example.text
 
 
 def _source_docs(name: str):
-    if name == "fineweb-edu":
-        return _plain_docs(FineWebEduTextDataModule(data_dir="/mnt/ai/data"))
-    if name == "cosmopedia-v2":
-        return _plain_docs(CosmopediaV2DataModule(data_dir="/mnt/ai/data"))
-    if name == "tinystories-v2":
-        return _plain_docs(TinyStoriesV2DataModule(data_dir="/mnt/ai/data"))
-    if name == "stackexchange":
-        return _plain_docs(StackExchangeDataModule(data_dir="/mnt/ai/data"))
-    if name == "wikipedia":
-        return _plain_docs(WikipediaDataModule(data_dir="/mnt/ai/data"))
-    if name == "coqa":
-        return _plain_docs(CoQADataModule(data_dir="/mnt/ai/data"))
-    if name == "squad":
-        return _plain_docs(SQuADTextDataModule(data_dir="/mnt/ai/data"))
-    if name == "oasst1":
-        return _oasst1_docs()
-    if name == "no_robots":
-        return _chatml_docs("HuggingFaceH4/no_robots", "train", "messages")
-    if name == "ultrachat":
-        return _chatml_docs("HuggingFaceH4/ultrachat_200k", "train_sft", "messages")
+    views = {
+        "fineweb-edu": "fineweb-edu.pretrain",
+        "cosmopedia-v2": "cosmopedia-v2.pretrain",
+        "tinystories-v2": "tinystories-v2.pretrain",
+        "stackexchange": "stackexchange.pretrain",
+        "wikipedia": "wikipedia.pretrain",
+        "coqa": "coqa.pretrain",
+        "squad": "squad.pretrain",
+        "oasst1": "oasst1.sft",
+        "no_robots": "no-robots.sft",
+        "ultrachat": "ultrachat-200k.sft",
+    }
+    if name in views:
+        return _view_docs(views[name])
     raise ValueError(f"unknown source {name!r}")
 
 
@@ -273,10 +211,12 @@ def evaluate(tok: BPETokenizer, heldout: dict[str, str]) -> dict:
     doc_lens.sort()
 
     def _p(q):
-        return doc_lens[min(len(doc_lens) - 1, int(q * len(doc_lens)))] if doc_lens else 0
+        return (
+            doc_lens[min(len(doc_lens) - 1, int(q * len(doc_lens)))] if doc_lens else 0
+        )
 
     def _frac_within(n):
-        return round(sum(l <= n for l in doc_lens) / max(len(doc_lens), 1), 4)
+        return round(sum(length <= n for length in doc_lens) / max(len(doc_lens), 1), 4)
 
     all_text = "\n".join(t for t in heldout.values() if t)
     total_ids = raw.encode(all_text, add_special_tokens=False).ids
@@ -313,7 +253,9 @@ def evaluate(tok: BPETokenizer, heldout: dict[str, str]) -> dict:
 def _write_report(path: Path, results: dict):
     tags = list(results.keys())
     lines = ["# tinylm tokenizer suite\n"]
-    lines.append("Fixed 500M-char future-facing corpus; vocab size is the only variable.\n")
+    lines.append(
+        "Fixed 500M-char future-facing corpus; vocab size is the only variable.\n"
+    )
     lines.append("## Aggregate\n")
     lines.append("| metric | " + " | ".join(tags) + " |")
     lines.append("| --- | " + " | ".join("---:" for _ in tags) + " |")
@@ -329,7 +271,9 @@ def _write_report(path: Path, results: dict):
         ("specials atomic", "all_specials_atomic"),
     ]
     for label, key in rows:
-        lines.append(f"| {label} | " + " | ".join(str(results[t][key]) for t in tags) + " |")
+        lines.append(
+            f"| {label} | " + " | ".join(str(results[t][key]) for t in tags) + " |"
+        )
     lines.append("\n## chars/token per source\n")
     srcs = list(next(iter(results.values()))["per_source"].keys())
     lines.append("| source | " + " | ".join(tags) + " |")
@@ -337,7 +281,9 @@ def _write_report(path: Path, results: dict):
     for s in srcs:
         lines.append(
             f"| {s} | "
-            + " | ".join(str(results[t]["per_source"][s]["chars_per_token"]) for t in tags)
+            + " | ".join(
+                str(results[t]["per_source"][s]["chars_per_token"]) for t in tags
+            )
             + " |"
         )
     path.write_text("\n".join(lines) + "\n")
@@ -403,7 +349,9 @@ def main():
         )
     )
     _write_report(REPO_OUT / "report.md", results)
-    print(f"\nsummary -> {REPO_OUT / 'summary.json'}\nreport  -> {REPO_OUT / 'report.md'}")
+    print(
+        f"\nsummary -> {REPO_OUT / 'summary.json'}\nreport  -> {REPO_OUT / 'report.md'}"
+    )
 
 
 if __name__ == "__main__":

@@ -23,22 +23,17 @@ import lightning.pytorch as pl
 import torch
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
-from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "pretrain"))
 from model import GPT  # noqa: E402  (the pretrain model, single source of truth)
 
-from chimera.data import (  # noqa: E402
-    CoQAChatDataModule,
-    EverydayConversationsDataModule,
-    GooAQChatDataModule,
-    NoRobotsChatDataModule,
-    QuACChatDataModule,
-    SODAChatDataModule,
-    SQuADChatDataModule,
+from chimera.data.text import (  # noqa: E402
+    MixtureSource,
+    TextDataModule,
+    TextMixtureSpec,
+    TokenizerSpec,
 )
-from chimera.data._text import MaskedTokenDataset  # noqa: E402
-from chimera.data.chat_template import render  # noqa: E402
+from chimera.data.text.chat_template import render  # noqa: E402
 from chimera.modules import LanguageModelModule  # noqa: E402
 from chimera.optim import LinearWarmupCosineAnnealingLR, Muon, muon_param_groups  # noqa: E402
 from chimera.utils import ProgressPrinter, TokenAxisCallback, build_run_loggers  # noqa: E402
@@ -114,50 +109,39 @@ GENERATION_PROMPTS = [
 ]
 
 
-def make_datamodules() -> list:
+def make_datamodule() -> TextDataModule:
     """The simple-QA chat mixture: bulk closed-book QA + grounded QA + chat style."""
-    DATA_DIR = "/mnt/ai/data"
-    common = dict(
-        tokenizer_path=TOKENIZER_PATH,
-        data_dir=DATA_DIR,
-        batch_size=BATCH_SIZE,
-        seq_len=SEQ_LEN,
-        max_val_tokens=250_000,
-    )
     # Phase-2 mix: the grounded-QA core (CoQA+QuAC lead, SQuAD/GooAQ moderate)
     # PLUS instruction breadth — No Robots (summarize/rewrite/extract/classify,
     # the transformation-instruction target) and a light SODA sample (social
     # dialog; synthetic, capped low to avoid style imprint). OASST1 (-> preference
     # tuning) and Tulu (needs source-filtering) deferred. Shares via max_train_tokens.
-    dms = [
-        CoQAChatDataModule(max_train_tokens=15_000_000, **common),
-        QuACChatDataModule(max_train_tokens=12_000_000, **common),
-        NoRobotsChatDataModule(max_train_tokens=8_000_000, **common),
-        SQuADChatDataModule(max_train_tokens=6_000_000, **common),
-        SODAChatDataModule(max_train_tokens=4_000_000, **common),
-        GooAQChatDataModule(max_train_tokens=3_000_000, **common),
-        EverydayConversationsDataModule(max_train_tokens=None, **common),
-    ]
-    for dm in dms:
-        dm.prepare_data()
-        dm.setup("fit")
-    return dms
-
-
-def concat_streams(dms) -> tuple[MaskedTokenDataset, MaskedTokenDataset, dict]:
-    """One packed train/val stream across sources (each ends on an EOS boundary)."""
-    train = MaskedTokenDataset(
-        torch.cat([dm.train_dataset.ids for dm in dms]),
-        torch.cat([dm.train_dataset.labels for dm in dms]),
-        SEQ_LEN,
+    sources = (
+        MixtureSource("coqa.sft", max_train_tokens=15_000_000, max_val_tokens=250_000),
+        MixtureSource("quac.sft", max_train_tokens=12_000_000, max_val_tokens=250_000),
+        MixtureSource(
+            "no-robots.sft", max_train_tokens=8_000_000, max_val_tokens=250_000
+        ),
+        MixtureSource("squad.sft", max_train_tokens=6_000_000, max_val_tokens=250_000),
+        MixtureSource("soda.sft", max_train_tokens=4_000_000, max_val_tokens=250_000),
+        MixtureSource("gooaq.sft", max_train_tokens=3_000_000, max_val_tokens=250_000),
+        MixtureSource(
+            "smoltalk.everyday.sft", max_train_tokens=None, max_val_tokens=250_000
+        ),
     )
-    val = MaskedTokenDataset(
-        torch.cat([dm.val_dataset.ids for dm in dms]),
-        torch.cat([dm.val_dataset.labels for dm in dms]),
-        SEQ_LEN,
+    dm = TextDataModule(
+        TextMixtureSpec(
+            sources=sources,
+            tokenizer=TokenizerSpec.pinned(TOKENIZER_PATH),
+            add_bos=True,
+        ),
+        data_dir="/mnt/ai/data",
+        batch_size=BATCH_SIZE,
+        seq_len=SEQ_LEN,
     )
-    mix = {dm.name: len(dm.train_dataset.ids) for dm in dms}
-    return train, val, mix
+    dm.prepare_data()
+    dm.setup("fit")
+    return dm
 
 
 def make_model(vocab_size: int) -> GPT:
@@ -201,31 +185,20 @@ def print_generations(model, tokenizer, bos_id: int, eos_id: int, im_end_id: int
 
 def train():
     pl.seed_everything(SEED, workers=True)
-    dms = make_datamodules()
-    tok = dms[0].tokenizer
-    eos_id, bos_id = dms[0].eos_id, dms[0].bos_id
+    dm = make_datamodule()
+    tok = dm.tokenizer
+    eos_id, bos_id = dm.eos_id, dm.bos_id
     im_end_id = tok._tok.token_to_id("<|im_end|>")
 
-    train_ds, val_ds, mix = concat_streams(dms)
+    mix = dm.source_train_tokens
     total = sum(mix.values())
     print(
         "sft mix: " + "  ".join(f"{k}={v:,} ({v / total:.0%})" for k, v in mix.items())
     )
-    print(
-        f"train tokens={total:,}  supervised={int((train_ds.labels != -100).sum()):,}"
-    )
+    print(f"train tokens={total:,}")
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True
-    )
+    train_loader = dm.train_dataloader()
+    val_loader = dm.val_dataloader()
 
     model = make_model(tok.vocab_size)
     state = torch.load(BASE_CHECKPOINT, map_location="cpu")
@@ -294,7 +267,10 @@ def train():
         logger=build_run_loggers(RUN_DIR, "tinylm-sft", run_name),
         callbacks=[
             ckpt,
-            ProgressPrinter(print_every=max(1, VALIDATE_EVERY_N_STEPS // 10), tokens_per_step=tokens_per_step),
+            ProgressPrinter(
+                print_every=max(1, VALIDATE_EVERY_N_STEPS // 10),
+                tokens_per_step=tokens_per_step,
+            ),
             TokenAxisCallback(tokens_per_step),
         ],
     )

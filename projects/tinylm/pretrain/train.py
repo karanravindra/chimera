@@ -36,19 +36,14 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from model import GPT
 from torchinfo import summary
 
-from chimera.data import (
-    ConcatTextDataModule,
-    ContextMixDataModule,
-    CosmopediaV2DataModule,
-    FineWebEduTextDataModule,
-    GooAQDataModule,
-    LocalDocumentsDataModule,
-    SQuADTextDataModule,
-    StackExchangeDataModule,
-    TinyStoriesV2DataModule,
-    TinyTextbooksDataModule,
-    TinyWebTextDataModule,
-    WikipediaDataModule,
+from chimera.data.text import (
+    DocumentWindow,
+    LocalTextView,
+    MixtureSource,
+    Packed,
+    TextDataModule,
+    TextMixtureSpec,
+    TokenizerSpec,
 )
 from chimera.modules import LanguageModelModule
 from chimera.optim import LinearWarmupCosineAnnealingLR, Muon, muon_param_groups
@@ -149,7 +144,9 @@ INIT_CKPT = os.environ.get("TINYLM_INIT_CKPT", "").strip() or None
 # Per-stage short/long token shares (README "Context expansion route").
 CTX_STAGE_SHARES = {"2k": (0.35, 0.65), "4k": (0.27, 0.73), "8k": (0.25, 0.75)}
 # Banded-BPB eval cadence (millions of tokens); 0/unset -> reuse bench cadence.
-BAND_EVAL_EVERY_MTOKENS = float(os.environ.get("TINYLM_BAND_EVAL_EVERY_MT", "0")) or None
+BAND_EVAL_EVERY_MTOKENS = (
+    float(os.environ.get("TINYLM_BAND_EVAL_EVERY_MT", "0")) or None
+)
 # Eval cadence is expressed in TOKENS (env, in millions) and converted to steps
 # below once the global batch is known — so a token budget maps to the same
 # real cadence regardless of batch/seq. Falls back to the fixed step counts.
@@ -171,7 +168,7 @@ _RUN_TAG = f"_{_RUN_TAG}" if _RUN_TAG else ""
 CHECKPOINT_PATH = RUN_DIR / f"chimera_gpt6m{_LOOP_TAG}{_RUN_TAG}.pt"
 
 
-def make_datamodule() -> ConcatTextDataModule:
+def make_datamodule() -> TextDataModule:
     # Per-source max_train_tokens = sampling weight over the concatenated
     # stream. The pool (TRAIN_TOKENS) deliberately exceeds what the step-capped
     # run consumes, so repetition is negligible. The vocab is trained on a
@@ -210,17 +207,12 @@ def make_datamodule() -> ConcatTextDataModule:
             "gooaq": 3,
             "squad": 1,  # ~all of the small corpus; format signal (repeats)
         }
-        # Widen the download/tokenize windows to supply ~3.9B unique tokens.
-        # Instance-process-local class-attr overrides (never touches the shared
-        # module defaults on disk): cosmopedia 2->7 shards (~1.9B), fineweb
-        # 1->4 shards (~2.8B avail), gooaq 1->2 shards (~0.12B, its ceiling).
-        CosmopediaV2DataModule.DATA_FILES = [
+        # Widen the locked file selections to supply ~3.9B unique tokens.
+        cosmopedia_files = [
             f"cosmopedia-v2/train-{i:05d}-of-00104.parquet" for i in range(7)
         ]
-        FineWebEduTextDataModule.DATA_FILES = [
-            f"sample/10BT/{i:03d}_00000.parquet" for i in range(4)
-        ]
-        GooAQDataModule.DATA_FILES = [
+        fineweb_files = [f"sample/10BT/{i:03d}_00000.parquet" for i in range(4)]
+        gooaq_files = [
             "pair/train-00000-of-00002.parquet",
             "pair/train-00001-of-00002.parquet",
         ]
@@ -235,6 +227,9 @@ def make_datamodule() -> ConcatTextDataModule:
             # grounded passage+QA format signal; small corpus, this share ~= all of it
             "squad": 1,
         }
+        cosmopedia_files = None
+        fineweb_files = None
+        gooaq_files = None
     total = sum(ratios.values())
     if total != 100:
         raise ValueError(f"train mix ratios must sum to 100, got {total}")
@@ -247,78 +242,53 @@ def make_datamodule() -> ConcatTextDataModule:
         )
     )
 
-    dm = ConcatTextDataModule(
-        [
-            # owner: carries the canonical vocab_size / backend / doc convention
-            # (tokenizer is trained on the blend below, not on this source alone)
-            TinyTextbooksDataModule(
-                data_dir=DATA_DIR,
-                add_bos=True,
-                vocab_size=16_384,
-                max_train_tokens=int(ratios["tiny-textbooks"] * TRAIN_TOKENS),
-                max_val_tokens=VAL_TOKENS,
-            ),
-            CosmopediaV2DataModule(
-                data_dir=DATA_DIR,
-                add_bos=True,
-                max_train_tokens=int(ratios["cosmopedia-v2"] * TRAIN_TOKENS),
-                max_val_tokens=VAL_TOKENS,
-            ),
-            FineWebEduTextDataModule(
-                data_dir=DATA_DIR,
-                add_bos=True,
-                max_train_tokens=int(ratios["fineweb-edu"] * TRAIN_TOKENS),
-                max_val_tokens=VAL_TOKENS,
-            ),
-            TinyStoriesV2DataModule(
-                data_dir=DATA_DIR,
-                add_bos=True,
-                max_train_tokens=int(ratios["tinystories-v2"] * TRAIN_TOKENS),
-                max_val_tokens=VAL_TOKENS,
-            ),
-            TinyWebTextDataModule(
-                data_dir=DATA_DIR,
-                add_bos=True,
-                max_train_tokens=int(ratios["tiny-webtext"] * TRAIN_TOKENS),
-                max_val_tokens=VAL_TOKENS,
-            ),
-            GooAQDataModule(
-                data_dir=DATA_DIR,
-                add_bos=True,
-                max_train_tokens=int(ratios["gooaq"] * TRAIN_TOKENS),
-                max_val_tokens=VAL_TOKENS,
-            ),
-            SQuADTextDataModule(
-                data_dir=DATA_DIR,
-                add_bos=True,
-                max_train_tokens=int(ratios["squad"] * TRAIN_TOKENS),
-                max_val_tokens=VAL_TOKENS,
-            ),
-            *(
-                [
-                    LocalDocumentsDataModule(
-                        doc_dir=str(DOCUMENTS_DIR),
-                        repeat=DOCUMENTS_REPEAT,
-                        data_dir=DATA_DIR,
-                        add_bos=True,
-                    )
-                ]
-                if any(DOCUMENTS_DIR.glob("*.md"))
-                else []
-            ),
-        ],
+    views = (
+        ("tiny-textbooks.pretrain", "tiny-textbooks", None),
+        ("cosmopedia-v2.pretrain", "cosmopedia-v2", cosmopedia_files),
+        ("fineweb-edu.pretrain", "fineweb-edu", fineweb_files),
+        ("tinystories-v2.pretrain", "tinystories-v2", None),
+        ("tiny-webtext.pretrain", "tiny-webtext", None),
+        ("gooaq.pretrain", "gooaq", gooaq_files),
+        ("squad.pretrain", "squad", None),
+    )
+    sources = [
+        MixtureSource(
+            view,
+            name=name,
+            data_files=data_files,
+            max_train_tokens=int(ratios[name] * TRAIN_TOKENS),
+            max_val_tokens=VAL_TOKENS,
+        )
+        for view, name, data_files in views
+    ]
+    if any(DOCUMENTS_DIR.glob("*.md")):
+        sources.append(
+            MixtureSource(
+                LocalTextView(
+                    "documents.pretrain", DOCUMENTS_DIR, repeat=DOCUMENTS_REPEAT
+                ),
+                name="documents",
+                max_train_tokens=None,
+                max_val_tokens=None,
+            )
+        )
+    tokenizer = (
+        TokenizerSpec.pinned(TOKENIZER_PATH)
+        if TOKENIZER_PATH is not None
+        else TokenizerSpec(mode="train", vocab_size=16_384, sample_chars=1_000_000_000)
+    )
+    dm = TextDataModule(
+        TextMixtureSpec(sources=tuple(sources), tokenizer=tokenizer, add_bos=True),
+        data_dir=DATA_DIR,
         batch_size=PHYS_BATCH,
-        # Pin the frozen tokenizer when given; otherwise train one on the mixture.
-        train_tokenizer_on_mixture=TOKENIZER_PATH is None,
-        tokenizer_sample_chars=1_000_000_000,
-        tokenizer_path=TOKENIZER_PATH,
+        seq_len=SEQ_LEN,
     )
     dm.prepare_data()
     dm.setup("fit")
     return dm
 
 
-def make_context_datamodule() -> ContextMixDataModule:
+def make_context_datamodule() -> TextDataModule:
     """Two-pool datamodule for a context-extension stage (2k/4k/8k).
 
     A broad SHORT pool (packed windows, short-context retention) plus a LONG pool
@@ -346,102 +316,90 @@ def make_context_datamodule() -> ContextMixDataModule:
     def _cap(pool: int, frac: float) -> int:
         return int(pool * frac)
 
-    short_pool = ConcatTextDataModule(
-        [
-            # owner carries vocab_size/backend/doc convention (vocab is pinned)
-            CosmopediaV2DataModule(
-                data_dir=DATA_DIR, add_bos=True, seq_len=ctx, vocab_size=16_384,
-                max_train_tokens=_cap(SHORT_TOKENS, 0.30), max_val_tokens=VAL_TOKENS,
-            ),
-            FineWebEduTextDataModule(
-                data_dir=DATA_DIR, add_bos=True, seq_len=ctx,
-                max_train_tokens=_cap(SHORT_TOKENS, 0.34), max_val_tokens=VAL_TOKENS,
-            ),
-            TinyStoriesV2DataModule(
-                data_dir=DATA_DIR, add_bos=True, seq_len=ctx,
-                max_train_tokens=_cap(SHORT_TOKENS, 0.30), max_val_tokens=VAL_TOKENS,
-            ),
-            GooAQDataModule(
-                data_dir=DATA_DIR, add_bos=True, seq_len=ctx,
-                max_train_tokens=_cap(SHORT_TOKENS, 0.05), max_val_tokens=VAL_TOKENS,
-            ),
-            SQuADTextDataModule(
-                data_dir=DATA_DIR, add_bos=True, seq_len=ctx,
-                max_train_tokens=_cap(SHORT_TOKENS, 0.01), max_val_tokens=VAL_TOKENS,
-            ),
-        ],
-        batch_size=PHYS_BATCH,
-        tokenizer_path=TOKENIZER_PATH,
+    short_specs = (
+        ("cosmopedia-v2.pretrain", 0.30),
+        ("fineweb-edu.pretrain", 0.34),
+        ("tinystories-v2.pretrain", 0.30),
+        ("gooaq.pretrain", 0.05),
+        ("squad.pretrain", 0.01),
     )
-    long_pool = ConcatTextDataModule(
-        [
-            WikipediaDataModule(
-                data_dir=DATA_DIR, add_bos=True, seq_len=ctx, vocab_size=16_384,
-                max_train_tokens=_cap(LONG_TOKENS, 0.50), max_val_tokens=VAL_TOKENS,
-            ),
-            # long-FineWeb slice: short pages get filtered out by min_doc_len,
-            # leaving the genuinely long coherent pages as long-range training data
-            FineWebEduTextDataModule(
-                data_dir=DATA_DIR, add_bos=True, seq_len=ctx,
-                max_train_tokens=_cap(LONG_TOKENS, 0.35), max_val_tokens=VAL_TOKENS,
-            ),
-            StackExchangeDataModule(
-                data_dir=DATA_DIR, add_bos=True, seq_len=ctx,
-                max_train_tokens=_cap(LONG_TOKENS, 0.15), max_val_tokens=VAL_TOKENS,
-            ),
-        ],
-        batch_size=PHYS_BATCH,
-        tokenizer_path=TOKENIZER_PATH,
+    long_specs = (
+        ("wikipedia.pretrain", 0.50),
+        ("fineweb-edu.pretrain", 0.35),
+        ("stackexchange.pretrain", 0.15),
     )
-    dm = ContextMixDataModule(
-        short_pool,
-        long_pool,
-        ctx=ctx,
-        short_share=short_share,
-        long_share=long_share,
+    sources = [
+        MixtureSource(
+            view,
+            name=f"short-{view.split('.')[0]}",
+            weight=short_share * share,
+            max_train_tokens=_cap(SHORT_TOKENS, share),
+            max_val_tokens=VAL_TOKENS,
+            sampling=Packed(),
+        )
+        for view, share in short_specs
+    ]
+    sources.extend(
+        MixtureSource(
+            view,
+            name=f"long-{view.split('.')[0]}",
+            weight=long_share * share,
+            max_train_tokens=_cap(LONG_TOKENS, share),
+            max_val_tokens=VAL_TOKENS,
+            sampling=DocumentWindow(),
+        )
+        for view, share in long_specs
+    )
+    dm = TextDataModule(
+        TextMixtureSpec(
+            sources=tuple(sources),
+            tokenizer=TokenizerSpec.pinned(TOKENIZER_PATH),
+            add_bos=True,
+            num_samples=MAX_TRAIN_STEPS * BATCH_SIZE,
+        ),
+        data_dir=DATA_DIR,
         batch_size=PHYS_BATCH,
-        # bound the sampler to exactly this run's length (one item == one ctx row)
-        num_samples=MAX_TRAIN_STEPS * BATCH_SIZE,
+        seq_len=ctx,
     )
     dm.prepare_data()
     dm.setup("fit")
+    train_sources = list(dm.train_datasets.values())
     print(
         f"context stage {CTX_STAGE}: ctx={ctx} short/long={short_share:.0%}/{long_share:.0%}  "
-        f"short_items={len(dm.short_dataset):,} long_windows={len(dm.long_dataset):,}"
+        f"short_items={sum(len(ds) for ds in train_sources[: len(short_specs)]):,} "
+        f"long_windows={sum(len(ds) for ds in train_sources[len(short_specs) :]):,}"
     )
     return dm
 
 
-def make_curriculum_loaders(dm: ConcatTextDataModule):
+def make_curriculum_loaders(dm: TextDataModule):
     """Split each source's token stream into phase-1/phase-2 chunks per the phase
     ratios and return one shuffled DataLoader per phase. Slicing each source at
     r1/(r1+r2) keeps per-source totals (and ids caches) identical to the flat mix —
     only the ORDER across phases changes. `documents` (and any source not in the
     ratio dicts) is split evenly so it stays present throughout."""
-    from torch.utils.data import DataLoader
-
-    from chimera.data._text import TokenDataset
+    from torch.utils.data import ConcatDataset, DataLoader, Subset
 
     phase1, phase2 = [], []
-    for name, sub in zip(dm.source_names, dm.datamodules):
-        data = sub.train_dataset.data
+    for name, dataset in dm.train_datasets.items():
         r1 = RATIOS_PHASE1.get(name)
         r2 = RATIOS_PHASE2.get(name)
         frac = 0.5 if not (r1 or r2) else r1 / (r1 + r2)
-        cut = int(len(data) * frac)
-        phase1.append(data[:cut])
-        phase2.append(data[cut:])
+        cut = int(len(dataset) * frac)
+        phase1.append(Subset(dataset, range(cut)))
+        phase2.append(Subset(dataset, range(cut, len(dataset))))
 
     for label, parts in (("phase1", phase1), ("phase2", phase2)):
-        total = sum(len(p) for p in parts)
+        total = sum(len(part) for part in parts)
         mix = "  ".join(
-            f"{n}={len(p) / total:.0%}" for n, p in zip(dm.source_names, parts)
+            f"{name}={len(part) / total:.0%}"
+            for name, part in zip(dm.source_names, parts)
         )
-        print(f"curriculum {label}: {total:,} tokens  ({mix})")
+        print(f"curriculum {label}: {total:,} windows  ({mix})")
 
     def loader(parts):
         return DataLoader(
-            TokenDataset(torch.cat(parts), dm.seq_len),
+            ConcatDataset(parts),
             batch_size=dm.batch_size,
             shuffle=True,
             num_workers=dm.num_workers,
@@ -450,7 +408,6 @@ def make_curriculum_loaders(dm: ConcatTextDataModule):
         )
 
     return loader(phase1), loader(phase2)
-
 
 
 def make_model(vocab_size: int, seq_len: int = SEQ_LEN) -> GPT:
@@ -625,7 +582,10 @@ def run_benchmarks(model, dm, step=None):
     metrics = {}  # task -> (metric_name, value as %)
     for task in TASKS:
         name, val, _ = headline(results[task])
-        metrics[task] = (name, val if ("perplex" in name or "bits_per_byte" in name) else val * 100)
+        metrics[task] = (
+            name,
+            val if ("perplex" in name or "bits_per_byte" in name) else val * 100,
+        )
     row = " | ".join(f"{t}={metrics[t][1]:.2f}" for t in order if t in metrics)
 
     if step is not None:
@@ -730,10 +690,16 @@ class PretrainEvalCallback(pl.Callback):
             net = getattr(pl_module.model, "_orig_mod", pl_module.model)
             widths = [w for w in CTX_WIDTHS if w <= self.seq_len]
             bands = score_banded(net, self.dm.tokenizer, DEVICE, widths=widths)
-            print("  banded bpb: " + "  ".join(f"{k}={v:.4f}" for k, v in bands.items()), flush=True)
+            print(
+                "  banded bpb: " + "  ".join(f"{k}={v:.4f}" for k, v in bands.items()),
+                flush=True,
+            )
             dists = [d for d in PROBE_DISTANCES if d <= self.seq_len]
             probe = retrieval_probe(net, DEVICE, distances=dists)
-            print("  retrieval: " + "  ".join(f"{k}={v:.2f}" for k, v in probe.items()), flush=True)
+            print(
+                "  retrieval: " + "  ".join(f"{k}={v:.2f}" for k, v in probe.items()),
+                flush=True,
+            )
             self._log(trainer, {f"val/banded/{k}": v for k, v in bands.items()})
 
     def on_train_batch_end(self, trainer, pl_module, *args, **kwargs):
@@ -743,7 +709,11 @@ class PretrainEvalCallback(pl.Callback):
         if step == self._last_step:
             return
         self._last_step = step
-        if self.bench_every and 0 < step < self.max_steps and step % self.bench_every == 0:
+        if (
+            self.bench_every
+            and 0 < step < self.max_steps
+            and step % self.bench_every == 0
+        ):
             run_benchmarks(pl_module.model, self.dm, step=step)
 
 
@@ -761,18 +731,19 @@ def train():
 
     # One optimizer step consumes GRAD_ACCUM_STEPS microbatches = BATCH_SIZE rows.
     global_batch_tokens = BATCH_SIZE * SEQ_LEN
-    if is_context:
-        # ContextMixDataModule.train_dataset is a ConcatDataset (no flat .data)
-        train_tokens = (len(dm.short_dataset) + len(dm.long_dataset)) * dm.ctx
-        val_tokens = len(dm.short_pool.val_dataset.data)
-    else:
-        train_tokens = len(dm.train_dataset.data)
-        val_tokens = len(dm.val_dataset.data)
+    train_tokens = sum(dm.source_train_tokens.values())
+    val_tokens = sum(dm.source_val_tokens.values())
 
     # token-budget cadence -> optimizer steps (fall back to the fixed step counts)
-    val_every = _cadence_steps(VAL_EVERY_MTOKENS, global_batch_tokens, VALIDATE_EVERY_N_STEPS)
-    bench_every = _cadence_steps(BENCH_EVERY_MTOKENS, global_batch_tokens, BENCH_EVERY_N_STEPS)
-    band_every = _cadence_steps(BAND_EVAL_EVERY_MTOKENS, global_batch_tokens, bench_every)
+    val_every = _cadence_steps(
+        VAL_EVERY_MTOKENS, global_batch_tokens, VALIDATE_EVERY_N_STEPS
+    )
+    bench_every = _cadence_steps(
+        BENCH_EVERY_MTOKENS, global_batch_tokens, BENCH_EVERY_N_STEPS
+    )
+    band_every = _cadence_steps(
+        BAND_EVAL_EVERY_MTOKENS, global_batch_tokens, bench_every
+    )
     print(f"cadence: val every {val_every} steps, bench every {bench_every} steps")
 
     print(f"vocab_size={dm.vocab_size}")

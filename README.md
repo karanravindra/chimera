@@ -22,7 +22,7 @@ uv sync --extra notebook   # Jupyter, plotting, Ollama client
 ## Public API
 
 ```python
-from chimera.data import ConcatTextDataModule, WindowSampledDataset
+from chimera.data.text import TextDataModule, TextMixtureSpec
 from chimera.optim import Muon, muon_param_groups
 from chimera.tokenizers import BPETokenizer
 ```
@@ -31,6 +31,8 @@ Package exports are lazy, so importing `chimera.data`, `chimera.models`, or
 `chimera.evals` does not initialize unrelated frameworks. Token caches are
 versioned, configuration-keyed, and written atomically. Build them in
 `prepare_data()`; `setup()` only reads completed caches, which is safe under DDP.
+The complete dataset inventory, upstream source-of-truth policy, and migration
+guide live in [`src/chimera/data/README.md`](src/chimera/data/README.md).
 
 The runnable model work lives in [`projects/tinylm`](projects/tinylm). Reusable
 legacy modules that may return later are documented in
